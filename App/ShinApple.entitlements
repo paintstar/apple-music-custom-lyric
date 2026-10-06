@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/plist-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 当前构建未启用 App Sandbox。通过公开 Music 脚本接口发送 Apple Events，
+	     使用系统「自动化」授权与 Info.plist 中的用途说明。 -->
+</dict>
+</plist>

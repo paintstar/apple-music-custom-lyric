@@ -1,0 +1,37 @@
+# SwiftPM / Xcode 构建产物与本机状态
+.build/
+.swiftpm/
+build/
+DerivedData/
+*.xcodeproj/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+*.log
+*.local
+.zcode/
+.video_agent/
+.private-backups/
+*.app/
+*.dmg
+*.zip
+
+# 本机歌词库与数据库备份
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+lyrics.preopen.json
+
+# 环境配置与签名材料
+.env
+.env.*
+!.env.example
+*.p8
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.provisionprofile
+secrets/
+.aws/

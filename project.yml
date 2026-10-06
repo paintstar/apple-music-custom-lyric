@@ -1,0 +1,54 @@
+name: ShinApple
+
+options:
+  bundleIdPrefix: com.shinapple
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  ShinAppleKit:
+    path: Packages/ShinAppleKit
+  ShinMusicScript:
+    path: Packages/ShinMusicScript
+  ShinLyricsEngine:
+    path: Packages/ShinLyricsEngine
+  ShinAppleData:
+    path: Packages/ShinAppleData
+  ShinAppServices:
+    path: Packages/ShinAppServices
+  ShinLyricsProvider:
+    path: Packages/ShinLyricsProvider
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+targets:
+  ShinApple:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - package: ShinAppleKit
+      - package: ShinMusicScript
+      - package: ShinLyricsEngine
+      - package: ShinAppleData
+      - package: ShinAppServices
+      - package: ShinLyricsProvider
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shinapple.dev
+        PRODUCT_NAME: ShinApple
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/ShinApple.entitlements
+        CODE_SIGN_STYLE: Automatic
+        # 非隔离异步函数在调用者隔离域执行（Approachable Concurrency），
+        # UI 层经 Task 调用非 Sendable 播放控制器时不再跨隔离发送
+        SWIFT_APPROACHABLE_CONCURRENCY: "YES"
+        # 签名：开发者在 Xcode（Signing & Capabilities）选择团队后即可签名运行；
+        # 签名团队沿用本机配置；自动化检查通过 build.sh --unsigned 验证编译。

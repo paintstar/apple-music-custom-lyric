@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: Test, lint, audit and Release build
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: SwiftPM dependency cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            Packages/*/.build/checkouts
+            Packages/*/.build/repositories
+            ~/Library/Caches/org.swift.swiftpm/repositories
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Packages/*/Package.resolved', 'Packages/*/Package.swift') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install development tools
+        run: brew install swiftlint xcodegen
+
+      - name: Shared local and CI checks
+        run: bash scripts/ci-local.sh

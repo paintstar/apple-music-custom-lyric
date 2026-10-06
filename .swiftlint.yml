@@ -1,0 +1,42 @@
+# SwiftLint 配置：以正确性与可读性为主，不追求风格洁癖。
+# 检查范围：Packages/ 与 App/；排除构建产物。
+included:
+  - Packages
+  - App
+excluded:
+  - "**/.build"
+  - "**/DerivedData"
+  - ShinApple.xcodeproj
+
+opt_in_rules:
+  - empty_count
+  - fatal_error_message
+  - closure_spacing
+  - operator_usage_whitespace
+
+line_length:
+  warning: 140
+  error: 200
+  ignores_comments: true
+
+identifier_name:
+  min_length: 1
+  max_length:
+    warning: 60
+    error: 80
+
+type_body_length:
+  warning: 350
+  error: 500
+
+file_length:
+  warning: 500
+  error: 800
+
+function_body_length:
+  warning: 80
+  error: 150
+
+# Swift 6 并发注解会产生长签名，放宽部分风格规则
+vertical_whitespace:
+  max_empty_lines: 3
