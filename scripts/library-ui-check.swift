@@ -11,6 +11,8 @@ private actor LibraryFixture: MusicLibraryBrowsing {
     var delaySecondPage = false
     var libraryFirstPageReads = 0
     var favoriteWriteCount = 0
+    var currentSource: MusicLibrarySource?
+    var delayNextSourceRead = false
     let library: [MusicLibraryTrack] = (0..<447).map { (index: Int) -> MusicLibraryTrack in
         let identifier = String(format: "%016X", index + 1)
         let title = index == 446 ? "末页星光" : "练习歌曲\(index)"
@@ -43,7 +45,22 @@ private actor LibraryFixture: MusicLibraryBrowsing {
             return MusicLibraryTrackPage(tracks: [track], totalCount: 1, nextOffset: nil)
         }
     }
-    func playTrack(_ trackRef: String, in source: MusicLibrarySource) async throws { plays.append((trackRef, source)) }
+    func playTrack(_ trackRef: String, in source: MusicLibrarySource) async throws {
+        plays.append((trackRef, source))
+        currentSource = source
+    }
+    func currentPlaybackSource() async throws -> MusicLibrarySource? {
+        let captured = currentSource
+        if delayNextSourceRead {
+            delayNextSourceRead = false
+            try? await Task.sleep(for: .milliseconds(220))
+        }
+        return captured
+    }
+    func setCurrentSource(_ source: MusicLibrarySource?, delayed: Bool = false) {
+        currentSource = source
+        delayNextSourceRead = delayed
+    }
     func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool {
         favoriteWriteCount += 1
         try await Task.sleep(for: .milliseconds(40))
@@ -91,9 +108,43 @@ private struct LibraryUICheck {
         try await wait { !model.isPlayingRequest }
         let plays = await fixture.plays
         try require(plays.count == 1 && plays[0].1 == .playlist(id: "B"), "点歌保留原歌单上下文")
+        var preparedShuffle: [Bool] = []
+        model.playFromStart(shuffleEnabled: true) { value in preparedShuffle.append(value); return false }
+        try await wait { !model.isPlayingRequest }
+        try require(await fixture.plays.count == 1 && preparedShuffle == [true], "随机状态未确认不能误播")
+        model.playFromStart(shuffleEnabled: false) { value in preparedShuffle.append(value); return true }
+        try await wait { !model.isPlayingRequest }
+        try require(await fixture.plays.count == 2 && preparedShuffle == [true, false], "主页普通播放确认关闭随机后点播")
+        model.playFromStart(shuffleEnabled: true) { _ in
+            try? await Task.sleep(for: .milliseconds(220))
+            return true
+        }
         model.select(.playlist("F"))
         try await wait { !model.isLoading }
         try require(model.isFolder && model.childPlaylists.count == 1 && model.tracks.isEmpty, "文件夹展示真实子歌单")
+        try? await Task.sleep(for: .milliseconds(260))
+        try require(await fixture.plays.count == 2, "切页后的迟到随机设置不能启动旧歌曲")
+        let playbackList = PlaybackListModel(service: fixture)
+        let currentTrack = "music-script:persistent:BBBBBBBBBBBBBBBB"
+        playbackList.reload(currentTrackKey: currentTrack)
+        try await wait { !playbackList.isLoading }
+        try require(playbackList.title == "当前歌单" && playbackList.tracks.first?.trackRef == currentTrack,
+                    "当前播放列表独立读取真实来源，不跟随浏览页面")
+        await fixture.setCurrentSource(.playlist(id: "A"), delayed: true)
+        playbackList.reload(currentTrackKey: "music-script:persistent:AAAAAAAAAAAAAAAA")
+        try? await Task.sleep(for: .milliseconds(20))
+        playbackList.cancel()
+        await fixture.setCurrentSource(.playlist(id: "B"))
+        playbackList.reload(currentTrackKey: currentTrack)
+        try await wait { !playbackList.isLoading && playbackList.tracks.first?.trackRef == currentTrack }
+        try? await Task.sleep(for: .milliseconds(260))
+        try require(playbackList.title == "当前歌单" && playbackList.tracks.first?.trackRef == currentTrack,
+                    "关闭重开后迟到的来源读取不能覆盖当前列表")
+        await fixture.setCurrentSource(nil)
+        playbackList.reload(currentTrackKey: currentTrack)
+        try await wait { !playbackList.isLoading }
+        try require(playbackList.tracks.isEmpty && playbackList.title == nil && playbackList.message != nil,
+                    "来源未知清空旧列表并提供说明")
         model.select(.favorites)
         try await wait { model.filteredTracks.count == 1 }
         if let favorite = model.filteredTracks.first {
@@ -113,6 +164,12 @@ private struct LibraryUICheck {
         resumed.select(.songs)
         try await wait { !resumed.isLoading && resumed.tracks.count == 447 }
         try require(await delayedFixture.libraryFirstPageReads == 2, "A→B→A半页缓存从新快照自动取齐")
+        resumed.playFromStart(shuffleEnabled: true) { $0 }
+        try await wait { !resumed.isPlayingRequest }
+        let randomPlays = await delayedFixture.plays
+        try require(randomPlays.count == 1 && randomPlays[0].1 == .library
+                    && resumed.displayedTracks.contains(where: { $0.trackRef == randomPlays[0].0 }),
+                    "随机起始曲来自当前显示列表并保留资料库来源")
 
         let failingFixture = LibraryFixture()
         await failingFixture.setFailure(true)
@@ -125,7 +182,7 @@ private struct LibraryUICheck {
         failing.reload()
         try await wait { !failing.isLoading && failing.tracks.count == 447 }
         try require(failing.errorMessage == nil, "刷新可恢复完整资料库")
-        print("AUTOMATED_PASS: library pagination/search/grouping/stale responses/play context/folder/favorite/partial cache/recovery")
+        print("AUTOMATED_PASS: library pagination/search/grouping/stale responses/play context/shuffle preparation/current playback list/folder/favorite/partial cache/recovery")
     }
 
     @MainActor private static func wait(_ predicate: @escaping () -> Bool) async throws {

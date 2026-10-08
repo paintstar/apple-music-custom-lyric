@@ -32,6 +32,18 @@ enum MusicLibraryScriptSources {
         wrap("return get \(column.rawValue) of every user playlist")
     }
 
+    /// 只识别公开词典中可分页读取的 library/user playlist，不猜测其它播放来源。
+    static let currentPlaybackSource = wrap("""
+    if not (exists current track) then return missing value
+    if not (exists current playlist) then return missing value
+    set playbackPlaylist to current playlist
+    if (class of playbackPlaylist) is library playlist then return {"library"}
+    if (class of playbackPlaylist) is user playlist then
+        return {"playlist", (persistent ID of playbackPlaylist)}
+    end if
+    return missing value
+    """)
+
     static func playlistParent(_ id: String) throws -> String {
         try wrap("""
         \(selection(.playlist(id: id)))

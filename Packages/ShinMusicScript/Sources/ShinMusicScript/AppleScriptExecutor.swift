@@ -211,9 +211,11 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
     private static func commandSource(_ command: String) -> String {
         """
         if application "Music" is not running then return "not-running"
-        tell application "Music"
-            \(command)
-        end tell
+        with timeout of \(MusicLibraryScriptSources.eventTimeoutSeconds) seconds
+            tell application "Music"
+                \(command)
+            end tell
+        end timeout
         return "ok"
         """
     }

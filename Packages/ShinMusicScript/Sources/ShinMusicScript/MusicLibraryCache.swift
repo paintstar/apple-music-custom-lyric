@@ -23,6 +23,11 @@ actor MusicLibraryCache {
         return try await runCancellable { try reader.readPlaylists(cancellation: $0) }
     }
 
+    func currentPlaybackSource() async throws -> MusicLibrarySource? {
+        let reader = reader
+        return try await runCancellable { try reader.currentPlaybackSource(cancellation: $0) }
+    }
+
     func loadTracks(in requestedSource: MusicLibrarySource, offset: Int, limit: Int) async throws -> MusicLibraryTrackPage {
         guard offset >= 0, (1...500).contains(limit) else { throw MusicLibraryError.invalidRequest }
         try Task.checkCancellation()
@@ -141,6 +146,14 @@ extension MusicScriptPlaybackController: MusicLibraryBrowsing {
     public func loadPlaylists() async throws -> [MusicLibraryPlaylist] {
         do {
             return try await libraryCache.loadPlaylists()
+        } catch let failure as MusicScriptFailure {
+            throw MusicScriptMapping.playbackError(for: failure)
+        }
+    }
+
+    public func currentPlaybackSource() async throws -> MusicLibrarySource? {
+        do {
+            return try await libraryCache.currentPlaybackSource()
         } catch let failure as MusicScriptFailure {
             throw MusicScriptMapping.playbackError(for: failure)
         }

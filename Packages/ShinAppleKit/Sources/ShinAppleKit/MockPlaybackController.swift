@@ -60,6 +60,7 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
         var lastNotified: PlaybackSnapshot?
         var entries: [Entry] = []
         var disposed = false
+        var librarySource: MusicLibrarySource?
     }
 
     /// 一次变更的产出：要分发的快照与分发时的监听者集合。
@@ -89,9 +90,10 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
     // MARK: - Mock 专属测试接口
 
     /// 设置 Mock 队列（带标题/时长）并立即装载第 `startAt` 首开始播放。
-    public func setMockQueue(_ tracks: [MockTrack], startAt: Int = 0) {
+    public func setMockQueue(_ tracks: [MockTrack], startAt: Int = 0, librarySource: MusicLibrarySource? = nil) {
         dispatch(state.withLock { s in
             s.tracks = tracks
+            s.librarySource = librarySource
             guard !tracks.isEmpty, tracks.indices.contains(startAt) else {
                 s.index = nil
                 return finishLocked(&s)
@@ -154,6 +156,10 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
         state.withLock { makeSnapshotLocked($0) }
     }
 
+    func mockPlaybackSource() -> MusicLibrarySource? {
+        state.withLock { s in s.disposed || s.index == nil ? nil : s.librarySource }
+    }
+
     @discardableResult
     public func subscribe(_ handler: @escaping @Sendable (PlaybackSnapshot) -> Void) -> PlaybackSubscriptionHandle {
         let id = state.withLock { s -> UUID in
@@ -178,6 +184,7 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
         let startIndex = mockTracks.firstIndex(where: { $0.identity == startAt }) ?? 0
         dispatch(state.withLock { s in
             s.tracks = mockTracks
+            s.librarySource = nil
             guard !mockTracks.isEmpty else {
                 s.index = nil
                 return finishLocked(&s)

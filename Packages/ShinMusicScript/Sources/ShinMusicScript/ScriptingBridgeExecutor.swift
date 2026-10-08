@@ -37,8 +37,6 @@ import ShinMSObjC
     // 兜底执行器，见下方 play() 注释。
     @objc optional func pause()
     @objc optional func playpause()
-    @objc optional func nextTrack()
-    @objc optional func previousTrack()
 }
 
 // MARK: - ScriptingBridge 执行器（主路径）
@@ -61,14 +59,18 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
     /// SB 初始化失败时为 false：readSnapshot 返回 failed(unknown)，控制命令抛错。
     public var isAvailable: Bool { application != nil }
 
-    /// play 命令的 NSAppleScript 兜底（SB 无裸 play 选择器，见协议处注释）。
-    /// 实例由本执行器独占，调用已由控制器的执行锁串行化。
-    private let playFallback = AppleScriptExecutor()
+    /// 播放和切歌命令经公开 AppleScript 执行，避免 optional SB 调用静默跳过。
+    /// 实例由本执行器独占，调用已由控制器的执行锁串行化；可注入验证命令分发。
+    private let commandExecutor: MusicScriptExecutor
 
     /// - Parameter bundleIdentifier: 目标程序（默认 Music.app；测试可覆盖观察行为）。
-    public init(bundleIdentifier: String = ScriptingBridgeExecutor.musicBundleIdentifier) {
+    public init(
+        bundleIdentifier: String = ScriptingBridgeExecutor.musicBundleIdentifier,
+        commandExecutor: MusicScriptExecutor? = nil
+    ) {
         // SBApplication(bundleIdentifier:) 只创建对象，不拉起目标应用。
         self.application = SBApplication(bundleIdentifier: bundleIdentifier)
+        self.commandExecutor = commandExecutor ?? AppleScriptExecutor()
     }
 
     // MARK: MusicScriptExecutor
@@ -126,7 +128,7 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
         // SB 无裸 play 选择器（见协议处注释）：走 NSAppleScript 兜底执行器。
         try ensureRunning()
         do {
-            try playFallback.play()
+            try commandExecutor.play()
         } catch let failure as MusicScriptFailure {
             throw failure
         } catch {
@@ -141,15 +143,13 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
     }
 
     public func nextTrack() throws {
-        try sendCommand { app in
-            app.nextTrack?()
-        }
+        // 词典命令本身正确，但 optional 消息不提供执行确认；固定 AppleScript
+        // 模板会检查运行状态，并把权限、超时等失败传回调用方。
+        try commandExecutor.nextTrack()
     }
 
     public func previousTrack() throws {
-        try sendCommand { app in
-            app.previousTrack?()
-        }
+        try commandExecutor.previousTrack()
     }
 
     public func seek(toSeconds seconds: Double) throws {

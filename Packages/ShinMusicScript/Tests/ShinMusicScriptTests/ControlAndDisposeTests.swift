@@ -81,6 +81,21 @@ struct ControlCommandTests {
         await #expect(throws: PlaybackError.unauthorized) {
             try await controller.play()
         }
+        executor.failCommand("nextTrack", with: .permissionDenied)
+        await #expect(throws: PlaybackError.unauthorized) { try await controller.next() }
+        executor.failCommand("previousTrack", with: .timeout)
+        await #expect(throws: PlaybackError.unknown("music:timeout")) { try await controller.previous() }
+    }
+
+    @Test("dispose 后切歌任务取消，执行器和采样不得继续调用")
+    func disposedTransportDoesNotExecute() async {
+        let executor = FakeMusicScriptExecutor()
+        let controller = makeController(executor)
+        controller.dispose()
+        await #expect(throws: CancellationError.self) { try await controller.next() }
+        await #expect(throws: CancellationError.self) { try await controller.previous() }
+        #expect(executor.recordedCommands.isEmpty)
+        #expect(executor.recordedReadCount == 0)
     }
 
     @Test("setQueue(catalog)：脚本适配器如实拒绝（目录 ID 不是 persistent ID）")

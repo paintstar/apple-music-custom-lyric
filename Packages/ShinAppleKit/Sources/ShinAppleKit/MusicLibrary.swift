@@ -69,6 +69,8 @@ public protocol MusicLibraryBrowsing: AnyObject, Sendable {
     func prepareMusicInBackground() async throws
     func loadPlaylists() async throws -> [MusicLibraryPlaylist]
     func loadTracks(in source: MusicLibrarySource, offset: Int, limit: Int) async throws -> MusicLibraryTrackPage
+    /// Music 正在播放的资料库/歌单来源；无法可靠识别时为 nil，不代表系统待播顺序。
+    func currentPlaybackSource() async throws -> MusicLibrarySource?
     /// 在原歌单上下文中点播；不改歌单、不临时复制歌曲、不拼接用户文本为脚本。
     func playTrack(_ trackRef: String, in source: MusicLibrarySource) async throws
     /// 仅按需读封面原始图像数据；无封面/不支持返回 nil，不包含音频数据。
@@ -78,6 +80,7 @@ public protocol MusicLibraryBrowsing: AnyObject, Sendable {
 }
 
 public extension MusicLibraryBrowsing {
+    func currentPlaybackSource() async throws -> MusicLibrarySource? { nil }
     func artworkData(for trackRef: String) async throws -> Data? { nil }
     func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool { throw MusicLibraryError.unsupported }
 }

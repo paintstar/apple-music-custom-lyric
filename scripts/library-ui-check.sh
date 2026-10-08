@@ -15,6 +15,6 @@ fi
 KIT_BUILD="$ROOT/Packages/ShinAppleKit/.build/$ARCH-apple-macosx/debug"
 "$SWIFT_COMPILER" -module-cache-path "$CLANG_MODULE_CACHE_PATH" -parse-as-library -swift-version 6 \
     -sdk "$SDK" -target "$ARCH-apple-macosx14.0" -I "$KIT_BUILD/Modules" \
-    "$ROOT/App/MusicLibraryBrowserModel.swift" "$ROOT/scripts/library-ui-check.swift" \
+    "$ROOT/App/MusicLibraryBrowserModel.swift" "$ROOT/App/PlaybackListModel.swift" "$ROOT/scripts/library-ui-check.swift" \
     "$KIT_BUILD/ShinAppleKit.build/"*.o -o "$CHECK_DIR/library-ui-check"
 "$CHECK_DIR/library-ui-check"

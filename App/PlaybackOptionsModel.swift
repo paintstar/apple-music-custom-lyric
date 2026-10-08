@@ -6,13 +6,19 @@ import ShinMusicScript
 @MainActor
 final class PlaybackOptionsModel: ObservableObject {
     @Published private(set) var snapshot = PlaybackOptionsSnapshot()
+    /// 滑块松手后保留用户目标，直到 Music 读回；不写入权威快照。
+    @Published private(set) var pendingVolume: Int?
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?
 
     private let service: any PlaybackOptionsControlling
     private var visibleControls = Set<UUID>()
-    private var request: Task<Void, Never>?
+    private var request: Task<Bool, Never>?
     private var generation: UInt64 = 0
+    private var lifecycleGeneration: UInt64 = 0
+    private var queuedVolume: Int?
+
+    var displayedVolume: Int? { pendingVolume ?? snapshot.volume }
 
     init(service: any PlaybackOptionsControlling) { self.service = service }
     deinit { request?.cancel() }
@@ -44,12 +50,46 @@ final class PlaybackOptionsModel: ObservableObject {
         }
     }
 
-    func setVolume(_ volume: Int) { run(.volume(volume)) }
+    func setVolume(_ volume: Int) {
+        guard (0...100).contains(volume) else {
+            errorMessage = PlaybackOptionsError.invalidVolume.localizedDescription
+            return
+        }
+        pendingVolume = volume
+        if isBusy {
+            // 原生滑块与方向键保持可用；只排队最近一次输入，避免积压 Apple Events。
+            queuedVolume = volume
+        } else {
+            run(.volume(volume))
+        }
+    }
+
+    /// 主页播放先等待选项确认，再启动列表；等待期间仍允许提交最新音量。
+    func preparePlayback(shuffleEnabled: Bool) async -> Bool {
+        let lifecycle = lifecycleGeneration
+        while let request {
+            _ = await request.value
+            guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
+        }
+        guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
+        run(.shuffle(shuffleEnabled))
+        guard let request else { return false }
+        let succeeded = await request.value
+        guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
+        guard succeeded, errorMessage == nil, snapshot.shuffleEnabled == shuffleEnabled else {
+            if errorMessage == nil { errorMessage = "未能确认随机播放状态，请重试后再播放。" }
+            return false
+        }
+        return true
+    }
 
     func cancel() {
+        lifecycleGeneration &+= 1
         generation &+= 1
         request?.cancel()
         request = nil
+        queuedVolume = nil
+        pendingVolume = nil
         isBusy = false
     }
 
@@ -68,6 +108,10 @@ final class PlaybackOptionsModel: ObservableObject {
 
     private func run(_ command: Command) {
         guard !isBusy else { return }
+        start(command)
+    }
+
+    private func start(_ command: Command) {
         generation &+= 1
         let generation = generation
         isBusy = true
@@ -75,17 +119,28 @@ final class PlaybackOptionsModel: ObservableObject {
         request = Task { [weak self, service] in
             do {
                 let result = try await command.execute(on: service)
-                guard let self, !Task.isCancelled, generation == self.generation else { return }
+                guard let self, !Task.isCancelled, generation == self.generation else { return false }
                 self.snapshot = result
-                self.isBusy = false
-                self.request = nil
+                self.finish()
+                return true
             } catch {
-                guard let self, !Task.isCancelled, generation == self.generation else { return }
-                self.snapshot = PlaybackOptionsSnapshot()
-                self.isBusy = false
-                self.request = nil
+                guard let self, !Task.isCancelled, generation == self.generation else { return false }
+                // 保留最近确认值；失败不会让滑块消失或随机/循环变成未知。
                 if !(error is CancellationError) { self.errorMessage = Self.message(for: error) }
+                self.finish()
+                return false
             }
+        }
+    }
+
+    private func finish() {
+        request = nil
+        if let volume = queuedVolume {
+            queuedVolume = nil
+            start(.volume(volume))
+        } else {
+            pendingVolume = nil
+            isBusy = false
         }
     }
 

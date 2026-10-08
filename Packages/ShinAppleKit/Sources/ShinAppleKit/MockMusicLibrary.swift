@@ -42,6 +42,11 @@ extension MockPlaybackController: MusicLibraryBrowsing {
         return MockMusicLibrary.playlists
     }
 
+    public func currentPlaybackSource() async throws -> MusicLibrarySource? {
+        try Task.checkCancellation()
+        return mockPlaybackSource()
+    }
+
     public func loadTracks(in source: MusicLibrarySource, offset: Int, limit: Int) async throws -> MusicLibraryTrackPage {
         try Task.checkCancellation()
         guard offset >= 0, (1...500).contains(limit) else { throw MusicLibraryError.invalidRequest }
@@ -66,7 +71,7 @@ extension MockPlaybackController: MusicLibraryBrowsing {
         setMockQueue(tracks.map { track in
             MockTrack(identity: CatalogIdentity(storefront: "mock", catalogSongId: track.persistentID),
                       title: track.title, artist: track.artist, durationMs: track.durationMs, trackRef: track.trackRef)
-        }, startAt: index)
+        }, startAt: index, librarySource: source)
     }
 
     public func playTrackRef(_ trackRef: String) async throws {

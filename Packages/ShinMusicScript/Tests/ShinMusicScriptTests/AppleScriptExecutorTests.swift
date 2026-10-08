@@ -125,6 +125,19 @@ struct AppleScriptExecutorParsingTests {
 
 struct ExecutorConstructionTests {
 
+    @Test("切歌通过注入的公开脚本执行器发送，失败不能静默吞掉")
+    func transportUsesCommandExecutor() throws {
+        let commands = FakeMusicScriptExecutor()
+        let executor = ScriptingBridgeExecutor(commandExecutor: commands)
+        try executor.nextTrack()
+        try executor.previousTrack()
+        #expect(commands.recordedCommands == ["nextTrack", "previousTrack"])
+        commands.failCommand("nextTrack", with: .permissionDenied)
+        #expect(throws: MusicScriptFailure.permissionDenied) { try executor.nextTrack() }
+        commands.failCommand("previousTrack", with: .timeout)
+        #expect(throws: MusicScriptFailure.timeout) { try executor.previousTrack() }
+    }
+
     @Test("ScriptingBridge 执行器可构造（目标 Music bundle id；不拉起应用）")
     func sbExecutorConstructs() {
         let executor = ScriptingBridgeExecutor()

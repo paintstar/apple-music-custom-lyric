@@ -1071,6 +1071,7 @@ private struct PlayerUICheck {
         try await checkContinuousPlayback(store: store)
         try await LyricsMotionUICheck.run()
         try await PlaybackProgressUICheck.runChecks()
+        try await PlaybackOptionsUICheck.runChecks()
         try await checkPlaybackDragging(store: store, snapshot: initial)
         fflush(nil)
         try await checkTranslationHintPresentation()

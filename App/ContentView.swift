@@ -107,7 +107,7 @@ struct ContentView: View {
                                   onNowPlaying: { showNowPlaying() },
                                   onToggleLyrics: { toggleLibraryLyrics(isVisible: hasLyrics) },
                                   showsLyrics: hasLyrics,
-                                  trailingMenu: AnyView(navigationMenu().menuIndicator(.hidden)
+                                  trailingMenu: AnyView(navigationMenu()
                                     .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)))
                         .frame(maxWidth: PlayerBarView.maximumWidth)
                         .background {
@@ -184,7 +184,7 @@ struct ContentView: View {
             .help("展开窗口，返回原页面")
             .accessibilityLabel("展开窗口，返回原页面")
             PlaybackVolumeButton(model: model.playbackOptions, compact: true)
-            navigationMenu(compact: true).menuIndicator(.hidden)
+            navigationMenu(compact: true)
         }
         .buttonStyle(.plain)
         .padding(4)
@@ -300,41 +300,33 @@ private struct MusicLibraryNavigationMenu: View {
     let onEdit: () -> Void
 
     var body: some View {
-        Menu {
-            Section("资料库") {
-                ForEach([MusicLibraryDestination.search, .recent, .artists, .albums, .songs, .favorites], id: \.self) { destination in
-                    Button(destination.title) { onSelect(.music(destination)) }
-                }
-                ForEach(browser.playlists) { playlist in
-                    Button(playlist.name) { onSelect(.music(.playlist(playlist.id))) }
-                }
-            }
-            Button("完整播放器", action: onNowPlaying)
-            Section("学习") {
-                Button("学习歌曲与备份") { onSelect(.library) }
-                Button("导入本地歌词", action: onImport).disabled(!canImport)
-                Button("编辑当前歌词", action: onEdit).disabled(!canEdit)
-            }
-            Button("设置") { onSelect(.settings) }
-        } label: {
-            Color.clear
-                .frame(width: compact ? 28 : PlaybackControlSizing.optionSide,
-                       height: compact ? 30 : PlaybackControlSizing.optionSide)
+        PlaybackMenu(items: menuItems, iconSize: compact ? 14 : PlaybackControlSizing.iconSize,
+                     width: compact ? 28 : PlaybackControlSizing.optionSide,
+                     height: compact ? 30 : PlaybackControlSizing.optionSide,
+                     accessibilityLabel: "播放器菜单", help: "资料库、学习与设置")
+    }
+
+    private var menuItems: [PlaybackMenu.Item] {
+        var items = [PlaybackMenu.Item(title: "资料库")]
+        for destination in [MusicLibraryDestination.search, .recent, .artists, .albums, .songs, .favorites] {
+            items.append(.init(title: destination.title, symbol: destination.symbol,
+                               action: { onSelect(.music(destination)) }))
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .frame(width: compact ? 28 : PlaybackControlSizing.optionSide,
-               height: compact ? 30 : PlaybackControlSizing.optionSide)
-        .overlay {
-            // 原生 Menu 会重设 image label 的字号，单独绘制图标以保持控制尺寸一致。
-            Image(systemName: "ellipsis.circle")
-                .font(.system(size: compact ? 14 : PlaybackControlSizing.iconSize))
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
+        for playlist in browser.playlists {
+            items.append(.init(title: playlist.name, symbol: playlist.isFolder ? "folder" : "music.note.list",
+                               action: { onSelect(.music(.playlist(playlist.id))) }))
         }
-        .contentShape(Rectangle())
-        .help("资料库、学习与设置")
-        .accessibilityLabel("播放器菜单")
+        items += [
+            .separator,
+            .init(title: "完整播放器", symbol: "play.rectangle", action: onNowPlaying),
+            .separator,
+            .init(title: "学习"),
+            .init(title: "学习歌曲与备份", symbol: "books.vertical", action: { onSelect(.library) }),
+            .init(title: "导入本地歌词", symbol: "square.and.arrow.down", isEnabled: canImport, action: onImport),
+            .init(title: "编辑当前歌词", symbol: "square.and.pencil", isEnabled: canEdit, action: onEdit),
+            .separator,
+            .init(title: "设置", symbol: "gearshape", action: { onSelect(.settings) })
+        ]
+        return items
     }
 }

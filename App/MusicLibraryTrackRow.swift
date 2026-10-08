@@ -17,16 +17,8 @@ struct MusicLibraryTrackRow: View {
             favoriteControl.frame(width: 20)
             artworkButton
             information
-            Menu { menuActions } label: {
-                Image(systemName: "ellipsis")
-                    .foregroundStyle(isHovered ? Color.primary : .secondary)
-                    .frame(width: 24, height: 32)
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .accessibilityLabel("\(track.title)的更多操作")
-            .help("歌曲选项")
+            PlaybackMenu(items: nativeMenuItems, symbol: "ellipsis", iconSize: 14, width: 28, height: 32,
+                         accessibilityLabel: "\(track.title)的更多操作", help: "歌曲选项")
         }
         .padding(.horizontal, 8)
         .background(Color.primary.opacity(isSelected ? 0.11 : isHovered ? 0.06 : 0),
@@ -99,6 +91,16 @@ struct MusicLibraryTrackRow: View {
             guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return value
         }.joined(separator: " — ")
+    }
+
+    private var nativeMenuItems: [PlaybackMenu.Item] {
+        var items = [PlaybackMenu.Item(title: "播放", symbol: "play.fill", action: onPlay)]
+        if let isFavorite = track.isFavorite {
+            items.append(.init(title: isFavorite ? "取消喜爱" : "标记为喜爱", symbol: "star",
+                               isEnabled: !browser.favoriteWrites.contains(track.trackRef),
+                               action: { browser.setFavorite(track, value: !isFavorite) }))
+        }
+        return items
     }
 
     @ViewBuilder

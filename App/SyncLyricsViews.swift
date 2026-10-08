@@ -72,68 +72,22 @@ struct SyncLyricsMenu: View {
     let onEdit: () -> Void
 
     var body: some View {
-        Menu {
-            Section {
-                // 偏移当前值以禁用菜单项副标题展示（正数延后/负数提前）。
-                Text("偏移：\(panel.syncDisplay.delayDescription)")
-                    .help("正数表示歌词比播放延后显示，负数表示提前；保存在本机，刷新后保留")
-                Button {
-                    panel.adjustDelay(byMs: LyricsPanelModel.delayStepMs)
-                } label: {
-                    Label("延后 0.1 秒", systemImage: "goforward.100")
-                }
-                .disabled(!panel.canAdjustDelay)
-                Button {
-                    panel.adjustDelay(byMs: -LyricsPanelModel.delayStepMs)
-                } label: {
-                    Label("提前 0.1 秒", systemImage: "gobackward.100")
-                }
-                .disabled(!panel.canAdjustDelay)
-                Button {
-                    panel.resetDelay()
-                } label: {
-                    Label("归零", systemImage: "arrow.counterclockwise")
-                }
-                .disabled(!panel.canAdjustDelay || panel.syncDisplay.userDelayMs == 0)
-            }
-            Section {
-                Toggle(isOn: $showTranslations) {
-                    Label("显示译文", systemImage: "text.bubble")
-                }
-                .help("开启后，在歌词下方显示简体中文译文；「待复核」标记原文修改后尚未核对的译文")
-            }
-            Section {
-                Button {
-                    onEdit()
-                } label: {
-                    Label("编辑歌词", systemImage: "square.and.pencil")
-                }
-                .disabled(!canEdit)
-                Button(role: .destructive) {
-                    onUnlink()
-                } label: {
-                    Label("解除关联", systemImage: "link.slash")
-                }
-                .disabled(panel.isTransitioning)
-            }
-        } label: {
-            Color.clear
-                .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
-        .overlay {
-            Image(systemName: "ellipsis.circle")
-                .font(.system(size: PlaybackControlSizing.iconSize))
-                .foregroundStyle(.primary.opacity(0.75))
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        }
-        .contentShape(Rectangle())
-        .accessibilityLabel("歌词选项")
-        .help("偏移调整、显示译文、编辑歌词与解除关联")
+        PlaybackMenu(items: [
+            .init(title: "偏移：\(panel.syncDisplay.delayDescription)"),
+            .init(title: "延后 0.1 秒", symbol: "goforward.100", isEnabled: panel.canAdjustDelay,
+                  action: { panel.adjustDelay(byMs: LyricsPanelModel.delayStepMs) }),
+            .init(title: "提前 0.1 秒", symbol: "gobackward.100", isEnabled: panel.canAdjustDelay,
+                  action: { panel.adjustDelay(byMs: -LyricsPanelModel.delayStepMs) }),
+            .init(title: "归零", symbol: "arrow.counterclockwise",
+                  isEnabled: panel.canAdjustDelay && panel.syncDisplay.userDelayMs != 0,
+                  action: { panel.resetDelay() }),
+            .separator,
+            .init(title: "显示译文", symbol: "text.bubble", isChecked: showTranslations,
+                  action: { showTranslations.toggle() }),
+            .separator,
+            .init(title: "编辑歌词", symbol: "square.and.pencil", isEnabled: canEdit, action: onEdit),
+            .init(title: "解除关联", symbol: "link.slash", isEnabled: !panel.isTransitioning, action: onUnlink)
+        ], accessibilityLabel: "歌词选项", help: "偏移调整、显示译文、编辑歌词与解除关联")
     }
 
     private var canEdit: Bool {

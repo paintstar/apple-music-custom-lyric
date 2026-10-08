@@ -5,11 +5,13 @@ import ShinAppleKit
 protocol MusicLibraryScriptReading: Sendable {
     func readPlaylists(cancellation: MusicLibraryCancellation) throws -> [MusicLibraryPlaylist]
     func readTracks(in source: MusicLibrarySource, cancellation: MusicLibraryCancellation) throws -> [MusicLibraryTrack]
+    func currentPlaybackSource(cancellation: MusicLibraryCancellation) throws -> MusicLibrarySource?
     func artworkData(persistentID: String, cancellation: MusicLibraryCancellation) throws -> Data?
     func setFavorite(persistentID: String, value: Bool, cancellation: MusicLibraryCancellation) throws -> Bool
 }
 
 extension MusicLibraryScriptReading {
+    func currentPlaybackSource(cancellation: MusicLibraryCancellation) throws -> MusicLibrarySource? { nil }
     func artworkData(persistentID: String, cancellation: MusicLibraryCancellation) throws -> Data? { nil }
     func setFavorite(persistentID: String, value: Bool, cancellation: MusicLibraryCancellation) throws -> Bool {
         throw MusicLibraryError.unsupported
@@ -20,6 +22,14 @@ extension MusicLibraryScriptReading {
 /// 按整列取值是为了规避 Music 在 fixed indexing=false 时范围索引的空洞与次序偏差。
 /// 每列一个公开查询，字段间可取消，前后 ID 序列和每列长度不一致则拒绝整批。
 struct AppleScriptMusicLibraryReader: MusicLibraryScriptReading {
+    func currentPlaybackSource(cancellation: MusicLibraryCancellation) throws -> MusicLibrarySource? {
+        try cancellation.check()
+        let result = try MusicLibraryScriptExecution.execute(MusicLibraryScriptSources.currentPlaybackSource,
+                                                            cancellation: cancellation)
+        try cancellation.check()
+        return try MusicLibraryDescriptorParser.playbackSource(result)
+    }
+
     func artworkData(persistentID: String, cancellation: MusicLibraryCancellation) throws -> Data? {
         try cancellation.check()
         let source = try MusicLibraryScriptSources.artwork(persistentID: persistentID)
@@ -93,6 +103,24 @@ struct AppleScriptMusicLibraryReader: MusicLibraryScriptReading {
 }
 
 enum MusicLibraryDescriptorParser {
+    static func playbackSource(_ descriptor: NSAppleEventDescriptor) throws -> MusicLibrarySource? {
+        // AppleScript missing value 为 type('msng')；null 同样表示来源未知。
+        if descriptor.descriptorType == typeNull
+            || (descriptor.descriptorType == typeType && descriptor.typeCodeValue == 0x6D73_6E67) {
+            return nil
+        }
+        let items = try list(descriptor)
+        guard let marker = items.first.flatMap(text) else {
+            throw MusicScriptFailure.fieldUnavailable("library:playbackSource")
+        }
+        if marker == "library", items.count == 1 { return .library }
+        if marker == "playlist", items.count == 2,
+           let id = text(items[1]), SongBinding.isValidPersistentID(id) {
+            return .playlist(id: id)
+        }
+        throw MusicScriptFailure.fieldUnavailable("library:playbackSource")
+    }
+
     static func list(_ descriptor: NSAppleEventDescriptor) throws -> [NSAppleEventDescriptor] {
         guard descriptor.descriptorType == typeAEList else { throw MusicScriptFailure.fieldUnavailable("library:list") }
         return (0..<descriptor.numberOfItems).compactMap { descriptor.atIndex($0 + 1) }

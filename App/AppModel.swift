@@ -15,6 +15,7 @@ import ShinMusicScript
 final class AppModel: ObservableObject {
     /// 稳定错误码（ShinMusicScript 执行器层约定）。
     static let permissionDeniedCode = "music:permissionDenied"
+    static let pendingTrackChangeMessage = "「音乐」尚未返回切歌变化，请检查当前播放列表。"
 
     let isMock: Bool
     let controller: PlaybackController
@@ -55,6 +56,8 @@ final class AppModel: ObservableObject {
     /// 播放侧一次性状态消息。setter 为 internal：保存位置切换扩展
     /// 重建协调器时写入偏移保存失败的提示。
     @Published var playbackMessage: String?
+    /// 切歌命令等待期间阻止重复提交，由按钮呈现操作状态。
+    @Published var isChangingTrack = false
 
     // MARK: 歌词面板与导入/同步协调/编辑器
 
@@ -103,6 +106,9 @@ final class AppModel: ObservableObject {
     private var startupTask: Task<Void, Never>?
     private let makeLyricsDatabase: @MainActor () async throws -> LyricsDatabase.Database
     private var seekSequence = 0
+    var transportSequence = 0
+    var transportTask: Task<Void, Never>?
+    var waitingForTransportChange: PlaybackSnapshot?
     private var searchTask: Task<Void, Never>?
     /// 请求序号：丢弃过期的搜索响应。
     private var searchSequence = 0
@@ -127,6 +133,7 @@ final class AppModel: ObservableObject {
         startupTask?.cancel()
         searchTask?.cancel()
         debounceTask?.cancel()
+        transportTask?.cancel()
     }
 
     // MARK: - 启动与权限
@@ -165,7 +172,11 @@ final class AppModel: ObservableObject {
         await startupTask?.value
     }
 
-    private func applySnapshot(_ snapshot: PlaybackSnapshot) {
+    func applySnapshot(_ snapshot: PlaybackSnapshot) {
+        if let expected = waitingForTransportChange, Self.didConfirmTransportChange(from: expected, to: snapshot) {
+            waitingForTransportChange = nil
+            if playbackMessage == Self.pendingTrackChangeMessage { playbackMessage = nil }
+        }
         if let pendingSeek, !pendingSeek.matches(snapshot) || !Self.canSeek(snapshot, isMock: isMock) {
             self.pendingSeek = nil
             seekSequence += 1
@@ -318,36 +329,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func playNext() {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.controller.next()
-            } catch let error as PlaybackError {
-                self.handlePlaybackError(error)
-            } catch {
-                self.playbackMessage = "切歌失败：\(String(describing: error))"
-            }
-        }
-    }
-
-    func playPrevious() {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.controller.previous()
-            } catch let error as PlaybackError {
-                self.handlePlaybackError(error)
-            } catch {
-                self.playbackMessage = "切歌失败：\(String(describing: error))"
-            }
-        }
-    }
-
     // 会话过期处理（切歌/播放路径）：自动化权限被拒会把状态机拉回
     // automationDenied，由状态区呈现「打开自动化权限设置」按钮（用户显式
     // 触发）；绝不自动循环重新弹窗。曲目不可用与超时各自有区分文案。
-    private func handlePlaybackError(_ error: PlaybackError) {
+    func handlePlaybackError(_ error: PlaybackError) {
         switch error {
         case .unauthorized:
             setup = .automationDenied

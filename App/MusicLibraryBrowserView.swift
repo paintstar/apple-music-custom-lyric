@@ -154,13 +154,22 @@ struct MusicLibraryBrowserView: View {
                     Text("搜索已同步的歌曲、艺人和专辑。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if let first = browser.displayedTracks.first, !browser.isFolder {
-                    Button {
-                        browser.play(first)
-                    } label: {
-                        Label("播放", systemImage: "play.fill")
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 4)
+                if !browser.displayedTracks.isEmpty, !browser.isFolder {
+                    HStack(spacing: 10) {
+                        Button {
+                            browser.playFromStart(shuffleEnabled: false, preparePlayback: model.playbackOptions.preparePlayback)
+                        } label: {
+                            Label("播放", systemImage: "play.fill")
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 4)
+                        }
+                        Button {
+                            browser.playFromStart(shuffleEnabled: true, preparePlayback: model.playbackOptions.preparePlayback)
+                        } label: {
+                            Label("随机播放", systemImage: "shuffle")
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 4)
+                        }
                     }
                     .buttonStyle(.bordered)
                     .tint(Color.appleMusicPink)

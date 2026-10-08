@@ -119,6 +119,7 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     var groups: [MusicLibraryGroup] { grouped(filteredTracks) }
+    var browsingService: MusicLibraryBrowsing? { service }
 
     private func grouped(_ items: [MusicLibraryTrack]) -> [MusicLibraryGroup] {
         guard destination == .artists || destination == .albums else { return [] }
@@ -192,6 +193,16 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     func play(_ track: MusicLibraryTrack) {
+        beginPlayback(track, prepare: nil)
+    }
+
+    func playFromStart(shuffleEnabled: Bool, preparePlayback: @escaping @MainActor (Bool) async -> Bool) {
+        let currentTracks = displayedTracks
+        guard !isFolder, let start = shuffleEnabled ? currentTracks.randomElement() : currentTracks.first else { return }
+        beginPlayback(start, prepare: { await preparePlayback(shuffleEnabled) })
+    }
+
+    private func beginPlayback(_ track: MusicLibraryTrack, prepare: (@MainActor () async -> Bool)?) {
         guard let service else { return }
         playSequence += 1
         let sequence = playSequence
@@ -202,6 +213,16 @@ final class MusicLibraryBrowserModel: ObservableObject {
         playTask = Task { [weak self] in
             do {
                 try Task.checkCancellation()
+                if let prepare {
+                    let prepared = await prepare()
+                    try Task.checkCancellation()
+                    guard let self, sequence == self.playSequence else { return }
+                    guard prepared else {
+                        self.isPlayingRequest = false
+                        self.playbackError = "播放方式未能更新，请检查「音乐」App 后重试。"
+                        return
+                    }
+                }
                 try await service.playTrack(track.trackRef, in: source)
                 guard let self, sequence == self.playSequence else { return }
                 self.isPlayingRequest = false

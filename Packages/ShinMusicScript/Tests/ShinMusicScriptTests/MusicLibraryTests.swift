@@ -5,6 +5,36 @@ import ShinAppleKit
 @testable import ShinMusicScript
 
 struct MusicLibraryDescriptorTests {
+    @Test("当前播放来源只识别公开资料库/歌单类型，缺失为未知，异常不可猜测")
+    func parsesCurrentPlaybackSource() throws {
+        func sourceList(_ texts: [String]) -> NSAppleEventDescriptor {
+            let descriptor = NSAppleEventDescriptor(listDescriptor: ())
+            for (index, text) in texts.enumerated() {
+                descriptor.insert(NSAppleEventDescriptor(string: text), at: index + 1)
+            }
+            return descriptor
+        }
+        #expect(try MusicLibraryDescriptorParser.playbackSource(sourceList(["library"])) == .library)
+        #expect(try MusicLibraryDescriptorParser.playbackSource(sourceList(["playlist", Fixtures.pidB]))
+                == .playlist(id: Fixtures.pidB))
+        #expect(try MusicLibraryDescriptorParser.playbackSource(.null()) == nil)
+        #expect(try MusicLibraryDescriptorParser.playbackSource(NSAppleEventDescriptor(typeCode: 0x6D73_6E67)) == nil)
+        #expect(throws: MusicScriptFailure.fieldUnavailable("library:playbackSource")) {
+            try MusicLibraryDescriptorParser.playbackSource(sourceList(["playlist", "not-an-id"]))
+        }
+        #expect(throws: MusicScriptFailure.fieldUnavailable("library:playbackSource")) {
+            try MusicLibraryDescriptorParser.playbackSource(sourceList(["unexpected"]))
+        }
+    }
+
+    @Test("当前播放列表固定模板通过本机公开词典编译，不执行 Music 事件")
+    func currentPlaybackSourceScriptCompiles() throws {
+        let script = try #require(NSAppleScript(source: MusicLibraryScriptSources.currentPlaybackSource))
+        var error: NSDictionary?
+        #expect(script.compileAndReturnError(&error))
+        #expect(error == nil)
+    }
+
     private func columns() -> [MusicLibraryScriptSources.TrackColumn: [NSAppleEventDescriptor]] {
         [
             .persistentID: [NSAppleEventDescriptor(string: Fixtures.pidA), NSAppleEventDescriptor(string: Fixtures.pidB)],

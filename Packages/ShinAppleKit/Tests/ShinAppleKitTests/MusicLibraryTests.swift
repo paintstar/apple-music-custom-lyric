@@ -25,16 +25,23 @@ struct MusicLibraryTests {
     func playbackUsesPlaylistContext() async throws {
         let player = MockPlaybackController()
         let source = MusicLibrarySource.playlist(id: "B000000000000002")
+        #expect(try await player.currentPlaybackSource() == nil)
         try await player.playTrack(MockMusicLibrary.tracks[1].trackRef, in: source)
+        #expect(try await player.currentPlaybackSource() == source)
         #expect(player.snapshot().trackRef == MockMusicLibrary.tracks[1].trackRef)
         try await player.next()
+        #expect(try await player.currentPlaybackSource() == source)
         #expect(player.snapshot().trackRef == MockMusicLibrary.tracks[3].trackRef)
         try await player.previous()
         #expect(player.snapshot().trackRef == MockMusicLibrary.tracks[1].trackRef)
+        #expect(try await player.currentPlaybackSource() == source)
         await #expect(throws: MusicLibraryError.sourceUnavailable) {
             try await player.playTrack(MockMusicLibrary.tracks[2].trackRef, in: source)
         }
         #expect(player.snapshot().trackRef == MockMusicLibrary.tracks[1].trackRef)
+        #expect(try await player.currentPlaybackSource() == source)
+        player.setMockQueue([])
+        #expect(try await player.currentPlaybackSource() == nil)
     }
 
     @Test("Mock 喜爱修改只影响指定曲目，刷新后保留；封面缺失不假造")

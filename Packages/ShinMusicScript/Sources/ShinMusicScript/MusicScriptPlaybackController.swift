@@ -56,7 +56,7 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     private let libraryLocator: MusicScriptExecutor
     /// 执行锁：保证 SBApplication/NSAppleScript 的串行访问（不嵌套状态锁）。
     private let executorLock = NSLock()
-    private let libraryPlayQueue = DispatchQueue(label: "ShinMusicScript.library-play", qos: .userInitiated)
+    private let playbackCommandQueue = DispatchQueue(label: "ShinMusicScript.playback-commands", qos: .userInitiated)
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let samplingIntervalNanos: UInt64
     private let sessionEpoch: Int
@@ -193,11 +193,11 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     }
 
     public func next() async throws {
-        try performCommand { try self.executor.nextTrack() }
+        try await performTransportCommand { try self.executor.nextTrack() }
     }
 
     public func previous() async throws {
-        try performCommand { try self.executor.previousTrack() }
+        try await performTransportCommand { try self.executor.previousTrack() }
     }
 
     public func dispose() {
@@ -237,7 +237,7 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         do {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    libraryPlayQueue.async { [self] in
+                    playbackCommandQueue.async { [self] in
                         do {
                             try cancellation.check()
                             try executorLock.withLock {
@@ -278,6 +278,43 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
 // MARK: - 命令发出与读回
 
 extension MusicScriptPlaybackController {
+
+    /// 同步 Apple Events 由专用队列承接，避免切歌等待阻塞 UI 或 Swift 协作线程。
+    /// 排队期间取消/dispose 的命令不再发出；已发送事件的结果只经随后采样发布。
+    private func performTransportCommand(_ body: @escaping @Sendable () throws -> Void) async throws {
+        try Task.checkCancellation()
+        let cancellation = MusicLibraryCancellation()
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    playbackCommandQueue.async { [self] in
+                        do {
+                            try executorLock.withLock {
+                                try cancellation.check()
+                                guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+                                try body()
+                            }
+                            try cancellation.check()
+                            guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+                            _ = sampleOnce()
+                            continuation.resume()
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+                try Task.checkCancellation()
+            } onCancel: {
+                cancellation.cancel()
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as MusicScriptFailure {
+            throw MusicScriptMapping.playbackError(for: failure)
+        } catch {
+            throw PlaybackError.unknown("music:unknown:\(String(describing: error))")
+        }
+    }
 
     /// 命令发出（执行锁内）→ 立即读回一次快照（命令发出不冒充成功）。
     private func performCommand(_ body: @escaping () throws -> Void) throws {

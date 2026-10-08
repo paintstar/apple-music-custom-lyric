@@ -6,8 +6,9 @@ import ShinAppleKit
 struct PlayerBarView: View {
     static let maximumWidth: CGFloat = 700
     private static let horizontalPadding: CGFloat = 16
-    // 沿用原单行布局的最小内容宽度；宽度只由宿主决定，播放帧不再触发候选布局探测。
-    private static let inlineContentWidth: CGFloat = 528
+    private static let trailingControlSpacing: CGFloat = 4
+    // 原单行布局宽度加上当前播放列表的槽位及间距，避免新增按钮挤压歌曲信息。
+    private static let inlineContentWidth: CGFloat = 528 + PlaybackControlSizing.optionSide + trailingControlSpacing
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var artworkStore: ArtworkStore
@@ -17,6 +18,7 @@ struct PlayerBarView: View {
     var showsLyrics = false
     var trailingMenu: AnyView?
     @State private var isArtworkHovered = false
+    @State private var showsPlaybackList = false
 
     var body: some View {
         VStack(spacing: 6) {
@@ -86,10 +88,27 @@ struct PlayerBarView: View {
     }
 
     private var trailingControls: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: Self.trailingControlSpacing) {
             lyricsButton
+            playbackListButton
             trailingMenu
             PlaybackVolumeButton(model: model.playbackOptions)
+        }
+    }
+
+    private var playbackListButton: some View {
+        Button { showsPlaybackList.toggle() } label: {
+            Image(systemName: "list.bullet")
+                .font(.system(size: PlaybackControlSizing.iconSize, weight: .medium))
+                .foregroundStyle(showsPlaybackList ? Color.appleMusicPink : .secondary)
+                .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PlaybackButtonStyle(isSelected: showsPlaybackList))
+        .accessibilityLabel("当前播放列表")
+        .help("显示当前播放列表")
+        .popover(isPresented: $showsPlaybackList) {
+            PlaybackListView(browser: model.musicLibraryBrowser).environmentObject(model)
         }
     }
 

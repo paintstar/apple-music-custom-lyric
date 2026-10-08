@@ -55,8 +55,9 @@ struct PlaybackControlsView: View {
                            height: PlaybackControlSizing.transportHeight)
                     .contentShape(Rectangle())
             }
-            .disabled(!canControl || !(model.snapshot.capabilities?.previous ?? model.isMock))
+            .disabled(model.isChangingTrack || !canControl || !(model.snapshot.capabilities?.previous ?? model.isMock))
             .accessibilityLabel("上一首")
+            .help(model.isChangingTrack ? "正在切换歌曲…" : "上一首")
             Button { model.togglePlayPause() } label: {
                 Image(systemName: model.snapshot.status == .playing ? "pause.fill" : "play.fill")
                     .font(.system(size: layout == .transport ? 24 : 26, weight: .semibold))
@@ -65,6 +66,7 @@ struct PlaybackControlsView: View {
             }
             .disabled(!canControl || !(model.snapshot.capabilities?.playPause ?? model.isMock))
             .accessibilityLabel(model.snapshot.status == .playing ? "暂停" : "播放")
+            .help(model.snapshot.status == .playing ? "暂停" : "播放")
             Button { model.playNext() } label: {
                 Image(systemName: "forward.fill")
                     .font(.system(size: PlaybackControlSizing.iconSize, weight: .semibold))
@@ -72,11 +74,12 @@ struct PlaybackControlsView: View {
                            height: PlaybackControlSizing.transportHeight)
                     .contentShape(Rectangle())
             }
-            .disabled(!canControl || !(model.snapshot.capabilities?.next ?? model.isMock))
+            .disabled(model.isChangingTrack || !canControl || !(model.snapshot.capabilities?.next ?? model.isMock))
             .accessibilityLabel("下一首")
+            .help(model.isChangingTrack ? "正在切换歌曲…" : "下一首")
             PlaybackRepeatButton(model: model.playbackOptions)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PlaybackButtonStyle())
         .foregroundStyle(.primary)
         .frame(maxWidth: layout == .stacked ? .infinity : nil)
     }
