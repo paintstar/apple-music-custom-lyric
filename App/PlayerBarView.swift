@@ -16,13 +16,14 @@ struct PlayerBarView: View {
     var onNowPlaying: (() -> Void)?
     var onToggleLyrics: (() -> Void)?
     var showsLyrics = false
+    var floatingLyricsControl: AnyView?
     var trailingMenu: AnyView?
     @State private var isArtworkHovered = false
     @State private var showsPlaybackList = false
 
     var body: some View {
         VStack(spacing: 6) {
-            if availableWidth >= Self.inlineContentWidth + 2 * Self.horizontalPadding {
+            if availableWidth >= minimumInlineWidth {
                 HStack(spacing: 14) {
                     PlaybackControlsView(layout: .transport)
                     trackAndProgress
@@ -90,10 +91,17 @@ struct PlayerBarView: View {
     private var trailingControls: some View {
         HStack(spacing: Self.trailingControlSpacing) {
             lyricsButton
+            floatingLyricsControl
             playbackListButton
             trailingMenu
             PlaybackVolumeButton(model: model.playbackOptions)
         }
+    }
+
+    private var minimumInlineWidth: CGFloat {
+        let floatingControlWidth = floatingLyricsControl == nil
+            ? 0 : PlaybackControlSizing.optionSide + Self.trailingControlSpacing
+        return Self.inlineContentWidth + floatingControlWidth + 2 * Self.horizontalPadding
     }
 
     private var playbackListButton: some View {

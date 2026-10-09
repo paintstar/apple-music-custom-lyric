@@ -62,6 +62,8 @@ final class LyricsPanelModel: ObservableObject {
     /// 当前展示内容所属的曲目键（nil = 尚未展示任何曲目内容）。
     /// 过渡决策（LyricsPanelTransition）据此判断「同曲目刷新 / 换曲目」。
     private(set) var displayedTrackKey: String?
+    /// 已应用关联结果的曲目生命周期；查询开始时不提前更新，避免旧文档被当作新结果。
+    private(set) var displayedTrackEpoch: Int?
 
     private let service: LyricsAssociationService?
     /// 宿主（AppModel）持有的同步协调器；nil = 歌词库初始化失败。
@@ -119,6 +121,7 @@ final class LyricsPanelModel: ObservableObject {
         guard let trackKey else {
             state = .noTrack
             displayedTrackKey = nil
+            displayedTrackEpoch = nil
             return
         }
         guard let service else {
@@ -154,6 +157,7 @@ final class LyricsPanelModel: ObservableObject {
         trackEpoch: Int
     ) {
         let previousDocumentId = currentDocumentId
+        displayedTrackEpoch = trackEpoch
         switch resolved {
         case .unbound:
             scrollableLineIds = []

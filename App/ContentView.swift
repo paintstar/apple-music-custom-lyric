@@ -20,6 +20,7 @@ struct ContentView: View {
     @State private var windowWidth: CGFloat = 1180
     @State private var floatingPlayerHeight: CGFloat = 0
     @AppStorage("player.showLibraryLyrics") private var showsLibraryLyrics = true
+    var floatingLyricsWindow: FloatingLyricsWindowController?
 
     var body: some View {
         GeometryReader { geometry in
@@ -107,6 +108,7 @@ struct ContentView: View {
                                   onNowPlaying: { showNowPlaying() },
                                   onToggleLyrics: { toggleLibraryLyrics(isVisible: hasLyrics) },
                                   showsLyrics: hasLyrics,
+                                  floatingLyricsControl: floatingLyricsControl,
                                   trailingMenu: AnyView(navigationMenu()
                                     .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)))
                         .frame(maxWidth: PlayerBarView.maximumWidth)
@@ -136,6 +138,12 @@ struct ContentView: View {
             .allowsHitTesting(hasLyrics)
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.28), value: hasLyrics)
+    }
+
+    private var floatingLyricsControl: AnyView? {
+        floatingLyricsWindow.map { controller in
+            AnyView(FloatingLyricsToggleButton(controller: controller, model: model))
+        }
     }
 
     @ViewBuilder

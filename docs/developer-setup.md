@@ -39,6 +39,7 @@ Mock 使用原创虚构数据和每次新建的临时数据库，不播放音频
 ```bash
 bash scripts/library-ui-check.sh
 bash scripts/player-ui-check.sh
+bash scripts/floating-lyrics-ui-check.sh
 bash scripts/library-scroll-ui-check.sh
 bash scripts/auto-fetch-check.sh
 ```

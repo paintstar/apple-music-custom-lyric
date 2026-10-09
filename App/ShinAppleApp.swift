@@ -6,6 +6,7 @@ import SwiftUI
 @main
 struct ShinAppleApp: App {
     @StateObject private var model: AppModel
+    @StateObject private var floatingLyricsWindow = FloatingLyricsWindowController()
 
     init() {
         let isMock = ProcessInfo.processInfo.arguments.contains("--mock")
@@ -18,7 +19,7 @@ struct ShinAppleApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(floatingLyricsWindow: floatingLyricsWindow)
                 .environmentObject(model)
                 .frame(minWidth: PlayerWindowController.minimumSize.width,
                        minHeight: PlayerWindowController.minimumSize.height)
@@ -26,5 +27,16 @@ struct ShinAppleApp: App {
         }
         .defaultSize(width: 1180, height: 780)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandMenu("悬浮歌词") {
+                Button(floatingLyricsWindow.isPresented ? "关闭悬浮歌词" : "显示悬浮歌词") {
+                    floatingLyricsWindow.toggle(model: model)
+                }
+                Button(floatingLyricsWindow.isLocked ? "解锁悬浮歌词" : "锁定悬浮歌词") {
+                    floatingLyricsWindow.toggleLock()
+                }
+                .disabled(!floatingLyricsWindow.isPresented)
+            }
+        }
     }
 }
