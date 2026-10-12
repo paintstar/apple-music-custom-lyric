@@ -31,12 +31,14 @@ enum LyricsMotionUICheck {
         return (window, view)
     }
 
-    private static func settle(_ message: String, _ predicate: () -> Bool) async throws {
-        for _ in 0..<300 {
+    private static func settle(
+        _ message: String, attempts: Int = 300, diagnostic: (() -> String)? = nil, _ predicate: () -> Bool
+    ) async throws {
+        for _ in 0..<attempts {
             if predicate() { return }
             try await Task.sleep(for: .milliseconds(5))
         }
-        preconditionFailure(message)
+        preconditionFailure(diagnostic.map { message + "\n" + $0() } ?? message)
     }
 
     private static func sampleOffsets(_ view: LyricsScrollView, count: Int = 12) async throws -> [CGFloat] {
@@ -160,10 +162,12 @@ enum LyricsMotionUICheck {
         precondition(unexpectedManual == 1 && !view.isScrollAnimating && view.documentView!.alphaValue == 1
                      && abs(view.contentView.bounds.minY - manualOffset) < 0.01,
                      "手动阅读应取消远距定位并恢复透明度，旧目标不能再次滚回")
-        // 跨过多个歌词组时仍要能取消过渡，卸载不能留下透明的正文。
-        show(0)
-        try await settle("卸载检查需要一个正在运行的动画") { view.hasActiveDisplayLink }
-        try await Task.sleep(for: .milliseconds(40))
+        // 手动取消后的坐标取决于落位时机；先固定起点，再建立独立的远距过渡。
+        show(0, reduceMotion: true)
+        show(11)
+        try await settle("卸载检查需要一个正在运行且正文淡出的动画") {
+            view.hasActiveDisplayLink && view.isScrollAnimating && view.canvas.alphaValue < 0.95
+        }
         view.prepareForRemoval()
         let removedOffset = view.contentView.bounds.minY
         try await Task.sleep(for: .milliseconds(120))
@@ -430,7 +434,13 @@ enum LyricsMotionUICheck {
         }
         defer { NotificationCenter.default.removeObserver(observer) }
         window.orderFront(nil)
-        try await settle("窗口恢复可见后应准确定位最新组并结束排队位移") {
+        try await settle("窗口恢复可见后应准确定位最新组并结束排队位移", attempts: 500, diagnostic: {
+            "offset=\(view.contentView.bounds.minY) target=\(target) animating=\(view.isScrollAnimating)"
+                + " motion=\(String(describing: view.scrollMotion)) jump=\(String(describing: view.jump))"
+                + " displayLink=\(view.hasActiveDisplayLink) visible=\(window.isVisible)"
+                + " unoccluded=\(window.occlusionState.contains(.visible))"
+                + " latestRequest=\(view.configuration?.request?.lineId == document.lines[1].id)"
+        }) {
             window.occlusionState.contains(.visible) && !view.isScrollAnimating
                 && abs(view.contentView.bounds.minY - target) < 1
         }

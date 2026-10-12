@@ -14,9 +14,19 @@ ShinApple 是 macOS 原生歌曲语言学习播放器，当前版本为 **0.1.0*
 
 手动导入、用户确认获取和人工编辑的内容优先，自动获取不会覆盖这些内容。自动落位的歌词标注「自动获取，未核对」；移出全部已选播放列表时，仅清理未编辑且不含人工翻译的自动歌词。
 
-## 平台与构建
+## 下载与安装
 
-部署目标为 **macOS 14.0 及以上**，仅提供 macOS 应用源码。构建需要 **完整 Xcode 26 及以上**、Swift 6、[XcodeGen](https://github.com/yonaskolb/XcodeGen) 和 [SwiftLint](https://github.com/realm/SwiftLint)。最低部署目标不代表所有系统版本和硬件均已实测。
+从 [GitHub Releases](https://github.com/paintstar/apple-music-custom-lyric/releases) 下载 **0.1.0** 安装包，需要 **macOS 14.0 及以上**。已构建 **Apple Silicon（arm64）** 版本，暂未提供 Intel 安装包。
+
+1. 下载 `ShinApple-0.1.0-macOS-arm64.dmg`，打开后将 **ShinApple** 拖到 **Applications**。也可下载同名 ZIP，解压后将 `ShinApple.app` 移到「应用程序」。
+2. 从「应用程序」启动 ShinApple，按提示允许控制官方「音乐」App。
+3. 本次安装包采用 **ad-hoc 签名，未经 Apple 公证**。如果系统提示无法验证开发者，请确认下载来源后按照 [Apple 官方说明](https://support.apple.com/zh-cn/102445) 在「系统设置 → 隐私与安全性」中处理。
+
+升级时退出 ShinApple，再用新版替换「应用程序」中的旧版；本地学习资料会保留，建议先在设置中导出 JSON 备份。安装包不包含歌词或音乐资料库。
+
+## 源码构建
+
+构建需要 **完整 Xcode 26 及以上**、Swift 6、[XcodeGen](https://github.com/yonaskolb/XcodeGen) 和 [SwiftLint](https://github.com/realm/SwiftLint)。最低部署目标不代表所有系统版本和硬件均已实测。
 
 在仓库根目录运行：
 
@@ -25,7 +35,7 @@ bash scripts/build.sh Debug --unsigned
 open .build/xcode/Build/Products/Debug/ShinApple.app
 ```
 
-这是本机开发构建，签名和公证需另行配置。详细环境、权限和检查命令见 [开发者配置](docs/developer-setup.md)。
+这是本机开发构建。生成安装包使用 `bash scripts/package-release.sh`，输出在 `.build/release/`；签名、公证和详细检查命令见 [开发者配置](docs/developer-setup.md)。
 
 ## 开始使用
 

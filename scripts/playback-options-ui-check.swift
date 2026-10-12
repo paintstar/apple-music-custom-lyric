@@ -122,8 +122,12 @@ enum PlaybackOptionsUICheck {
             slider.displayIfNeeded()
             let knob = cell.knobRect(flipped: slider.isFlipped)
             let bar = cell.barRect(flipped: slider.isFlipped)
+            let start = NSPoint(x: knob.midX + 2, y: knob.midY)
+            // 原生几何就绪后仍需等宿主命中区域更新，再由窗口派发鼠标。
+            let hit = host.hitTest(slider.convert(start, to: host.superview))
             return window.isKeyWindow && slider.integerValue == 40 && knob.width > 0 && knob.height > 0
                 && bar.width > knob.width && slider.bounds.contains(NSPoint(x: knob.midX, y: knob.midY))
+                && hit === slider
         }
         let slider = findSlider(host)!
         let identity = ObjectIdentifier(slider)

@@ -68,12 +68,14 @@ private final class CheckController: PlaybackController, @unchecked Sendable {
 
 @main
 private struct PlayerUICheck {
-    @MainActor static func eventually(_ message: String, _ predicate: () -> Bool) async throws {
-        for _ in 0..<200 {
+    @MainActor static func eventually(
+        _ message: String, attempts: Int = 200, diagnostic: (() -> String)? = nil, _ predicate: () -> Bool
+    ) async throws {
+        for _ in 0..<attempts {
             if predicate() { return }
             try await Task.sleep(for: .milliseconds(5))
         }
-        preconditionFailure(message)
+        preconditionFailure(diagnostic.map { message + "\n" + $0() } ?? message)
     }
 
     @MainActor static func checkAutoReturn(
@@ -380,7 +382,9 @@ private struct PlayerUICheck {
         let beforeSingle = replayCount()
         try await click(points[0], count: 1)
         try await Task.sleep(for: clickDelay)
-        precondition(replayCount() == beforeSingle + 1, "NSTextView真实单击应重听一次")
+        try await eventually("NSTextView真实单击应重听一次", diagnostic: {
+            "expected=\(beforeSingle + 1) actual=\(replayCount()) visible=\(window.isVisible) key=\(window.isKeyWindow)"
+        }) { replayCount() == beforeSingle + 1 }
         for point in points {
             let before = replayCount()
             try await click(point, count: 1)
@@ -435,6 +439,18 @@ private struct PlayerUICheck {
             ))
             view.layoutSubtreeIfNeeded()
         }
+        func animationDiagnostic(for index: Int) -> String {
+            let requestedRow = panel.scrollRequest.flatMap { view.textLayout.rowIndices[$0.lineId] }
+            let configuredRow = view.configuration?.request.flatMap { view.textLayout.rowIndices[$0.lineId] }
+            return "row=\(index) offset=\(view.contentView.bounds.minY) expected=\(view.textLayout.rows[index].frame.minY)"
+                + " resolvedTarget=\(String(describing: view.offset(for: document.lines[index].id)))"
+                + " animating=\(view.isScrollAnimating) motion=\(String(describing: view.scrollMotion))"
+                + " jump=\(String(describing: view.jump)) displayLink=\(view.hasActiveDisplayLink)"
+                + " visible=\(window.isVisible) unoccluded=\(window.occlusionState.contains(.visible))"
+                + " mode=\(panel.browseMode) configuredFollow=\(view.configuration?.followsPlayback == true)"
+                + " requestRow=\(String(describing: requestedRow)) configuredRow=\(String(describing: configuredRow))"
+                + " requestMatches=\(panel.scrollRequest?.requestId == view.configuration?.request?.requestId)"
+        }
         render()
         var firstOffset = view.contentView.bounds.minY
         for tick in 1...32 {
@@ -458,10 +474,12 @@ private struct PlayerUICheck {
             try await Task.sleep(for: .milliseconds(160))
             precondition(panel.browseMode == .follow, "连续播放动画不得误进入手动模式")
         }
-        try await Task.sleep(for: .milliseconds(650))
+        // 与独立动效检查保持 2.5 秒上限；距离响应和系统显示刷新不保证固定时刻完成。
+        try await eventually("多次更新后动画必须抵达最新权威歌词行", attempts: 500,
+                             diagnostic: { animationDiagnostic(for: 8) }) {
+            !view.isScrollAnimating && abs(view.contentView.bounds.minY - view.textLayout.rows[8].frame.minY) < 1
+        }
         precondition(view.contentView.bounds.minY > firstOffset + 100, "小窗连续播放必须产生实际滚动")
-        precondition(abs(view.contentView.bounds.minY - view.textLayout.rows[8].frame.minY) < 1,
-                     "多次更新后动画必须抵达最新权威歌词行")
 
         model.seek(toMs: 24_000)
         try await eventually("第一次 seek 已进入控制器") { controller.pendingTargets == [24_000] }
@@ -471,8 +489,10 @@ private struct PlayerUICheck {
         controller.completeSeek(4_000)
         try await eventually("连 seek 采用最新读回") { panel.syncDisplay.currentLineIds == [document.lines[2].id] }
         render()
-        try await Task.sleep(for: .milliseconds(650))
-        precondition(abs(view.contentView.bounds.minY - view.textLayout.rows[2].frame.minY) < 1)
+        try await eventually("连续 seek 后动画必须抵达最新读回的歌词行", attempts: 500,
+                             diagnostic: { animationDiagnostic(for: 2) }) {
+            !view.isScrollAnimating && abs(view.contentView.bounds.minY - view.textLayout.rows[2].frame.minY) < 1
+        }
 
         // 真正移动 clip，暂停自动跟随；权威采样仍持续前进，等待后应回到最新行。
         view.contentView.scroll(to: NSPoint(x: 0, y: view.contentView.bounds.minY + 140))
@@ -486,12 +506,17 @@ private struct PlayerUICheck {
             render()
         }
         try await eventually("连续播放中手动浏览空闲后恢复") { panel.browseMode == .follow }
+        try await eventually("恢复跟随应采用最后一次权威采样") {
+            model.snapshot.seq == sample.seq && panel.syncDisplay.currentLineIds == [document.lines[5].id]
+        }
         render()
-        try await Task.sleep(for: .milliseconds(650))
         guard let id = panel.syncDisplay.currentLineIds?.first, let index = view.textLayout.rowIndices[id] else {
             preconditionFailure("恢复跟随后应有当前行")
         }
-        precondition(abs(view.contentView.bounds.minY - view.textLayout.rows[index].frame.minY) < 1)
+        try await eventually("恢复跟随后动画必须抵达最新权威歌词行", attempts: 500,
+                             diagnostic: { animationDiagnostic(for: index) }) {
+            !view.isScrollAnimating && abs(view.contentView.bounds.minY - view.textLayout.rows[index].frame.minY) < 1
+        }
 
         let nextDocument = LyricDocument(lines: (0..<4).map {
             LyricLine(startMs: Int64($0) * 2_000, text: "切歌后的原创第 \($0) 句")
