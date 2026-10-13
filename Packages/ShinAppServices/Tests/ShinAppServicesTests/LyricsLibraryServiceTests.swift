@@ -241,7 +241,8 @@ struct LyricsLibraryServiceTests {
             binding: SongBinding(track: Fixture.trackA, lyricDocumentId: document.id, userDelayMs: 300)
         )
         let service = LyricsLibraryService(store: store)
-        let data = try await service.exportBackup()
+        let exportDate = Date()
+        let data = try await service.exportBackup(at: exportDate)
 
         // 全新空库走一遍确认导入流程。
         let (fresh, freshDir) = try TestEnv.makeTempStore()
@@ -256,8 +257,8 @@ struct LyricsLibraryServiceTests {
         #expect(try await fresh.document(id: document.id) == document)
         #expect(try await fresh.binding(for: Fixture.trackA)?.userDelayMs == 300)
 
-        // 原库再导出一次：内容一致（时间参数固定时字节确定）。
-        let dataAgain = try await service.exportBackup()
+        // 原库在同一导出时间下再导出一次，字节应一致。
+        let dataAgain = try await service.exportBackup(at: exportDate)
         #expect(data == dataAgain)
     }
 }

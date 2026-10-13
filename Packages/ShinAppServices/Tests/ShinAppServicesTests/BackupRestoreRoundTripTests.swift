@@ -97,7 +97,8 @@ struct BackupRestoreRoundTripTests {
         let fixture = try await Self.seedSource(source)
 
         // 2) 导出 → 3) 全新空库（清空等价物）→ 解析 → 预览。
-        let backupData = try await source.exportBackup()
+        let exportDate = Date()
+        let backupData = try await source.exportBackup(at: exportDate)
         let (restored, restoredDir) = try TestEnv.makeTempStore()
         defer { TestEnv.cleanup(restoredDir) }
         #expect(try await restored.allDocuments().isEmpty)
@@ -119,8 +120,8 @@ struct BackupRestoreRoundTripTests {
         try await assertRestoredDocuments(fixture, in: restored)
         try await assertRestoredBindings(fixture, in: restored)
 
-        // 再导出字节与源库一致（导出确定性 → 恢复完整性的最强证据）。
-        let exportedAgain = try await restored.exportBackup()
+        // 恢复库在同一导出时间下再导出，字节应与源库一致。
+        let exportedAgain = try await restored.exportBackup(at: exportDate)
         #expect(exportedAgain == backupData)
     }
 
