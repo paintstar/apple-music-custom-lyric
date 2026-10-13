@@ -193,10 +193,12 @@ struct MusicPlaybackContextTests {
             MusicPlaybackContextScripts.remove(ownership)
         ]
         for source in scripts {
-            let script = try #require(NSAppleScript(source: source))
-            var error: NSDictionary?
-            #expect(script.compileAndReturnError(&error))
-            #expect(error == nil)
+            try MusicAppleScriptExecution.withLock {
+                let script = try #require(NSAppleScript(source: source))
+                var error: NSDictionary?
+                #expect(script.compileAndReturnError(&error))
+                #expect(error == nil)
+            }
         }
         #expect(throws: MusicLibraryError.invalidRequest) {
             try MusicPlaybackContextScripts.append(["\" & do shell script \"example"], to: ownership, from: .library)
@@ -230,15 +232,17 @@ struct MusicPlaybackContextTests {
             (name, description, "kept"), (name.lowercased(), description, "released"),
             (name, description.lowercased(), "released"), (name + " ", description, "released")
         ] {
-            let script = try #require(NSAppleScript(source: """
-            set targetName to "\(testName)"
-            set targetDescription to "\(testDescription)"
-            \(comparison)
-            return "kept"
-            """))
-            var error: NSDictionary?
-            let result = script.executeAndReturnError(&error)
-            #expect(error == nil && result.stringValue == expected)
+            try MusicAppleScriptExecution.withLock {
+                let script = try #require(NSAppleScript(source: """
+                set targetName to "\(testName)"
+                set targetDescription to "\(testDescription)"
+                \(comparison)
+                return "kept"
+                """))
+                var error: NSDictionary?
+                let result = script.executeAndReturnError(&error)
+                #expect(error == nil && result.stringValue == expected)
+            }
         }
     }
 

@@ -1057,6 +1057,7 @@ private struct FloatingLyricsUICheck {
         precondition(model.canBeginOnlineFetch)
         let trackKey = model.currentTrackKey
         let fetchPopup = try await openGear()
+        try await checkSettingsBackground(fetchPopup)
         try await perform("floating-lyrics-fetch", in: fetchPopup) {
             FloatingLyricsActions.fetch(model, presentMainWindow: { controller.presentMainWindow?() })
         }
@@ -1090,6 +1091,53 @@ private struct FloatingLyricsUICheck {
         model.isImportPresented = false
         try await eventually("导入入口操作后设置 popover 应关闭") { !resumePopup.isVisible }
         print("PASS gear 首击/弹窗开关、先展示主窗再获取/导入、目标固定及人工草稿防重入")
+    }
+
+    /// 缓存原生窗口 frame view，保存设置弹窗内容及两侧边缘截图。
+    @MainActor private static func checkSettingsBackground(_ popup: NSWindow) async throws {
+        guard let content = popup.contentView else { preconditionFailure("设置弹窗缺少内容视图") }
+        let frameView = content.superview ?? content
+        let backdrop = NSWindow(contentRect: popup.frame.insetBy(dx: -20, dy: -20),
+                                styleMask: .borderless, backing: .buffered, defer: false)
+        backdrop.isReleasedWhenClosed = false
+        backdrop.isOpaque = true
+        backdrop.backgroundColor = .white
+        backdrop.level = popup.level
+        backdrop.contentView = NSHostingView(rootView: HStack(spacing: 0) {
+            Color.white
+            Color.yellow
+            Color.blue
+            Color.red
+        })
+        backdrop.order(.below, relativeTo: popup.windowNumber)
+        defer { backdrop.close() }
+        try await Task.sleep(for: .milliseconds(250))
+        _ = try await visibleTextBitmap(popup)
+        popup.displayIfNeeded()
+        frameView.layoutSubtreeIfNeeded()
+        guard let bitmap = frameView.bitmapImageRepForCachingDisplay(in: frameView.bounds) else {
+            preconditionFailure("原生设置弹窗无法生成截图")
+        }
+        bitmap.bitmapData?.initialize(repeating: 0, count: bitmap.bytesPerRow * bitmap.pixelsHigh)
+        frameView.cacheDisplay(in: frameView.bounds, to: bitmap)
+        if let output = ProcessInfo.processInfo.environment["FLOATING_LYRICS_CHECK_OUTPUT"], !output.isEmpty {
+            let directory = URL(fileURLWithPath: output, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else {
+                preconditionFailure("原生设置弹窗截图无法编码")
+            }
+            try data.write(to: directory.appendingPathComponent("floating-lyrics-settings-original.png"))
+        }
+        // 取侧边留白内部，避开正文、圆角抗锯齿与阴影；透明玻璃或浅色外框都应失败。
+        for x in [max(2, bitmap.pixelsWide / 50), bitmap.pixelsWide - max(3, bitmap.pixelsWide / 50)] {
+            guard let color = bitmap.colorAt(x: x, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.deviceRGB) else {
+                preconditionFailure("设置弹窗侧边背景没有有效像素")
+            }
+            precondition(color.alphaComponent > 0.99
+                         && max(color.redComponent, color.greenComponent, color.blueComponent) < 0.5,
+                         "设置弹窗侧边必须是深色不透明背景")
+        }
+        print("PASS 原生设置弹窗两侧深色实底；保存内容及两侧边缘截图，使用原创纯色后景。")
     }
 
     @MainActor private static func pressAccessibleControl(_ identifier: String) -> (found: Bool, hasSpacing: Bool, status: Int32) {

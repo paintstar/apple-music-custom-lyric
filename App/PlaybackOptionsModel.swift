@@ -10,6 +10,10 @@ final class PlaybackOptionsModel: ObservableObject {
     @Published private(set) var pendingVolume: Int?
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var pendingShuffleChange = false
+    @Published private(set) var pendingRepeatChange = false
+    @Published private(set) var shuffleErrorMessage: String?
+    @Published private(set) var repeatErrorMessage: String?
 
     private let service: any PlaybackOptionsControlling
     private var visibleControls = Set<UUID>()
@@ -18,6 +22,7 @@ final class PlaybackOptionsModel: ObservableObject {
     private var generation: UInt64 = 0
     private var lifecycleGeneration: UInt64 = 0
     private var queuedVolume: Int?
+    private var queuedModeActions: [ModeAction] = []
 
     var displayedVolume: Int? { pendingVolume ?? snapshot.volume }
 
@@ -25,9 +30,8 @@ final class PlaybackOptionsModel: ObservableObject {
     deinit { request?.cancel(); playbackRefresh?.cancel() }
 
     func appear(_ id: UUID) {
-        let wasEmpty = visibleControls.isEmpty
-        visibleControls.insert(id)
-        if wasEmpty { refresh() }
+        // 浮窗打开时主窗可能已可见，非激活面板也不会触发 App 激活通知。
+        if visibleControls.insert(id).inserted { refresh() }
     }
 
     func disappear(_ id: UUID) {
@@ -38,17 +42,17 @@ final class PlaybackOptionsModel: ObservableObject {
     func refresh() { run(.read) }
 
     func toggleShuffle() {
-        guard let enabled = snapshot.shuffleEnabled else { refresh(); return }
-        run(.shuffle(!enabled))
+        guard !pendingShuffleChange else { return }
+        shuffleErrorMessage = nil
+        pendingShuffleChange = true
+        enqueue(.shuffle)
     }
 
     func cycleRepeat() {
-        guard let mode = snapshot.repeatMode else { refresh(); return }
-        switch mode {
-        case .off: run(.repeatMode(.all))
-        case .all: run(.repeatMode(.one))
-        case .one: run(.repeatMode(.off))
-        }
+        guard !pendingRepeatChange else { return }
+        repeatErrorMessage = nil
+        pendingRepeatChange = true
+        enqueue(.repeatMode)
     }
 
     func setVolume(_ volume: Int) {
@@ -88,6 +92,9 @@ final class PlaybackOptionsModel: ObservableObject {
         playbackRefresh = nil
         request = nil
         queuedVolume = nil
+        queuedModeActions.removeAll()
+        pendingShuffleChange = false
+        pendingRepeatChange = false
         pendingVolume = nil
         isBusy = false
     }
@@ -105,6 +112,31 @@ final class PlaybackOptionsModel: ObservableObject {
         }
     }
 
+    private enum ModeAction {
+        case shuffle, repeatMode
+        func command(for snapshot: PlaybackOptionsSnapshot) -> Command? {
+            switch self {
+            case .shuffle: return snapshot.shuffleEnabled.map { .shuffle(!$0) }
+            case .repeatMode:
+                return snapshot.repeatMode.map {
+                    switch $0 {
+                    case .off: .repeatMode(.all)
+                    case .all: .repeatMode(.one)
+                    case .one: .repeatMode(.off)
+                    }
+                }
+            }
+        }
+    }
+
+    private func enqueue(_ action: ModeAction) {
+        // 每个按钮最多保留一次点击；首读或其他控件忙碌时，不丢掉用户的切换意图。
+        queuedModeActions.append(action)
+        guard !isBusy else { return }
+        // 点击前读当前状态，避免使用主窗缓存去反转用户在 Music 中更改后的设置。
+        start(.read)
+    }
+
     private func run(_ command: Command) {
         guard !isBusy else { return }
         start(command)
@@ -120,12 +152,22 @@ final class PlaybackOptionsModel: ObservableObject {
                 let result = try await command.execute(on: service)
                 guard let self, !Task.isCancelled, generation == self.generation else { return false }
                 self.snapshot = result
+                self.completeModeChange(command)
                 self.finish()
                 return true
             } catch {
                 guard let self, !Task.isCancelled, generation == self.generation else { return false }
-                // 保留最近确认值；失败不会让滑块消失或随机/循环变成未知。
-                if !(error is CancellationError) { self.errorMessage = Self.message(for: error) }
+                // 执行失败保留最近确认值；Music 有实际读回时，以读回校正状态。
+                if let failure = error as? MusicPlaybackOptionsReadbackFailure { self.snapshot = failure.snapshot }
+                let message = error is CancellationError ? nil : Self.message(for: error)
+                if let message { self.errorMessage = message }
+                self.completeModeChange(command, errorMessage: message)
+                // 失败后停止待执行模式，各按钮保留自己的失败原因，不被后续音量请求清掉。
+                self.clearModeActions(errorMessage: message)
+                if case .read = command {
+                    self.shuffleErrorMessage = message
+                    self.repeatErrorMessage = message
+                }
                 self.finish()
                 return false
             }
@@ -137,14 +179,52 @@ final class PlaybackOptionsModel: ObservableObject {
         if let volume = queuedVolume {
             queuedVolume = nil
             start(.volume(volume))
-        } else {
-            pendingVolume = nil
-            isBusy = false
+            return
         }
+        pendingVolume = nil
+        while !queuedModeActions.isEmpty {
+            let action = queuedModeActions.removeFirst()
+            if let command = action.command(for: snapshot) {
+                start(command)
+                return
+            }
+            switch action {
+            case .shuffle:
+                pendingShuffleChange = false
+                errorMessage = "无法读取随机播放状态，未执行切换。请检查「音乐」App 后重试。"
+                shuffleErrorMessage = errorMessage
+            case .repeatMode:
+                pendingRepeatChange = false
+                errorMessage = "无法读取循环播放状态，未执行切换。请检查「音乐」App 后重试。"
+                repeatErrorMessage = errorMessage
+            }
+        }
+        isBusy = false
+    }
+
+    private func completeModeChange(_ command: Command, errorMessage: String? = nil) {
+        switch command {
+        case .shuffle:
+            pendingShuffleChange = false
+            shuffleErrorMessage = errorMessage
+        case .repeatMode:
+            pendingRepeatChange = false
+            repeatErrorMessage = errorMessage
+        case .read, .volume: break
+        }
+    }
+
+    private func clearModeActions(errorMessage: String?) {
+        if pendingShuffleChange { shuffleErrorMessage = errorMessage }
+        if pendingRepeatChange { repeatErrorMessage = errorMessage }
+        queuedModeActions.removeAll()
+        pendingShuffleChange = false
+        pendingRepeatChange = false
     }
 
     private static func message(for error: Error) -> String {
         if let error = error as? PlaybackOptionsError { return error.localizedDescription }
+        if let error = error as? MusicPlaybackOptionsReadbackFailure { return error.localizedDescription }
         if let error = error as? MusicScriptFailure {
             switch error {
             case .permissionDenied:

@@ -35,6 +35,7 @@ public final class MusicScriptPlaybackOptionsService: PlaybackOptionsControlling
                         try cancellation.check()
                         let result = try executor.execute(command, checkCancellation: cancellation.check)
                         try cancellation.check()
+                        try command.confirmModeChange(in: result)
                         continuation.resume(returning: result)
                     } catch {
                         continuation.resume(throwing: error)
@@ -51,6 +52,34 @@ public final class MusicScriptPlaybackOptionsService: PlaybackOptionsControlling
 
 enum PlaybackOptionsCommand: Equatable, Sendable {
     case read, volume(Int), shuffle(Bool), repeatMode(PlaybackRepeatMode)
+
+    func confirmModeChange(in snapshot: PlaybackOptionsSnapshot) throws {
+        switch self {
+        case let .shuffle(expected) where snapshot.shuffleEnabled != expected:
+            throw MusicPlaybackOptionsReadbackFailure(snapshot: snapshot, option: .shuffle)
+        case let .repeatMode(expected) where snapshot.repeatMode != expected:
+            throw MusicPlaybackOptionsReadbackFailure(snapshot: snapshot, option: .repeatMode)
+        default: break
+        }
+    }
+}
+
+/// 保留 Music 实际读回，供界面校正状态；Apple Event 成功不等于模式已生效。
+public struct MusicPlaybackOptionsReadbackFailure: Error, Sendable, LocalizedError {
+    public enum Option: Sendable { case shuffle, repeatMode }
+    public let snapshot: PlaybackOptionsSnapshot
+    public let option: Option
+
+    public var errorDescription: String? {
+        switch option {
+        case .shuffle:
+            if snapshot.shuffleEnabled == nil { return "随机播放切换后无法确认状态，请检查「音乐」App 后重试。" }
+            return "「音乐」App 未应用随机播放设置，请检查当前播放列表后重试。"
+        case .repeatMode:
+            if snapshot.repeatMode == nil { return "循环播放切换后无法确认状态，请检查「音乐」App 后重试。" }
+            return "「音乐」App 未应用循环播放设置，请检查当前播放列表后重试。"
+        }
+    }
 }
 
 protocol PlaybackOptionsScriptExecuting: Sendable {

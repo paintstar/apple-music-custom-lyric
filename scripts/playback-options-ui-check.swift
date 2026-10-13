@@ -9,6 +9,8 @@ enum PlaybackOptionsUICheck {
     static func runChecks() async throws {
         try await checkPendingVolume()
         try await checkPreparePlayback()
+        try await checkModeChanges()
+        try await checkNativeModeHelp()
         try await checkNativeVolume()
     }
 
@@ -286,6 +288,153 @@ enum PlaybackOptionsUICheck {
         let finalCommands = await service.commands
         precondition(finalCommands.count == 4 && model.pendingVolume == nil, "卸载后的松手不得提交旧手势")
         print("PASS 原生音量持续拖动实际变化、松手一次提交、慢读回与连续输入不回跳、固定布局、键盘/辅助功能、边界裁剪与卸载取消")
+    }
+
+    private static func checkModeChanges() async throws {
+        let service = OptionsCheckService()
+        let model = PlaybackOptionsModel(service: service)
+        let mainControl = UUID()
+        model.appear(mainControl)
+        model.toggleShuffle()
+        model.cycleRepeat()
+        precondition(model.pendingShuffleChange && model.pendingRepeatChange, "首次读取期间点击应保留意图")
+        try await settle("模式首读") { await service.commands == [.read] }
+        await service.completeNext()
+        try await settle("初读后真正执行随机开启") { await service.commands == [.read, .shuffle(true)] }
+        precondition(model.snapshot.shuffleEnabled == false, "设置完成前不假定随机已经开启")
+        await service.completeNext()
+        try await settle("随机之后串行切换循环") { await service.commands.last == .repeatMode(.all) }
+        await service.completeNext()
+        try await settle("两个模式均真实确认") {
+            !model.isBusy && model.snapshot.shuffleEnabled == true && model.snapshot.repeatMode == .all
+                && !model.pendingShuffleChange && !model.pendingRepeatChange
+        }
+
+        let floatingControl = UUID()
+        model.appear(floatingControl)
+        try await settle("主窗仍可见时新浮窗也读取选项") { await service.commands.last == .read }
+        await service.completeNext(reported: .init(volume: 40, shuffleEnabled: false, repeatMode: .all))
+        try await settle("新浮窗可更新外部修改") { !model.isBusy && model.snapshot.shuffleEnabled == false }
+        model.cycleRepeat()
+        try await settle("点击循环前先读取 Music 当前值") { await service.commands.last == .read }
+        await service.completeNext(reported: .init(volume: 40, shuffleEnabled: false, repeatMode: .one))
+        try await settle("以刚读回的单曲循环决定关闭，而非缓存的列表循环") {
+            await service.commands.last == .repeatMode(.off)
+        }
+        await service.completeNext()
+        try await settle("关闭循环确认") { !model.isBusy && model.snapshot.repeatMode == .off }
+
+        model.toggleShuffle()
+        model.setVolume(73)
+        model.cycleRepeat()
+        try await settle("模式重读请求送出") { await service.commands.last == .read }
+        await service.completeNext(failing: true)
+        try await settle("失败后待提交音量仍能执行") { await service.commands.last == .volume(73) }
+        precondition(model.shuffleErrorMessage != nil && model.repeatErrorMessage != nil
+                     && !model.pendingShuffleChange && !model.pendingRepeatChange,
+                     "播放方式失败不能被后续音量请求清掉或误作成功")
+        await service.completeNext()
+        try await settle("音量成功后模式失败仍可发现") { !model.isBusy && model.shuffleErrorMessage != nil }
+        model.toggleShuffle()
+        try await settle("失败后的点击保留切换意图并重新读取") { await service.commands.last == .read }
+        await service.completeNext()
+        try await settle("失败后的下一次点击真正切换") { await service.commands.last == .shuffle(true) }
+        await service.completeNext()
+        try await settle("重试切换确认") { !model.isBusy && model.shuffleErrorMessage == nil && model.snapshot.shuffleEnabled == true }
+
+        model.toggleShuffle()
+        try await settle("未知状态前读取送出") { await service.commands.last == .read }
+        await service.completeNext(reported: .init(volume: 73, repeatMode: .off))
+        try await settle("仍然未知时明确告知未切换") {
+            !model.isBusy && !model.pendingShuffleChange && model.shuffleErrorMessage?.contains("未执行切换") == true
+        }
+        let beforeCancellation = await service.commands.count
+        model.cycleRepeat()
+        try await settle("取消前模式读取送出") { await service.commands.count == beforeCancellation + 1 }
+        model.cancel()
+        await service.completeNext(reported: .init(volume: 73, shuffleEnabled: false, repeatMode: .one))
+        try await Task.sleep(for: .milliseconds(30))
+        let cancelledCommands = await service.commands
+        precondition(cancelledCommands.count == beforeCancellation + 1 && !model.isBusy && !model.pendingRepeatChange,
+                     "生命周期取消后不得执行迟到的循环写入")
+        precondition(model.snapshot.repeatMode == .off, "取消后旧读取不能覆盖新生命周期")
+        print("PASS 首读点击排队、共享控件新显示刷新、点击前读取当前值、失败保留、真正重试、未知和生命周期取消")
+    }
+
+    private static func checkNativeModeHelp() async throws {
+        let service = OptionsCheckService()
+        let model = PlaybackOptionsModel(service: service)
+        let host = NSHostingView(rootView: HStack {
+            PlaybackShuffleButton(model: model)
+            PlaybackRepeatButton(model: model)
+        }.padding(20).environment(\.colorScheme, .dark))
+        let panel = NSPanel(contentRect: NSRect(x: 380, y: 160, width: 160, height: 88),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.contentView = host
+        panel.level = .floating
+        panel.orderFrontRegardless()
+        defer { panel.close() }
+        try await settle("非激活面板读取模式") { await service.commands == [.read] }
+        try await settle("首读期间未知状态与点击行为可从原生提示发现") {
+            host.layoutSubtreeIfNeeded()
+            panel.displayIfNeeded()
+            let helps = nativeHelpViews(host)
+            return helps.count == 2 && helps.allSatisfy {
+                $0.toolTip?.contains("状态未知") == true
+                    && $0.toolTip?.contains("点击后读取状态并切换") == true
+                    && $0.toolTip?.contains("正在读取或调整其他播放选项") == true
+            }
+        }
+        await service.completeNext()
+        try await settle("非激活面板原生提示挂载") {
+            host.layoutSubtreeIfNeeded()
+            panel.displayIfNeeded()
+            let helps = nativeHelpViews(host)
+            return !model.isBusy && helps.count == 2 && helps.allSatisfy { $0.bounds.width > 0 }
+        }
+        var helps = nativeHelpViews(host)
+        let shuffle = helps.first { $0.toolTip?.hasPrefix("随机播放：") == true }!
+        let repeating = helps.first { $0.toolTip?.hasPrefix("循环播放：") == true }!
+        precondition(shuffle.toolTip?.contains("点击开启随机播放") == true
+                     && repeating.toolTip?.contains("点击切换为列表循环") == true,
+                     "悬停提示必须同时说明功能、当前状态和下一次操作")
+        let center = NSPoint(x: shuffle.bounds.midX, y: shuffle.bounds.midY)
+        precondition(shuffle.hitTest(center) == nil, "原生 tooltip 不能拦截按钮命中")
+        let location = shuffle.convert(center, to: nil)
+        let event: @MainActor @Sendable (NSEvent.EventType) -> NSEvent = { type in
+            NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+                               timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: panel.windowNumber, context: nil,
+                               eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+        }
+        // SwiftUI 按钮可进入 AppKit 跟踪循环；用其事件队列释放，避免 down 阻塞后续 up。
+        let release = Timer(timeInterval: 0.04, repeats: false) { _ in
+            MainActor.assumeIsolated { NSApplication.shared.postEvent(event(.leftMouseUp), atStart: false) }
+        }
+        RunLoop.main.add(release, forMode: .common)
+        RunLoop.main.add(release, forMode: .eventTracking)
+        panel.sendEvent(event(.leftMouseDown))
+        try await Task.sleep(for: .milliseconds(100))
+        try await settle("非激活面板点击确实送出读取") { await service.commands.last == .read && model.pendingShuffleChange }
+        try await settle("等待确认期间原生悬停提示可读") {
+            host.layoutSubtreeIfNeeded()
+            return nativeHelpViews(host).first { $0.toolTip?.hasPrefix("随机播放：") == true }?.toolTip?
+                .contains("正在切换，等待「音乐」App 确认") == true
+        }
+        await service.completeNext()
+        try await settle("非激活面板点击确实执行切换") { await service.commands.last == .shuffle(true) }
+        await service.completeNext()
+        try await settle("读回后原生悬停提示随状态更新") {
+            host.layoutSubtreeIfNeeded()
+            helps = nativeHelpViews(host)
+            return helps.first { $0.toolTip?.hasPrefix("随机播放：") == true }?.toolTip?.contains("点击关闭随机播放") == true
+        }
+        print("PASS 非激活浮窗原生 tooltip 功能/当前状态/下一动作、提示不吞点击和确认后更新")
+    }
+
+    private static func nativeHelpViews(_ view: NSView) -> [NSView] {
+        (view.toolTip == nil ? [] : [view]) + view.subviews.flatMap(nativeHelpViews)
     }
 
     private static func settle(_ message: String, failureDetails: (() -> String)? = nil, _ predicate: () async -> Bool) async throws {

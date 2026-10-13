@@ -74,6 +74,36 @@ struct PlaybackOptionsTests {
         #expect(executor.commands.count == 1)
     }
 
+    @Test("随机/循环必须确认写入目标；未生效或未知时保留实际读回并明确失败")
+    func confirmsModeChanges() async throws {
+        let confirmed = PlaybackOptionsSnapshot(volume: 37, shuffleEnabled: true, repeatMode: .one)
+        let service = MusicScriptPlaybackOptionsService(executor: OptionsTestExecutor(result: confirmed))
+        #expect(try await service.setShuffleEnabled(true) == confirmed)
+        #expect(try await service.setRepeatMode(.one) == confirmed)
+        let actualValues = [PlaybackOptionsSnapshot(volume: 37, shuffleEnabled: false, repeatMode: .off),
+                            PlaybackOptionsSnapshot(volume: 37)]
+        for actual in actualValues {
+            let refused = MusicScriptPlaybackOptionsService(executor: OptionsTestExecutor(result: actual))
+            do {
+                _ = try await refused.setShuffleEnabled(true)
+                Issue.record("随机设置未生效不能报告成功")
+            } catch let failure as MusicPlaybackOptionsReadbackFailure {
+                #expect(failure.snapshot == actual)
+                #expect(failure.option == .shuffle)
+                #expect(failure.errorDescription?.contains("随机播放") == true)
+            }
+            do {
+                _ = try await refused.setRepeatMode(.one)
+                Issue.record("循环设置未生效不能报告成功")
+            } catch let failure as MusicPlaybackOptionsReadbackFailure {
+                #expect(failure.snapshot == actual)
+                #expect(failure.option == .repeatMode)
+                #expect(failure.errorDescription?.contains("循环播放") == true)
+            }
+            #expect(try await refused.readOptions() == actual, "普通读取应保留未知值，不误报设置失败")
+        }
+    }
+
     @Test("排队操作取消后不会发送；已执行操作的迟到结果不返回")
     func cancelsQueuedRequest() async throws {
         let executor = OptionsTestExecutor(result: .init(volume: 25), blocksFirst: true)

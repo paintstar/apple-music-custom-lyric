@@ -92,6 +92,10 @@ struct FloatingLyricsSettingsPopover: View {
         }
         .padding(16)
         .frame(width: Self.contentWidth)
+        // 用系统深色窗口底色覆盖整个弹窗（含原生箭头），不透出后方歌词或桌面。
+        .background(Color(nsColor: .windowBackgroundColor))
+        .presentationBackground(Color(nsColor: .windowBackgroundColor))
+        .preferredColorScheme(.dark)
     }
 
     private var playbackControls: some View {

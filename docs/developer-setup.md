@@ -33,7 +33,7 @@ bash scripts/package-release.sh
 
 脚本默认构建 Apple Silicon 的未签名 Release App，再对分发副本签名，生成 DMG、ZIP 和发布说明，输出位于 `.build/release/`。DMG 中提供拖到 Applications 的安装入口；ZIP 中只有 App。包名从 App 的版本号及实际 Mach-O 架构生成，构建缓存位于 `.build/release-xcode/`。安装包包含项目及第三方许可证，不包含源码、构建日志、本机数据库或签名材料。
 
-签名默认优先使用本机 `APPLE_SIGNING_IDENTITY`；没有配置时使用 ad-hoc 签名，不启用 Hardened Runtime。可通过 `--signing ad-hoc` 明确选择该模式。0.1.0 已构建 arm64 安装包；Intel 尚未提供，`--arch x86_64` 和 `--arch universal` 仅是其他架构的构建入口，需另行验收。
+签名默认优先使用本机 `APPLE_SIGNING_IDENTITY`；没有配置时使用 ad-hoc 签名，不启用 Hardened Runtime。可通过 `--signing ad-hoc` 明确选择该模式。0.1.1 已构建 arm64 安装包；Intel 尚未提供，`--arch x86_64` 和 `--arch universal` 仅是其他架构的构建入口，需另行验收。
 
 已有 Developer ID Application 证书的开发者，可在本机配置 `APPLE_SIGNING_IDENTITY` 后执行 `bash scripts/package-release.sh --signing developer-id`。脚本不导入证书，也不输出该配置值；此模式为临时分发副本启用 Hardened Runtime，并添加 `com.apple.security.automation.apple-events` entitlement，保留系统自动化授权。签名身份不是 Developer ID Application 时停止打包。
 

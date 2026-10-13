@@ -33,9 +33,9 @@ public actor NeteaseLyricsClient {
     public static let eapiLyricPath = "/eapi/song/lyric"
     /// eapi 加密体内的业务路径。
     private static let eapiLyricAPIPath = "/api/song/lyric"
-    /// 匿名请求的固定兼容标识；系统字段不代表运行机器或用户身份。
+    /// 匿名请求的固定兼容标识，不绑定应用发行版本；系统字段不代表运行机器或用户身份。
     private static let userAgent =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ShinApple/0.1.0 (lyrics fetch)"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ShinApple (lyrics fetch)"
 
     // eapi 协议固定常量（公开逆向资料，如 NeteaseCloudMusicApi 的 eapi 封装；
     // 对所有客户端一致，不是本机或账号凭据，无保密性要求）。

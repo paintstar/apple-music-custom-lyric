@@ -37,6 +37,13 @@ private struct PlaybackModeButton: View {
     private var isOn: Bool {
         kind == .shuffle ? model.snapshot.shuffleEnabled == true : (model.snapshot.repeatMode ?? .off) != .off
     }
+    private var isPending: Bool {
+        kind == .shuffle ? model.pendingShuffleChange : model.pendingRepeatChange
+    }
+    private var functionName: String { kind == .shuffle ? "随机播放" : "循环播放" }
+    private var issueMessage: String? {
+        kind == .shuffle ? model.shuffleErrorMessage : model.repeatErrorMessage
+    }
     private var label: String {
         if kind == .shuffle {
             return model.snapshot.shuffleEnabled.map { $0 ? "随机播放已开启" : "随机播放已关闭" } ?? "随机播放状态未知"
@@ -47,41 +54,85 @@ private struct PlaybackModeButton: View {
         if kind == .shuffle { return "shuffle" }
         return model.snapshot.repeatMode == .one ? "repeat.1" : "repeat"
     }
+    private var help: String {
+        let purpose = kind == .shuffle ? "随机播放：随机播放当前列表中的歌曲。" : "循环播放：重复播放当前列表或当前歌曲。"
+        let action: String
+        if isPending {
+            action = "正在切换，等待「音乐」App 确认。"
+        } else if !isKnown {
+            action = "点击后读取状态并切换；读取失败会显示原因。"
+        } else if kind == .shuffle {
+            action = model.snapshot.shuffleEnabled == true ? "点击关闭随机播放。" : "点击开启随机播放。"
+        } else {
+            switch model.snapshot.repeatMode {
+            case .off: action = "点击切换为列表循环。"
+            case .all: action = "点击切换为单曲循环。"
+            case .one: action = "点击关闭循环。"
+            case nil: action = "点击读取状态并切换。"
+            }
+        }
+        var lines = [purpose, "当前：\(label)。", action]
+        if model.isBusy, !isPending { lines.append("正在读取或调整其他播放选项，点击后会依次执行。") }
+        if let error = issueMessage { lines.append("上次操作：\(error)") }
+        return lines.joined(separator: "\n")
+    }
 
     var body: some View {
         Button {
-            if !isKnown || model.errorMessage != nil {
-                showsDetails = true
-                if model.errorMessage == nil { model.refresh() }
-            } else {
-                initiatedChange = true
-                if kind == .shuffle { model.toggleShuffle() } else { model.cycleRepeat() }
-            }
+            initiatedChange = true
+            if !isKnown || issueMessage != nil { showsDetails = true }
+            if kind == .shuffle { model.toggleShuffle() } else { model.cycleRepeat() }
         } label: {
             Image(systemName: symbol)
                 .font(.system(size: PlaybackControlSizing.iconSize, weight: .medium))
                 .foregroundStyle(isOn ? Color.appleMusicPink : .secondary)
+                .opacity(isPending ? 0.35 : 1)
                 .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
                 .contentShape(Rectangle())
                 .overlay(alignment: .topTrailing) {
-                    if !isKnown {
+                    if isPending {
+                        ProgressView().controlSize(.mini)
+                    } else if issueMessage != nil {
+                        Image(systemName: "exclamationmark.circle.fill").font(.caption2)
+                            .foregroundStyle(.orange)
+                    } else if !isKnown {
                         Image(systemName: "questionmark.circle.fill").font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
         }
         .buttonStyle(PlaybackButtonStyle(isSelected: isOn))
-        .disabled(model.isBusy)
+        .disabled(isPending)
         .accessibilityLabel(label)
-        .help(label + (isKnown ? " · 点击切换" : " · 点击重试读取"))
-        .popover(isPresented: $showsDetails) { PlaybackOptionsStatusView(model: model, title: label) }
-        .onChange(of: model.errorMessage) { _, message in
+        .accessibilityHint(help)
+        .overlay { PlaybackModeTooltip(text: help).allowsHitTesting(false).accessibilityHidden(true) }
+        .popover(isPresented: $showsDetails) {
+            PlaybackOptionsStatusView(model: model, title: functionName, stateDescription: label,
+                                      sequenceDescription: kind == .repeatMode ? "依次切换：关闭 → 列表循环 → 单曲循环 → 关闭" : nil,
+                                      issueMessage: issueMessage, isChanging: isPending,
+                                      retry: { if kind == .shuffle { model.toggleShuffle() } else { model.cycleRepeat() } })
+        }
+        .onChange(of: issueMessage) { _, message in
             if initiatedChange, message != nil { showsDetails = true; initiatedChange = false }
         }
-        .onChange(of: model.isBusy) { _, busy in
-            if !busy, model.errorMessage == nil { initiatedChange = false }
+        .onChange(of: isPending) { _, pending in
+            if !pending, issueMessage == nil { initiatedChange = false }
         }
         .modifier(PlaybackOptionsVisibility(model: model))
+    }
+}
+
+/// AppKit 注册完整按钮区域的 tooltip；不参与命中，避免浮窗 popover 与按钮样式吞掉悬停提示。
+private struct PlaybackModeTooltip: NSViewRepresentable {
+    let text: String
+    func makeNSView(context: Context) -> HelpView {
+        let view = HelpView()
+        view.setAccessibilityElement(false)
+        return view
+    }
+    func updateNSView(_ view: HelpView, context: Context) { view.toolTip = text }
+    final class HelpView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
 
@@ -166,26 +217,37 @@ struct PlaybackVolumePopover: View {
 
 private struct PlaybackOptionsStatusView: View {
     @ObservedObject var model: PlaybackOptionsModel
-    let title: String?
+    let title: String
+    let stateDescription: String
+    let sequenceDescription: String?
+    let issueMessage: String?
+    let isChanging: Bool
+    let retry: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let title { Text(title).font(.headline) }
+            Text(title).font(.headline)
+            Text("当前：\(stateDescription)")
+            if let sequenceDescription { Text(sequenceDescription).foregroundStyle(.secondary) }
             if model.isBusy {
-                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("正在读取…") }
-            } else if let message = model.errorMessage {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(isChanging ? "正在切换，等待音乐确认…" : "正在读取…")
+                }
+            }
+            if let message = issueMessage {
                 Text(message).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-                Button("重试") { model.refresh() }
+                Button("重试切换", action: retry).disabled(isChanging)
             } else {
                 if model.snapshot.volume == nil || model.snapshot.shuffleEnabled == nil || model.snapshot.repeatMode == nil {
                     Text("部分播放选项暂时无法读取。").foregroundStyle(.secondary)
                 }
-                Button("刷新播放选项") { model.refresh() }
+                Button("刷新播放选项") { model.refresh() }.disabled(model.isBusy)
             }
         }
         .font(.caption)
-        .padding(title == nil ? 0 : 16)
-        .frame(maxWidth: title == nil ? nil : 280, alignment: .leading)
+        .padding(16)
+        .frame(maxWidth: 280, alignment: .leading)
     }
 }
 
