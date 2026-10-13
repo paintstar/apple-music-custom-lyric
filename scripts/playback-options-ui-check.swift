@@ -64,38 +64,37 @@ enum PlaybackOptionsUICheck {
         let service = OptionsCheckService()
         let model = PlaybackOptionsModel(service: service)
         model.refresh()
-        let prepare = Task { await model.preparePlayback(shuffleEnabled: true) }
-        try await settle("播放准备先等待读取") { await service.commands == [.read] }
+        model.refreshAfterPlayback()
+        try await settle("播放后刷新先等待旧读取") { await service.commands == [.read] }
         await service.completeNext()
-        try await settle("播放准备设置随机") { await service.commands == [.read, .shuffle(true)] }
-        await service.completeNext()
-        let prepared = await prepare.value
-        precondition(prepared && model.snapshot.shuffleEnabled == true, "随机状态确认后才能继续播放")
-
-        let failedWithVolume = Task { await model.preparePlayback(shuffleEnabled: true) }
-        try await settle("失败播放准备送出") { await service.commands.count == 3 }
-        model.setVolume(55)
-        await service.completeNext(failing: true)
-        let failedResult = await failedWithVolume.value
-        precondition(!failedResult, "排队音量不能掩盖随机设置失败，即使旧状态恰好匹配")
-        try await settle("失败准备仍需完成排队音量") { await service.commands.last == .volume(55) }
-        await service.completeNext()
-        try await settle("排队音量确认") { !model.isBusy }
-
-        let mismatch = Task { await model.preparePlayback(shuffleEnabled: false) }
-        try await settle("第二次播放准备送出") { await service.commands.last == .shuffle(false) }
+        try await settle("列表服务确认播放后只重新读取，不在无曲目时预设随机") {
+            await service.commands == [.read, .read]
+        }
         await service.completeNext(reported: .init(volume: 40, shuffleEnabled: true, repeatMode: .off))
-        let mismatchResult = await mismatch.value
-        precondition(!mismatchResult && model.errorMessage != nil, "写入后状态不匹配必须阻止误播")
+        try await settle("刷新确认上下文服务设置的随机状态") { !model.isBusy && model.snapshot.shuffleEnabled == true }
+
+        model.setVolume(55)
+        model.refreshAfterPlayback()
+        model.setVolume(67)
+        try await settle("等待音量不插入随机写入") { await service.commands.last == .volume(55) }
+        await service.completeNext()
+        try await settle("先提交最新排队音量") { await service.commands.last == .volume(67) }
+        await service.completeNext()
+        try await settle("音量完成后刷新播放方式") { await service.commands.last == .read }
+        await service.completeNext(reported: .init(volume: 67, shuffleEnabled: false, repeatMode: .off))
+        try await settle("刷新确认普通播放和最新音量") {
+            !model.isBusy && model.snapshot.shuffleEnabled == false && model.snapshot.volume == 67
+        }
 
         model.refresh()
-        let cancelled = Task { await model.preparePlayback(shuffleEnabled: false) }
-        try await settle("取消前读取送出") { await service.commands.last == .read }
+        model.refreshAfterPlayback()
+        try await settle("取消前读取送出") { await service.commands.count == 6 }
         model.cancel()
         await service.completeNext()
-        let cancelledResult = await cancelled.value
-        precondition(!cancelledResult && !model.isBusy, "生命周期取消不能继续触发主页播放")
-        print("PASS 主页播放准备等待、随机读回确认、不匹配阻止播放与取消隔离")
+        try await Task.sleep(for: .milliseconds(30))
+        let commands = await service.commands
+        precondition(commands.count == 6 && !model.isBusy, "生命周期取消不能送出迟到的播放后刷新")
+        print("PASS 上下文播放后刷新、保留音量串行合并、读取真实随机状态与取消隔离")
     }
 
     private static func checkNativeVolume() async throws {
@@ -111,28 +110,89 @@ enum PlaybackOptionsUICheck {
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = host
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.level = .floating
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        NSApplication.shared.activate()
         defer { window.close() }
-        try await settle("生产音量滑块挂载") {
+        let windowReadiness = {
+            "active=\(NSApplication.shared.isActive), visible=\(window.isVisible), "
+                + "unoccluded=\(window.occlusionState.contains(.visible)), key=\(window.isKeyWindow)"
+        }
+        try await settle("音量测试窗口激活与可见", failureDetails: windowReadiness) {
+            window.displayIfNeeded()
+            return NSApplication.shared.isActive && window.isVisible && window.occlusionState.contains(.visible)
+        }
+        // 激活完成后再请求键盘焦点，避免应用尚未激活时的首次请求被系统延后。
+        window.makeKeyAndOrderFront(nil)
+        try await settle("音量测试窗口接收键盘焦点", failureDetails: windowReadiness) { window.isKeyWindow }
+        var mountReadiness: [String: Bool] = [:]
+        try await settle("生产音量滑块挂载", failureDetails: {
+            windowReadiness() + ", " + mountReadiness.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
+        }) {
             host.layoutSubtreeIfNeeded()
             window.displayIfNeeded()
             host.displayIfNeeded()
-            guard let slider = findSlider(host), let cell = slider.cell as? NSSliderCell else { return false }
+            let slider = findSlider(host)
+            mountReadiness = ["slider": slider != nil, "cell": slider?.cell is NSSliderCell]
+            guard let slider, let cell = slider.cell as? NSSliderCell else { return false }
             slider.displayIfNeeded()
             let knob = cell.knobRect(flipped: slider.isFlipped)
             let bar = cell.barRect(flipped: slider.isFlipped)
             let start = NSPoint(x: knob.midX + 2, y: knob.midY)
             // 原生几何就绪后仍需等宿主命中区域更新，再由窗口派发鼠标。
             let hit = host.hitTest(slider.convert(start, to: host.superview))
-            return window.isKeyWindow && slider.integerValue == 40 && knob.width > 0 && knob.height > 0
-                && bar.width > knob.width && slider.bounds.contains(NSPoint(x: knob.midX, y: knob.midY))
-                && hit === slider
+            mountReadiness.merge([
+                "key": window.isKeyWindow, "unoccluded": window.occlusionState.contains(.visible),
+                "valueReady": slider.integerValue == 40, "knobWidth": knob.width > 0, "knobHeight": knob.height > 0,
+                "barReady": bar.width > knob.width, "knobInBounds": slider.bounds.contains(NSPoint(x: knob.midX, y: knob.midY)),
+                "hit": hit === slider
+            ]) { _, latest in latest }
+            return mountReadiness.values.allSatisfy { $0 }
         }
         let slider = findSlider(host)!
         let identity = ObjectIdentifier(slider)
+        // fittingSize 会触发 SwiftUI 测量；先完成测量和绘制，再跨三个30fps周期确认基线。
+        _ = host.fittingSize
+        var previousFrame: NSRect?
+        var previousBounds: NSRect?
+        var previousKnob: NSRect?
+        var previousBar: NSRect?
+        var previousSize: NSSize?
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        try await settle("音量控件完成测量后实例、几何及命中应稳定") {
+            let size = host.fittingSize
+            host.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            host.displayIfNeeded()
+            slider.displayIfNeeded()
+            guard findSlider(host) === slider, window.isKeyWindow, window.occlusionState.contains(.visible), slider.isEnabled,
+                  slider.integerValue == 40, let cell = slider.cell as? NSSliderCell else {
+                stableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            let knob = cell.knobRect(flipped: slider.isFlipped)
+            let bar = cell.barRect(flipped: slider.isFlipped)
+            let start = NSPoint(x: knob.midX + 2, y: knob.midY)
+            guard knob.width > 0, knob.height > 0, bar.width > knob.width,
+                  host.hitTest(slider.convert(start, to: host.superview)) === slider else {
+                stableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            if previousFrame != slider.frame || previousBounds != slider.bounds || previousKnob != knob
+                || previousBar != bar || previousSize != size {
+                previousFrame = slider.frame
+                previousBounds = slider.bounds
+                previousKnob = knob
+                previousBar = bar
+                previousSize = size
+                stableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            return ProcessInfo.processInfo.systemUptime - stableSince >= 0.1
+        }
         let originalFrame = slider.frame
-        let originalSize = host.fittingSize
+        let originalSize = previousSize!
         let initialKnob = (slider.cell as! NSSliderCell).knobRect(flipped: slider.isFlipped)
         let initialBar = (slider.cell as! NSSliderCell).barRect(flipped: slider.isFlipped)
         let start = NSPoint(x: initialKnob.midX + 2, y: initialKnob.midY)
@@ -148,6 +208,7 @@ enum PlaybackOptionsUICheck {
         }
         // 与生产进度控件同样由窗口派发连续事件；不嵌套阻塞 AppKit 跟踪循环。
         window.sendEvent(event(.leftMouseDown, start))
+        precondition(slider.focusRingType == .none, "鼠标操作只显示原生拇指，不叠加键盘焦点环")
         precondition(slider.isTrackingMouse && abs(slider.integerValue - 40) <= 1,
                      "抓住滑块边缘不应跳动：tracking=\(slider.isTrackingMouse), value=\(slider.integerValue)")
         for point in [end, start, end] {
@@ -184,6 +245,7 @@ enum PlaybackOptionsUICheck {
                                              timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                                              context: nil, characters: "\u{F703}", charactersIgnoringModifiers: "\u{F703}",
                                              isARepeat: false, keyCode: 124)!)
+        precondition(slider.focusRingType == .default, "鼠标之后使用方向键应恢复系统焦点提示")
         try await settle("方向键应在未确认时直接提交新目标") { model.pendingVolume != beforeKey }
         let keyTarget = model.pendingVolume!
         precondition(keyTarget != beforeKey && slider.integerValue == keyTarget, "原生方向键必须实际调节音量")
@@ -219,18 +281,19 @@ enum PlaybackOptionsUICheck {
         precondition(slider.integerValue == 0 && model.pendingVolume == nil, "向左拖出轨道应裁剪到最小值")
         window.contentView = nil
         try await settle("卸载窗口应取消预览") { !slider.isTrackingMouse && preview.value == nil }
+        precondition(slider.focusRingType == .none, "卸载后不得保留旧键盘焦点环")
         slider.mouseUp(with: event(.leftMouseUp, end))
         let finalCommands = await service.commands
         precondition(finalCommands.count == 4 && model.pendingVolume == nil, "卸载后的松手不得提交旧手势")
         print("PASS 原生音量持续拖动实际变化、松手一次提交、慢读回与连续输入不回跳、固定布局、键盘/辅助功能、边界裁剪与卸载取消")
     }
 
-    private static func settle(_ message: String, _ predicate: () async -> Bool) async throws {
+    private static func settle(_ message: String, failureDetails: (() -> String)? = nil, _ predicate: () async -> Bool) async throws {
         for _ in 0..<250 {
             if await predicate() { return }
             try await Task.sleep(for: .milliseconds(10))
         }
-        preconditionFailure(message)
+        preconditionFailure(failureDetails.map { message + ": " + $0() } ?? message)
     }
 
     private static func findSlider(_ view: NSView) -> PlaybackVolumeSlider.VolumeSlider? {

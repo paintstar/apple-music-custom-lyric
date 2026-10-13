@@ -7,7 +7,7 @@ import ShinAppServices
 // - 关联查询只经 LyricsAssociationService：快照式刷新，序号防旧结果覆盖新状态；
 // - 同步高亮数据来自 PlaybackLyricsCoordinator：只有当前组变化才推送，
 //   本模型绝不因播放时间采样刷新全量状态（时间同步零数据库写入）；
-// - 浏览模式 FOLLOW/MANUAL：每次交互重置 5 秒等待，停止浏览后恢复跟随；
+// - 浏览模式 FOLLOW/MANUAL：每次交互按设置重置等待，停止浏览后恢复跟随；
 //   编辑与视图消失会取消等待，旧任务不能影响新歌曲/新文档。
 // - 查询失败进入 unavailable 静态错误态并保留中文说明；
 //   唯一恢复入口是界面上用户显式点击的「重试」（LyricsPanelView），
@@ -76,16 +76,29 @@ final class LyricsPanelModel: ObservableObject {
     private var manualResumeTask: Task<Void, Never>?
     private var manualResumeGeneration = 0
     private var scrollableLineIds: Set<UUID> = []
-    /// 听歌时给用户短暂阅读窗口；不参与歌词时间计算。
-    private let manualResumeDelay: Duration
+    private let defaults: UserDefaults
+    private let manualResumeDelayOverride: Duration?
+    private let monotonicTime: @MainActor () -> TimeInterval
+    private var observedResumeDelay: TimeInterval
+    private var lastReadingActivityAt: TimeInterval?
+    private var readingSettingsObserver: NSObjectProtocol?
 
 
-    init(store: GRDBLyricsStore?, manualResumeDelay: Duration = .seconds(5)) {
-        self.manualResumeDelay = manualResumeDelay
+    init(store: GRDBLyricsStore?, manualResumeDelay: Duration? = nil, defaults: UserDefaults = .standard,
+         monotonicTime: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.defaults = defaults
+        manualResumeDelayOverride = manualResumeDelay
+        self.monotonicTime = monotonicTime
+        observedResumeDelay = LyricsReadingSettings.resumeDelay(in: defaults)
         service = store.map(LyricsAssociationService.init)
         guard store != nil else {
             state = .unavailable("本地歌词库不可用，无法读写歌词。")
             return
+        }
+        readingSettingsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: defaults, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.readingSettingsChanged() }
         }
     }
 
@@ -108,6 +121,7 @@ final class LyricsPanelModel: ObservableObject {
         let currentSequence = sequence
         cancelManualResume()
         if displayedTrackKey != trackKey || requestedTrackEpoch != trackEpoch {
+            lastReadingActivityAt = nil
             browseMode = isAutoScrollSuspended ? .manual : .follow
             scrollRequest = nil
             scrollableLineIds = []
@@ -139,12 +153,18 @@ final class LyricsPanelModel: ObservableObject {
                 state = .loading
             }
         }
+        await coordinator?.waitForPendingDelayWrites()
+        guard currentSequence == sequence, requestedTrackEpoch == trackEpoch, !Task.isCancelled else { return }
+        let delaySequence = coordinator?.currentDelaySequence()
         do {
             let resolved = try await service.associationState(forTrackKey: trackKey)
-            guard currentSequence == sequence else { return }
-            applyAssociationResult(resolved, trackKey: trackKey, trackEpoch: trackEpoch)
+            guard currentSequence == sequence, !Task.isCancelled else { return }
+            applyAssociationResult(
+                resolved, trackKey: trackKey, trackEpoch: trackEpoch,
+                expectedDelaySequence: delaySequence
+            )
         } catch {
-            guard currentSequence == sequence else { return }
+            guard currentSequence == sequence, !Task.isCancelled else { return }
             state = .unavailable(ErrorText.describe(error))
             displayedTrackKey = trackKey
         }
@@ -154,7 +174,8 @@ final class LyricsPanelModel: ObservableObject {
     private func applyAssociationResult(
         _ resolved: LyricsAssociationState,
         trackKey: String,
-        trackEpoch: Int
+        trackEpoch: Int,
+        expectedDelaySequence: UInt64?
     ) {
         let previousDocumentId = currentDocumentId
         displayedTrackEpoch = trackEpoch
@@ -181,7 +202,8 @@ final class LyricsPanelModel: ObservableObject {
             displayedTrackKey = trackKey
             coordinator?.applyLyrics(
                 trackKey: trackKey, trackEpoch: trackEpoch, document: document,
-                userDelayMs: binding.userDelayMs
+                userDelayMs: binding.userDelayMs, binding: binding,
+                expectedDelaySequence: expectedDelaySequence
             )
         }
         if currentDocumentId != previousDocumentId, !isAutoScrollSuspended {
@@ -219,6 +241,7 @@ final class LyricsPanelModel: ObservableObject {
         if suspended {
             browseMode = .manual
         } else if browseMode == .manual {
+            lastReadingActivityAt = monotonicTime()
             scheduleManualResume()
         }
     }
@@ -257,6 +280,9 @@ final class LyricsPanelModel: ObservableObject {
         if let anchor = scrollAnchor(for: display),
            anchor != previousAnchor || display.waitingInterval != previous.waitingInterval {
             requestScroll(to: anchor)
+        } else if scrollAnchor(for: display) == nil, previousAnchor != nil {
+            // 短清屏没有展示锚点；清掉旧请求，偏移重排时也不能滚向已收起的空白行。
+            scrollRequest = nil
         }
     }
 
@@ -310,6 +336,7 @@ final class LyricsPanelModel: ObservableObject {
         guard !isTransitioning, !isAutoScrollSuspended else { return }
         if browseMode != .manual { browseMode = .manual }
         scrollRequest = nil
+        lastReadingActivityAt = monotonicTime()
         scheduleManualResume()
     }
 
@@ -330,7 +357,7 @@ final class LyricsPanelModel: ObservableObject {
     }
 
     private func scrollAnchor(for display: PlaybackLyricsDisplay) -> UUID? {
-        if let waiting = display.waitingInterval {
+        if let waiting = display.waitingInterval, waiting.shouldShowIndicator {
             return waiting.anchorLineId ?? waiting.nextLineId
         }
         return display.currentLineIds?.first
@@ -398,14 +425,31 @@ final class LyricsPanelModel: ObservableObject {
         guard !visibleAreas.isEmpty, activeGestures.isEmpty, !isAutoScrollSuspended, !isTransitioning,
               browseMode == .manual, currentDocumentId != nil else { return }
         let generation = manualResumeGeneration
-        let delay = manualResumeDelay
+        let now = monotonicTime()
+        let lastActivity = lastReadingActivityAt ?? now
+        lastReadingActivityAt = lastActivity
+        let configuredDelay = manualResumeDelayOverride ?? .seconds(LyricsReadingSettings.resumeDelay(in: defaults))
+        let elapsed = Duration.seconds(max(0, now - lastActivity))
+        let delay = max(.zero, configuredDelay - elapsed)
         manualResumeTask = Task { @MainActor [weak self] in
             do { try await Task.sleep(for: delay) } catch { return }
             guard let self, self.manualResumeGeneration == generation,
-                  !self.visibleAreas.isEmpty else { return }
+                  !self.visibleAreas.isEmpty, self.activeGestures.isEmpty else { return }
             self.resumeFollowing()
         }
     }
 
-    deinit { manualResumeTask?.cancel() }
+    private func readingSettingsChanged() {
+        guard manualResumeDelayOverride == nil else { return }
+        let delay = LyricsReadingSettings.resumeDelay(in: defaults)
+        guard delay != observedResumeDelay else { return }
+        observedResumeDelay = delay
+        // 设置变化不是阅读活动；新等待仍从最后一次真实滚动/选择/松手起算。
+        if browseMode == .manual { scheduleManualResume() }
+    }
+
+    isolated deinit {
+        manualResumeTask?.cancel()
+        if let readingSettingsObserver { NotificationCenter.default.removeObserver(readingSettingsObserver) }
+    }
 }

@@ -22,8 +22,8 @@ final class AppModel: ObservableObject {
     /// 官方音乐资料库与本机歌词库独立；首次打开浏览页时再加载。
     lazy var musicLibraryBrowser = MusicLibraryBrowserModel(service: controller as? MusicLibraryBrowsing)
     lazy var playbackOptions: PlaybackOptionsModel = {
-        let service: PlaybackOptionsControlling = isMock
-            ? MockPlaybackOptionsController() : MusicScriptPlaybackOptionsService()
+        let service: PlaybackOptionsControlling = (controller as? PlaybackOptionsControlling)
+            ?? (isMock ? MockPlaybackOptionsController() : MusicScriptPlaybackOptionsService())
         return PlaybackOptionsModel(service: service)
     }()
     /// 目录搜索服务仅 Mock 模式提供：真实模式播放来自「音乐」App 本身，

@@ -57,6 +57,7 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     /// 执行锁：保证 SBApplication/NSAppleScript 的串行访问（不嵌套状态锁）。
     private let executorLock = NSLock()
     private let playbackCommandQueue = DispatchQueue(label: "ShinMusicScript.playback-commands", qos: .userInitiated)
+    private let playbackContext = MusicPlaybackContext()
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let samplingIntervalNanos: UInt64
     private let sessionEpoch: Int
@@ -257,6 +258,35 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
             } onCancel: {
                 cancellation.cancel()
             }
+        } catch let failure as MusicScriptFailure {
+            throw MusicScriptMapping.playbackError(for: failure)
+        }
+    }
+
+    func performContextCommand(
+        _ operation: @escaping @Sendable (MusicPlaybackContext, () throws -> Void) throws -> Void
+    ) async throws {
+        try Task.checkCancellation()
+        let cancellation = MusicLibraryCancellation()
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    playbackCommandQueue.async { [self] in
+                        do {
+                            try operation(playbackContext) {
+                                try cancellation.check()
+                                guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+                            }
+                            _ = sampleOnce()
+                            continuation.resume()
+                        } catch {
+                            _ = sampleOnce()
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+                try Task.checkCancellation()
+            } onCancel: { cancellation.cancel() }
         } catch let failure as MusicScriptFailure {
             throw MusicScriptMapping.playbackError(for: failure)
         }

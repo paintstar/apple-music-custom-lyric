@@ -3,7 +3,6 @@ import ShinAppleKit
 
 // 同步歌词视图组件：歌词面板与播放器页面共用同一套同步渲染。
 // - SyncLyricsMenu：右上角「···」菜单，提供偏移、双语、编辑与解除关联；
-// - ResumeFollowingCapsule：手动浏览时显示「回到当前歌词」，可立即恢复跟随；
 // - SyncLyricsArea：FOLLOW/MANUAL 滚动区 + Apple Music 歌词页排版
 //   （固定行字号消除切行抖动，当前行以亮度强调，原生文本准确定位；
 //   窄窗口缩 15%，当前行锚定视口上 1/3，减少动态效果时直接定位）。
@@ -42,6 +41,8 @@ struct LyricsTypography {
 
 /// 同步歌词区常量（泛型视图不能有 static 存储属性，集中放这里）。
 enum LyricsSyncConstants {
+    /// 等待槽只容纳三点，独立于大字歌词字号，避免空行叠出大块留白。
+    static let waitingSlotHeight: CGFloat = 24
     /// 译文语言（v1 固定简体中文；与编辑器一致）。
     static let translationLanguage = "zh-Hans"
     /// 边缘渐隐高度（上下各 80pt，远端行淡出；比逐行 blur 便宜）。
@@ -64,68 +65,98 @@ extension EnvironmentValues {
     }
 }
 
-/// 右上角「···」菜单：偏移调整/双语开关/编辑/解除关联（chrome 收纳）。
+/// 顶栏与独立侧栏共用歌词动作，状态变化后重新计算启用状态。
+@MainActor
+enum LyricsMenuActions {
+    static func items(
+        panel: LyricsPanelModel?, showTranslations: Binding<Bool>,
+        onUnlink: @escaping () -> Void, onEdit: @escaping () -> Void
+    ) -> [PlaybackMenu.Item] {
+        let hasDocument = panel?.currentDocumentId != nil && panel?.isAutoScrollSuspended != true
+        let canAdjust = panel?.canAdjustDelay == true && hasDocument
+        let delay = canAdjust ? panel?.syncDisplay.delayDescription ?? "不可用" : "不可用"
+        return [
+            .init(title: "偏移：\(delay)"),
+            .init(title: "延后 0.1 秒", symbol: "goforward.100", isEnabled: canAdjust,
+                  action: { panel?.adjustDelay(byMs: LyricsPanelModel.delayStepMs) }),
+            .init(title: "提前 0.1 秒", symbol: "gobackward.100", isEnabled: canAdjust,
+                  action: { panel?.adjustDelay(byMs: -LyricsPanelModel.delayStepMs) }),
+            .init(title: "归零", symbol: "arrow.counterclockwise",
+                  isEnabled: canAdjust && panel?.syncDisplay.userDelayMs != 0,
+                  action: { panel?.resetDelay() }),
+            .separator,
+            .init(title: "显示译文", symbol: "text.bubble", isEnabled: hasDocument,
+                  isChecked: showTranslations.wrappedValue, action: { showTranslations.wrappedValue.toggle() }),
+            .separator,
+            .init(title: "编辑歌词", symbol: "square.and.pencil", isEnabled: hasDocument, action: onEdit),
+            .init(title: "解除关联", symbol: "link.slash", isEnabled: hasDocument, action: onUnlink)
+        ]
+    }
+}
+
+/// 同一菜单可独立展示，或将歌词动作并入播放器顶栏的导航菜单。
 struct SyncLyricsMenu: View {
     @ObservedObject var panel: LyricsPanelModel
     @Binding var showTranslations: Bool
     let onUnlink: () -> Void
     let onEdit: () -> Void
+    var leadingItems: [PlaybackMenu.Item] = []
+    var trailingItems: [PlaybackMenu.Item] = []
+    var compact = false
+    var accessibilityLabel = "歌词选项"
+    var help = "偏移调整、显示译文、编辑歌词与解除关联"
 
     var body: some View {
-        PlaybackMenu(items: [
-            .init(title: "偏移：\(panel.syncDisplay.delayDescription)"),
-            .init(title: "延后 0.1 秒", symbol: "goforward.100", isEnabled: panel.canAdjustDelay,
-                  action: { panel.adjustDelay(byMs: LyricsPanelModel.delayStepMs) }),
-            .init(title: "提前 0.1 秒", symbol: "gobackward.100", isEnabled: panel.canAdjustDelay,
-                  action: { panel.adjustDelay(byMs: -LyricsPanelModel.delayStepMs) }),
-            .init(title: "归零", symbol: "arrow.counterclockwise",
-                  isEnabled: panel.canAdjustDelay && panel.syncDisplay.userDelayMs != 0,
-                  action: { panel.resetDelay() }),
-            .separator,
-            .init(title: "显示译文", symbol: "text.bubble", isChecked: showTranslations,
-                  action: { showTranslations.toggle() }),
-            .separator,
-            .init(title: "编辑歌词", symbol: "square.and.pencil", isEnabled: canEdit, action: onEdit),
-            .init(title: "解除关联", symbol: "link.slash", isEnabled: !panel.isTransitioning, action: onUnlink)
-        ], accessibilityLabel: "歌词选项", help: "偏移调整、显示译文、编辑歌词与解除关联")
-    }
-
-    private var canEdit: Bool {
-        panel.currentDocumentId != nil
+        PlaybackMenu(items: leadingItems + LyricsMenuActions.items(
+            panel: panel, showTranslations: $showTranslations, onUnlink: onUnlink, onEdit: onEdit
+        ) + trailingItems, iconSize: compact ? 14 : PlaybackControlSizing.iconSize,
+                     width: compact ? 28 : PlaybackControlSizing.optionSide,
+                     height: compact ? 30 : PlaybackControlSizing.optionSide,
+                     accessibilityLabel: accessibilityLabel, help: help)
     }
 }
 
-/// 「回到当前歌词」悬浮胶囊：仅在 MANUAL（用户滚离当前行）时出现，
-/// 手动浏览期间的恢复跟随入口。
-struct ResumeFollowingCapsule: View {
-    @ObservedObject var panel: LyricsPanelModel
-    let reduceMotion: Bool
+/// 确认期间固定曲目和文档，切歌后不能解除新曲目的关联。
+@MainActor
+struct LyricsUnlinkRequest {
+    let trackKey: String
+    let trackEpoch: Int
+    let documentId: UUID
 
-    var body: some View {
-        // 组切换时字号/字重/透明度平滑过渡与滚动同节奏；reduceMotion 瞬变。
-        ZStack {
-            if panel.browseMode == .manual {
-                Button {
-                    panel.resumeFollowing()
-                } label: {
-                    Label("回到当前歌词", systemImage: "arrow.down.to.line.compact")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 7)
-                }
-                .buttonStyle(.plain)
-                .background(.ultraThinMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(.white.opacity(0.14)))
-                .help("立即恢复跟随；停止浏览约 5 秒后也会自动返回")
-                .transition(
-                    reduceMotion
-                        ? .opacity
-                        : .opacity.combined(with: .move(edge: .top))
-                )
+    init?(model: AppModel) {
+        guard let trackKey = model.currentTrackKey, let panel = model.lyricsPanel,
+              panel.displayedTrackKey == trackKey, panel.displayedTrackEpoch == model.snapshot.trackEpoch,
+              let documentId = panel.currentDocumentId else { return nil }
+        self.trackKey = trackKey
+        trackEpoch = model.snapshot.trackEpoch
+        self.documentId = documentId
+    }
+
+    func matches(_ model: AppModel) -> Bool {
+        model.currentTrackKey == trackKey && model.snapshot.trackEpoch == trackEpoch
+            && model.lyricsPanel?.displayedTrackKey == trackKey && model.lyricsPanel?.displayedTrackEpoch == trackEpoch
+            && model.lyricsPanel?.currentDocumentId == documentId
+    }
+}
+
+/// 侧栏和播放器顶栏沿用同一破坏性确认；只解除歌曲绑定，文档保留。
+struct LyricsUnlinkConfirmation: ViewModifier {
+    @EnvironmentObject private var model: AppModel
+    @Binding var request: LyricsUnlinkRequest?
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            "解除当前曲目的歌词关联？",
+            isPresented: Binding(get: { request != nil }, set: { if !$0 { request = nil } }),
+            titleVisibility: .visible, presenting: request
+        ) { target in
+            Button("解除关联（歌词文档保留在本机）", role: .destructive) {
+                if target.matches(model) { model.unlinkCurrentLyrics() }
             }
+            Button("取消", role: .cancel) {}
+        } message: { _ in
+            Text("解除后该曲目将回到「无本地歌词」状态；已保存的歌词文档不会被删除。")
         }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: panel.browseMode)
     }
 }
 
@@ -168,7 +199,8 @@ struct SyncLyricsArea<MenuContent: View>: View {
                 viewportAnchorFraction: viewportAnchorFraction,
                 waitingInterval: panel.syncDisplay.waitingInterval,
                 waitingPosition: waitingPosition,
-                waitingIsPlaying: waitingIsPlaying
+                waitingIsPlaying: waitingIsPlaying,
+                userDelayMs: panel.syncDisplay.userDelayMs
             )
             .mask {
                 let edgeHeight = min(LyricsSyncConstants.edgeFadeHeight, geometry.size.height / 6)
@@ -182,9 +214,6 @@ struct SyncLyricsArea<MenuContent: View>: View {
             }
             .overlay(alignment: .topTrailing) {
                 menu().padding(.trailing, 10).padding(.top, 6)
-            }
-            .overlay(alignment: .top) {
-                ResumeFollowingCapsule(panel: panel, reduceMotion: reduceMotion).padding(.top, 6)
             }
             .onAppear { panel.lyricsAreaAppeared(areaId) }
             .onDisappear { panel.lyricsAreaDisappeared(areaId) }

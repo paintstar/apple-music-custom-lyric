@@ -10,10 +10,12 @@ struct PlaybackListView: View {
         let trackKey: String?
         let trackEpoch: Int
         let sessionEpoch: Int
+        let contextVersion: Int
     }
     private var playbackIdentity: PlaybackIdentity {
         PlaybackIdentity(trackKey: model.snapshot.trackKey, trackEpoch: model.snapshot.trackEpoch,
-                         sessionEpoch: model.snapshot.sessionEpoch)
+                         sessionEpoch: model.snapshot.sessionEpoch,
+                         contextVersion: browser.confirmedPlaybackContextVersion)
     }
 
     init(browser: MusicLibraryBrowserModel) {

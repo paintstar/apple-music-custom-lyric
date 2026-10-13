@@ -36,7 +36,7 @@ struct NowPlayingView: View {
                     HStack(spacing: max(28, geometry.size.width * 0.045)) {
                         coverColumn
                             .frame(width: min(360, geometry.size.width * 0.38))
-                        LyricsPanelView()
+                        LyricsPanelView(showsInlineMenu: false)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     }
                     .frame(height: geometry.size.height)

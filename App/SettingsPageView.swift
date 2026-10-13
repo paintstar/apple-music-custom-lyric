@@ -2,7 +2,7 @@ import SwiftUI
 
 // 设置页：播放权限、显示偏好、本地数据位置与自动获取。
 // - 播放来源与授权状态（含「打开自动化权限设置」出口，语义同原状态区）；
-// - 显示偏好：「显示译文」（与歌词面板同一 @AppStorage 键，状态互通）；
+// - 显示偏好：「显示译文」与歌词面板互通，悬浮字号和字距与浮窗设置互通；
 // - 减少动态效果：跟随系统辅助功能设置（动效实现处均已遵守），只读呈现；
 // - 本地数据：歌词库位置说明与备份提示；真实模式提供「更改保存位置」
 //   （选目录 → 在线备份搬数据 → 立即生效，不要求重启）；
@@ -14,6 +14,14 @@ struct SettingsPageView: View {
     /// 与歌词面板共享同一键（LyricsPanelView.translationsSettingKey）。
     @AppStorage(LyricsPanelView.translationsSettingKey)
     private var showTranslations = true
+    @AppStorage(FloatingLyricsUnlockSettings.delayPreferenceKey)
+    private var floatingLyricsUnlockDelay = FloatingLyricsUnlockSettings.defaultDelay
+    @AppStorage(LyricsReadingSettings.resumeDelayPreferenceKey)
+    private var lyricsResumeDelay = LyricsReadingSettings.defaultResumeDelay
+    @AppStorage(FloatingLyricsSettings.fontSizePreferenceKey)
+    private var floatingLyricsFontSize = FloatingLyricsSettings.defaultFontSize
+    @AppStorage(FloatingLyricsSettings.characterSpacingPreferenceKey)
+    private var floatingLyricsCharacterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isDebugExpanded = false
     /// 待确认切换的目标目录（NSOpenPanel 结果；nil = 无待确认操作）。
@@ -93,9 +101,42 @@ struct SettingsPageView: View {
         section(title: "显示") {
             Toggle("显示简体中文译文", isOn: $showTranslations)
                 .help("开启后，在歌词下方显示简体中文译文；「待复核」标记原文修改后尚未核对的译文")
+            Stepper(value: Binding(
+                get: { LyricsReadingSettings.normalized(lyricsResumeDelay) },
+                set: { lyricsResumeDelay = LyricsReadingSettings.normalized($0) }
+            ), in: LyricsReadingSettings.resumeDelayRange, step: LyricsReadingSettings.resumeDelayStep) {
+                Text("自动回到当前歌词：空闲 \(formattedSetting(LyricsReadingSettings.normalized(lyricsResumeDelay))) 秒")
+            }
+            .help("停止滚动、拖动或选词达到等待时间后，自动跟随当前歌词；调整立即生效")
+            Stepper(value: Binding(
+                get: { FloatingLyricsSettings.normalizedFontSize(floatingLyricsFontSize) },
+                set: { floatingLyricsFontSize = FloatingLyricsSettings.normalizedFontSize($0) }
+            ), in: FloatingLyricsSettings.fontSizeRange, step: FloatingLyricsSettings.fontSizeStep) {
+                Text("悬浮歌词字体大小：\(formattedSetting(FloatingLyricsSettings.normalizedFontSize(floatingLyricsFontSize))) 点")
+            }
+            .help("原文和译文按比例缩放，仅作用于悬浮歌词。")
+            Stepper(value: Binding(
+                get: { FloatingLyricsSettings.normalizedCharacterSpacing(floatingLyricsCharacterSpacing) },
+                set: { floatingLyricsCharacterSpacing = FloatingLyricsSettings.normalizedCharacterSpacing($0) }
+            ), in: FloatingLyricsSettings.characterSpacingRange, step: FloatingLyricsSettings.characterSpacingStep) {
+                Text("悬浮歌词字间距：\(formattedSetting(FloatingLyricsSettings.normalizedCharacterSpacing(floatingLyricsCharacterSpacing))) 点")
+            }
+            .help("调整字与字之间的距离，仅作用于悬浮歌词。")
+            Stepper(value: $floatingLyricsUnlockDelay, in: FloatingLyricsUnlockSettings.delayRange,
+                    step: FloatingLyricsUnlockSettings.delayStep) {
+                Text("悬浮歌词解锁等待：\(floatingLyricsUnlockDelay.formatted(.number.precision(.fractionLength(0...1)))) 秒")
+            }
+            .help("锁定后持续将鼠标放在悬浮歌词上，等待指定时间显示解锁按钮；调整立即生效")
+            Text("锁定歌词后，鼠标停在歌词上会显示可点击的锁标志；移出歌词即隐藏。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Text("减少动态效果：跟随系统辅助功能设置（当前 \(reduceMotion ? "已开启：歌词滚动与高亮不做动画" : "未开启：歌词平滑滚动")）。")
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private func formattedSetting(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0...1)))
     }
 
     // MARK: - 本地数据（含保存位置切换）

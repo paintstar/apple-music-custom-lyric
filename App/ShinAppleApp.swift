@@ -18,7 +18,7 @@ struct ShinAppleApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: PlayerWindowController.mainWindowGroupID) {
             ContentView(floatingLyricsWindow: floatingLyricsWindow)
                 .environmentObject(model)
                 .frame(minWidth: PlayerWindowController.minimumSize.width,

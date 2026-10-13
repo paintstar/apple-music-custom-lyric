@@ -14,6 +14,7 @@ final class PlaybackOptionsModel: ObservableObject {
     private let service: any PlaybackOptionsControlling
     private var visibleControls = Set<UUID>()
     private var request: Task<Bool, Never>?
+    private var playbackRefresh: Task<Void, Never>?
     private var generation: UInt64 = 0
     private var lifecycleGeneration: UInt64 = 0
     private var queuedVolume: Int?
@@ -21,7 +22,7 @@ final class PlaybackOptionsModel: ObservableObject {
     var displayedVolume: Int? { pendingVolume ?? snapshot.volume }
 
     init(service: any PlaybackOptionsControlling) { self.service = service }
-    deinit { request?.cancel() }
+    deinit { request?.cancel(); playbackRefresh?.cancel() }
 
     func appear(_ id: UUID) {
         let wasEmpty = visibleControls.isEmpty
@@ -64,29 +65,27 @@ final class PlaybackOptionsModel: ObservableObject {
         }
     }
 
-    /// 主页播放先等待选项确认，再启动列表；等待期间仍允许提交最新音量。
-    func preparePlayback(shuffleEnabled: Bool) async -> Bool {
+    /// 播放服务先建立实际列表并确认随机状态，再刷新控件；音量请求仍按原顺序完成。
+    func refreshAfterPlayback() {
+        playbackRefresh?.cancel()
         let lifecycle = lifecycleGeneration
-        while let request {
-            _ = await request.value
-            guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
+        playbackRefresh = Task { [weak self] in
+            guard let self else { return }
+            while let request = self.request {
+                _ = await request.value
+                guard !Task.isCancelled, lifecycle == self.lifecycleGeneration else { return }
+            }
+            guard !Task.isCancelled, lifecycle == self.lifecycleGeneration else { return }
+            self.refresh()
         }
-        guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
-        run(.shuffle(shuffleEnabled))
-        guard let request else { return false }
-        let succeeded = await request.value
-        guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
-        guard succeeded, errorMessage == nil, snapshot.shuffleEnabled == shuffleEnabled else {
-            if errorMessage == nil { errorMessage = "未能确认随机播放状态，请重试后再播放。" }
-            return false
-        }
-        return true
     }
 
     func cancel() {
         lifecycleGeneration &+= 1
         generation &+= 1
         request?.cancel()
+        playbackRefresh?.cancel()
+        playbackRefresh = nil
         request = nil
         queuedVolume = nil
         pendingVolume = nil

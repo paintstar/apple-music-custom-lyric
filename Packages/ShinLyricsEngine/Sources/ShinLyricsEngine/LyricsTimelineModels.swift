@@ -32,6 +32,8 @@ public struct LyricsTimelineClearBoundary: Equatable, Sendable {
 /// 可确定下一句起点的等待区间。只来自前奏或明确的定时空白，不推测演唱句尾。
 /// 起止均为应用来源 offset 和用户延迟后的播放坐标，区间左闭右开。
 public struct LyricsWaitingInterval: Equatable, Sendable {
+    /// 展示启发式：不足三秒的明确等待仍保留清屏边界，只省略圆点提示。
+    public static let minimumIndicatorDurationMs: Int64 = 3_000
     public let startMs: Int64
     public let endMs: Int64
     /// 下一组中第一条非空歌词的稳定 id。
@@ -44,6 +46,11 @@ public struct LyricsWaitingInterval: Equatable, Sendable {
         self.endMs = endMs
         self.nextLineId = nextLineId
         self.anchorLineId = anchorLineId
+    }
+
+    public var shouldShowIndicator: Bool {
+        let duration = endMs.subtractingReportingOverflow(startMs)
+        return !duration.overflow && duration.partialValue >= Self.minimumIndicatorDurationMs
     }
 }
 

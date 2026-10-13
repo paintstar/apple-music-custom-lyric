@@ -23,6 +23,7 @@ struct NativeLyricsScrollView: NSViewRepresentable {
     /// 只读既有受限播放时钟；nil 表示未知、过期或 seek 中，保持静态。
     var waitingPosition: (() -> Int64?)?
     var waitingIsPlaying = false
+    var userDelayMs: Int64 = 0
 
     var resolvedViewportAnchorFraction: CGFloat { LyricsViewportAnchorKey.clamped(viewportAnchorFraction) }
 
@@ -195,14 +196,15 @@ final class LyricsScrollView: NSScrollView {
             accessibilityRows.removeAll()
         }
         let key = "\(value.document.id):\(value.document.revision):\(value.showTranslations)"
-            + ":\(value.typography.lineSize):\(value.typography.translationSize)"
+            + ":\(value.typography.lineSize):\(value.typography.translationSize):\(value.userDelayMs)"
         if key != contentKey {
             cancelAnimation()
             contentKey = key
             textLayout.textView.clearInteraction()
             accessibilityRows.removeAll()
             textLayout.rebuild(
-                document: value.document, typography: value.typography, showTranslations: value.showTranslations
+                document: value.document, typography: value.typography, showTranslations: value.showTranslations,
+                userDelayMs: value.userDelayMs
             )
             needsTextLayout = true
             targetLineId = nil
@@ -268,7 +270,7 @@ final class LyricsScrollView: NSScrollView {
     func offset(for lineId: UUID) -> CGFloat? {
         guard let index = textLayout.rowIndices[lineId] else { return nil }
         let rowY: CGFloat
-        if let interval = configuration?.waitingInterval, interval.anchorLineId == nil,
+        if let interval = configuration?.waitingInterval, interval.shouldShowIndicator, interval.anchorLineId == nil,
            interval.nextLineId == lineId, let prelude = textLayout.preludeFrame {
             rowY = prelude.minY
         } else {

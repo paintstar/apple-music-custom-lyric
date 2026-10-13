@@ -217,6 +217,7 @@ struct PlaybackVolumeSlider: NSViewRepresentable {
         slider.maxValue = 100
         slider.isContinuous = true
         slider.controlSize = .small
+        slider.focusRingType = .none
         slider.target = context.coordinator
         slider.action = #selector(Coordinator.changed(_:))
         slider.coordinator = context.coordinator
@@ -227,7 +228,10 @@ struct PlaybackVolumeSlider: NSViewRepresentable {
     func updateNSView(_ slider: VolumeSlider, context: Context) {
         context.coordinator.parent = self
         slider.updateVolumeEnabled(enabled)
-        if !slider.isTrackingMouse, slider.integerValue != value { slider.integerValue = value }
+        if !slider.isTrackingMouse, slider.integerValue != value {
+            slider.integerValue = value
+            slider.noteFocusRingMaskChanged()
+        }
         let description = "\(slider.integerValue)%"
         if slider.accessibilityValueDescription() != description { slider.setAccessibilityValueDescription(description) }
     }
@@ -248,6 +252,7 @@ struct PlaybackVolumeSlider: NSViewRepresentable {
             }
         }
         @objc func changed(_ slider: VolumeSlider) {
+            slider.noteFocusRingMaskChanged()
             slider.setAccessibilityValueDescription("\(slider.integerValue)%")
             if slider.isTrackingMouse { parent.onPreview(slider.integerValue) } else { commit(slider) }
         }
@@ -264,6 +269,33 @@ struct PlaybackVolumeSlider: NSViewRepresentable {
         private var grabOffset: CGFloat = 0
 
         override var mouseDownCanMoveWindow: Bool { false }
+
+        override func becomeFirstResponder() -> Bool {
+            let accepted = super.becomeFirstResponder()
+            if accepted {
+                // 弹窗自动聚焦和鼠标点击不画键盘圆环；Tab 进入仍保留系统提示。
+                showKeyboardFocus(NSApplication.shared.currentEvent?.type == .keyDown)
+            }
+            return accepted
+        }
+
+        override func resignFirstResponder() -> Bool {
+            let resigned = super.resignFirstResponder()
+            if resigned { showKeyboardFocus(false) }
+            return resigned
+        }
+
+        override func keyDown(with event: NSEvent) {
+            showKeyboardFocus(true)
+            super.keyDown(with: event)
+            noteFocusRingMaskChanged()
+        }
+
+        private func showKeyboardFocus(_ shown: Bool) {
+            focusRingType = shown ? .default : .none
+            noteFocusRingMaskChanged()
+            needsDisplay = true
+        }
 
         func updateVolumeEnabled(_ enabled: Bool) {
             if !enabled { cancelMouseTracking() }
@@ -282,6 +314,7 @@ struct PlaybackVolumeSlider: NSViewRepresentable {
         override func mouseDown(with event: NSEvent) {
             guard isEnabled, coordinator?.parent.enabled == true else { return }
             window?.makeFirstResponder(self)
+            showKeyboardFocus(false)
             isTrackingMouse = true
             coordinator?.begin()
             let point = convert(event.locationInWindow, from: nil)
@@ -304,7 +337,10 @@ struct PlaybackVolumeSlider: NSViewRepresentable {
         }
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {
-            if newWindow !== window { cancelMouseTracking() }
+            if newWindow !== window {
+                cancelMouseTracking()
+                showKeyboardFocus(false)
+            }
             super.viewWillMove(toWindow: newWindow)
         }
 

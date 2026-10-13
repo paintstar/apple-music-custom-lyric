@@ -125,10 +125,12 @@ enum MusicLibraryScriptSources {
 
 /// 库读取和按歌单上下文点播共用的错误映射；不把系统错误中的用户曲目信息带入日志。
 enum MusicLibraryScriptExecution {
-    static func execute(_ source: String, cancellation: MusicLibraryCancellation? = nil) throws -> NSAppleEventDescriptor {
+    static func execute(_ source: String, cancellation: MusicLibraryCancellation? = nil,
+                        checkCancellation: () throws -> Void = {}) throws -> NSAppleEventDescriptor {
         try MusicAppleScriptExecution.withLock {
             // 请求可能在等其它服务释放 OSA 时取消；获锁后必须重新检查才可发出事件。
             try cancellation?.check()
+            try checkCancellation()
             guard let script = NSAppleScript(source: source) else {
                 throw MusicScriptFailure.unknown("library:scriptConstruction")
             }

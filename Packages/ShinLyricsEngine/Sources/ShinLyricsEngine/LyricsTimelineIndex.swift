@@ -42,6 +42,8 @@ public struct LyricsTimelineIndex: Equatable, Sendable {
     private let entries: [TimedEntry]
     private let groups: [Group]
     private let waitingIntervals: [LyricsWaitingInterval]
+    /// 整份文档中符合展示时长的等待槽；已应用来源偏移与用户延迟，播放推进不改变它。
+    public var indicatorIntervals: [LyricsWaitingInterval] { waitingIntervals.filter(\.shouldShowIndicator) }
     private let effectiveStartById: [UUID: Int64]
 
     /// 按文档与当前用户延迟构建时间组索引。

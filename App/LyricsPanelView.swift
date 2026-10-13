@@ -4,11 +4,10 @@ import ShinAppServices
 
 // 歌词区：嵌入播放器页面，处理空态、同步歌词与浏览交互。
 // - 空态包括库不可用、加载中、无曲目、无本地歌词和全未打轴；
-//   加载失败提供重试入口；开启双语而缺少译文时给出提示；
+//   加载失败提供重试入口；
 // - ready：同步高亮（当前组）+ FOLLOW/MANUAL 浏览 + 点击行跳转；
 //   切歌过渡态（旧内容置灰 + 「正在阅读非当前播放歌曲」提示条）；
-//   偏移/双语/编辑/解除关联收进「···」菜单（SyncLyricsMenu），
-//   MANUAL 态出现「回到当前歌词」悬浮胶囊（ResumeFollowingCapsule）；
+//   偏移/双语/编辑/解除关联通过共享菜单提供；
 // - 原文保持固定字号，当前行提高亮度；双语开关改变行高时 FOLLOW 下立即重新定位；
 // - 原生文本排版缓存准确坐标，万行文档不创建万行视图。
 // - 本视图透明嵌入 Now Playing 页（封面模糊铺底由宿主提供）；
@@ -23,15 +22,17 @@ import ShinAppServices
 
 struct LyricsPanelView: View {
     @EnvironmentObject private var model: AppModel
-    /// 右侧栏传入关闭按钮时，将菜单移到同一顶部行；其他播放器沿用正文入口。
+    /// 右侧栏传入关闭按钮时，将菜单移到同一顶部行。
     var headerTrailing: AnyView?
+    /// 完整与紧凑播放器的歌词动作已合并到顶栏菜单。
+    var showsInlineMenu = true
 
     /// 「显示译文」的 UserDefaults 键（@AppStorage；不进歌词库设置表）。
     static let translationsSettingKey = "lyrics.showTranslations"
 
     var body: some View {
         if let panel = model.lyricsPanel {
-            ObservedLyricsPanelView(panel: panel, headerTrailing: headerTrailing)
+            ObservedLyricsPanelView(panel: panel, headerTrailing: headerTrailing, showsInlineMenu: showsInlineMenu)
         } else {
             VStack(alignment: .leading, spacing: 16) {
                 if let headerTrailing {
@@ -53,11 +54,10 @@ private struct ObservedLyricsPanelView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var panel: LyricsPanelModel
     var headerTrailing: AnyView?
+    var showsInlineMenu: Bool
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var showUnlinkConfirm = false
-    @State private var translationHintDocumentKey: LyricsTranslationPolicy.DocumentKey?
-    @State private var showsMissingTranslationHint = false
+    @State private var unlinkRequest: LyricsUnlinkRequest?
     /// 双语显示开关。持久化方式：@AppStorage → UserDefaults 标准
     /// 域，key 见 `translationsSettingKey`（README 有说明；不入歌词库备份）。
     @AppStorage(LyricsPanelView.translationsSettingKey)
@@ -68,7 +68,7 @@ private struct ObservedLyricsPanelView: View {
             if let headerTrailing {
                 HStack(spacing: 4) {
                     Spacer(minLength: 0)
-                    if case .ready = panel.state { lyricsMenu }
+                    if showsInlineMenu, case .ready = panel.state { lyricsMenu }
                     headerTrailing
                 }
             }
@@ -76,18 +76,7 @@ private struct ObservedLyricsPanelView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .animation(reduceMotion ? nil : .easeIn(duration: 0.25), value: panel.contentChangeKey)
-        .confirmationDialog(
-            "解除当前曲目的歌词关联？",
-            isPresented: $showUnlinkConfirm,
-            titleVisibility: .visible
-        ) {
-            Button("解除关联（歌词文档保留在本机）", role: .destructive) {
-                model.unlinkCurrentLyrics()
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("解除后该曲目将回到「无本地歌词」状态；已保存的歌词文档不会被删除。")
-        }
+        .modifier(LyricsUnlinkConfirmation(request: $unlinkRequest))
         .onChange(of: scenePhase) { _, phase in
             // 前台恢复：立即按最近权威快照重算（协调器从不用计时器累加）。
             if phase == .active {
@@ -168,12 +157,14 @@ private struct ObservedLyricsPanelView: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            HStack {
-                Button("编辑歌词") {
-                    model.beginLyricsEditing()
+            if showsInlineMenu {
+                HStack {
+                    Button("编辑歌词") {
+                        model.beginLyricsEditing()
+                    }
+                    .disabled(!model.canBeginLyricsEditing)
+                    unlinkButton
                 }
-                .disabled(!model.canBeginLyricsEditing)
-                unlinkButton
             }
         }
     }
@@ -221,23 +212,13 @@ private struct ObservedLyricsPanelView: View {
 
     private func readyContent(_ document: LyricDocument, panel: LyricsPanelModel) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            // 歌词菜单：偏移/双语/编辑/解除关联收进歌词区右上角
-            // 「···」菜单；「回到当前歌词」仅在 MANUAL 态以悬浮胶囊出现。
+            // 播放器由顶栏统一提供歌词菜单，独立侧栏保留自己的入口。
             // 来源徽标：在线获取的歌词显示来源与核对状态；
             // 手动导入/人工编辑成果不带任何获取标记（手动优先的呈现面）。
             if let sourceLabel = Self.fetchSourceLabel(document) {
                 Label(sourceLabel, systemImage: "arrow.down.circle")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-            }
-            // 中文原文无需中文译文；外文无译文时保留编辑入口。
-            if showTranslations, translationHintDocumentKey == .init(document), showsMissingTranslationHint {
-                Label(
-                    "这份歌词还没有译文；可在「···」菜单的「编辑歌词」中为每行填写简体中文译文。",
-                    systemImage: "text.bubble"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
             SyncLyricsArea(
                 document: document,
@@ -267,16 +248,9 @@ private struct ObservedLyricsPanelView: View {
                 waitingIsPlaying: model.snapshot.status == .playing && model.pendingSeek == nil
                     && !panel.isTransitioning && !panel.isAutoScrollSuspended,
                 menu: {
-                    if headerTrailing == nil { lyricsMenu }
+                    if showsInlineMenu, headerTrailing == nil { lyricsMenu }
                 }
             )
-        }
-        // 任务挂在始终存在的正文容器上；空 Group 不会启动 task。
-        // 按文档变更计算一次，新文档识别完成前不展示旧结果。
-        .task(id: LyricsTranslationPolicy.DocumentKey(document)) {
-            guard !Task.isCancelled else { return }
-            showsMissingTranslationHint = LyricsTranslationPolicy.shouldShowMissingTranslation(document)
-            translationHintDocumentKey = .init(document)
         }
     }
 
@@ -284,7 +258,7 @@ private struct ObservedLyricsPanelView: View {
         SyncLyricsMenu(
             panel: panel,
             showTranslations: $showTranslations,
-            onUnlink: { showUnlinkConfirm = true },
+            onUnlink: { unlinkRequest = LyricsUnlinkRequest(model: model) },
             onEdit: { model.beginLyricsEditing() }
         )
     }
@@ -307,7 +281,7 @@ private struct ObservedLyricsPanelView: View {
 
     private var unlinkButton: some View {
         Button("解除关联") {
-            showUnlinkConfirm = true
+            unlinkRequest = LyricsUnlinkRequest(model: model)
         }
     }
 

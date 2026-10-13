@@ -31,9 +31,10 @@ struct CompactPlayerView: View {
                 VStack(spacing: 0) {
                     Color.clear.frame(height: coverHeight).allowsHitTesting(false)
                     PlaybackStatusView(compact: true)
-                    LyricsPanelView()
+                    LyricsPanelView(showsInlineMenu: false)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .padding(.horizontal, 18)
+                        .padding(.top, 16)
                         .padding(.bottom, 8)
                 }
                 ZStack(alignment: .bottom) {

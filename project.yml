@@ -45,6 +45,7 @@ targets:
         MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1
         INFOPLIST_FILE: App/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: App/ShinApple.entitlements
         CODE_SIGN_STYLE: Automatic
         # 非隔离异步函数在调用者隔离域执行（Approachable Concurrency），

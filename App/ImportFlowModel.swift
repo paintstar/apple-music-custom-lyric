@@ -45,12 +45,14 @@ final class ImportFlowModel: ObservableObject {
     /// 粘贴输入的歌词文本（idle 阶段文本框绑定）。「重新输入」保留内容便于修改重试；
     /// 成功/取消后随会话清理。
     @Published var pastedText = ""
-    /// 确认成功后的回调（宿主用于刷新歌词面板）。
-    var onDidConfirm: (() -> Void)?
+    /// 确认成功后的回调（宿主核对目标后刷新歌词并立即恢复跟随）。
+    var onDidConfirm: ((ImportConfirmation) -> Void)?
 
     private let service: ImportWorkflowService
     /// 代序号：取消/重开/新操作使旧异步结果失效。
     private var generation = 0
+    /// 宿主的保存后刷新同样核对此代次，避免新导入期间被旧完成任务抢回跟随。
+    var operationGeneration: Int { generation }
     /// 最近一次就绪的预览（保存失败退回时复用）。
     private var lastReady: (preview: ImportPreview, existing: ExistingBindingInfo?)?
     /// 「包含译文」关掉前最后使用的非 off 模式（再次打开时恢复）。
@@ -81,6 +83,7 @@ final class ImportFlowModel: ObservableObject {
         provenance: FetchProvenance? = nil
     ) async {
         generation += 1
+        let currentGeneration = generation
         target = newTarget
         phase = .idle
         alertMessage = nil
@@ -90,9 +93,13 @@ final class ImportFlowModel: ObservableObject {
         resetBilingualUIState()
         do {
             try await service.openImportSession(target: newTarget, provenance: provenance)
+            guard currentGeneration == generation else { return }
             // 目标已固定，此处查询结果只反映库中现状（提示卡数据源）。
-            existingForTarget = try? await service.existingBindingInfo()
+            let existing = try? await service.existingBindingInfo()
+            guard currentGeneration == generation else { return }
+            existingForTarget = existing
         } catch {
+            guard currentGeneration == generation else { return }
             alertMessage = ErrorText.describe(error)
         }
     }
@@ -197,7 +204,7 @@ final class ImportFlowModel: ObservableObject {
             let confirmation = try await service.confirmImport()
             guard currentGeneration == generation else { return }
             phase = .succeeded(confirmation)
-            onDidConfirm?()
+            onDidConfirm?(confirmation)
         } catch {
             guard currentGeneration == generation else { return }
             alertMessage = ErrorText.describe(error)
@@ -213,7 +220,9 @@ final class ImportFlowModel: ObservableObject {
     /// 取消导入：服务层不写库；关闭面板即可。
     func cancel() async {
         generation += 1
+        let currentGeneration = generation
         await service.cancel()
+        guard currentGeneration == generation else { return }
         target = nil
         existingForTarget = nil
         lastReady = nil

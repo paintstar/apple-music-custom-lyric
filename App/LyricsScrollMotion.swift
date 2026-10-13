@@ -107,7 +107,7 @@ extension LyricsScrollView {
     }
 
     func updateWaitingIndicator() {
-        guard let value = configuration, let interval = value.waitingInterval else {
+        guard let value = configuration, let interval = value.waitingInterval, interval.shouldShowIndicator else {
             waitingIndicator.configure(interval: nil, positionMs: nil, reduceMotion: true)
             waitingNeedsFrames = false
             return
@@ -122,7 +122,7 @@ extension LyricsScrollView {
         // 独立绘制在已有文字槽，既不改变 document height，也不拦截文本选择事件。
         waitingIndicator.frame = NSRect(
             x: rowFrame.minX, y: rowFrame.minY + textTopInset,
-            width: min(contentSize.width, 90), height: max(24, rowFrame.height)
+            width: min(contentSize.width, 90), height: LyricsSyncConstants.waitingSlotHeight
         )
         let position = value.waitingPosition?()
         waitingIndicator.configure(interval: interval, positionMs: position, reduceMotion: value.reduceMotion)

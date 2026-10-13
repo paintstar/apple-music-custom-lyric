@@ -1,5 +1,6 @@
 import AppKit
 import ShinAppleKit
+import ShinLyricsEngine
 
 /// TextKit 以固定字体建立准确行坐标；只在文档、排版或宽度变化时重新排版。
 /// 当前行颜色使用临时绘制属性，不改变字形、换行或文档高度。
@@ -25,6 +26,7 @@ final class LyricsTextLayout {
     private var blankTimeGroups: Set<Int> = []
     private(set) var preludeFrame: NSRect?
     private var preludeRange: NSRange?
+    private var waitingSlotLineIds: Set<UUID> = []
     private var emphasizedIndices: Set<Int> = []
     private var activeIds: Set<UUID> = []
     private var hoveredId: UUID?
@@ -57,7 +59,7 @@ final class LyricsTextLayout {
         textView.setAccessibilityLabel("同步歌词；单击或双击重听，拖动选择文字")
     }
 
-    func rebuild(document: LyricDocument, typography: LyricsTypography, showTranslations: Bool) {
+    func rebuild(document: LyricDocument, typography: LyricsTypography, showTranslations: Bool, userDelayMs: Int64 = 0) {
         let text = NSMutableAttributedString(string: "")
         resetEmphasis()
         rows = []
@@ -70,13 +72,10 @@ final class LyricsTextLayout {
         hoveredId = nil
         preludeRange = nil
         preludeFrame = nil
-        // 在最早的可见定时行前保留固定等待槽，切入/离开前奏不改变排版或视口。
-        let firstStart = document.lines.compactMap(\.startMs).min()
-        let preludeLineId = firstStart.flatMap { start in
-            document.lines.first {
-                $0.startMs == start && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }?.id
-        }
+        // 整文档一次预计算紧凑槽；资格采用有效时间，进入/退出等待不重新排版。
+        let intervals = LyricsTimelineIndex(document: document, userDelayMs: userDelayMs).indicatorIntervals
+        waitingSlotLineIds = Set(intervals.compactMap(\.anchorLineId))
+        let preludeLineId = intervals.first { $0.anchorLineId == nil }?.nextLineId
         for line in document.lines {
             let isBlank = line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if let start = line.startMs, let group = groups[start] {
@@ -84,20 +83,25 @@ final class LyricsTextLayout {
                 if !isBlank { blankTimeGroups.remove(group) }
             }
             if line.id == preludeLineId {
-                preludeRange = append(
-                    "\u{00a0}", to: text,
-                    style: (.systemFont(ofSize: typography.lineSize, weight: .bold), 0),
-                    spacing: LyricsTypography.groupSpacing,
-                    lineSpacing: typography.lineSize * LyricsTypography.lineSpacingFactor
-                )
+                preludeRange = appendWaitingSlot(to: text)
             }
             let translation = showTranslations ? line.translations[LyricsSyncConstants.translationLanguage] : nil
-            let originalRange = append(
-                isBlank ? "\u{00a0}" : line.text, to: text,
-                style: (.systemFont(ofSize: typography.lineSize, weight: .bold), line.startMs == nil ? 0.3 : 0.35),
-                spacing: translation == nil ? LyricsTypography.groupSpacing : LyricsTypography.translationSpacing,
-                lineSpacing: typography.lineSize * LyricsTypography.lineSpacingFactor
-            )
+            let originalRange: NSRange
+            if isBlank, waitingSlotLineIds.contains(line.id) {
+                originalRange = appendWaitingSlot(to: text)
+            } else if isBlank, line.startMs != nil, translation == nil {
+                // 只压缩展示；文档中空行的文本、稳定身份、时间及人工翻译均不改。
+                originalRange = NSRange(location: text.length, length: 0)
+            } else {
+                let compactBlank = isBlank && line.startMs != nil
+                originalRange = append(
+                    isBlank ? "\u{00a0}" : line.text, to: text,
+                    style: (.systemFont(ofSize: compactBlank ? 1 : typography.lineSize, weight: .bold),
+                            line.startMs == nil ? 0.3 : 0.35),
+                    spacing: translation == nil ? LyricsTypography.groupSpacing : LyricsTypography.translationSpacing,
+                    lineSpacing: compactBlank ? 0 : typography.lineSize * LyricsTypography.lineSpacingFactor
+                )
+            }
             var translationRange: NSRange?
             if let translation {
                 translationRange = append(
@@ -114,6 +118,17 @@ final class LyricsTextLayout {
             ))
         }
         storage.setAttributedString(text)
+    }
+
+    private func appendWaitingSlot(to text: NSMutableAttributedString) -> NSRange {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = LyricsSyncConstants.waitingSlotHeight
+        paragraph.maximumLineHeight = LyricsSyncConstants.waitingSlotHeight
+        let range = NSRange(location: text.length, length: 1)
+        text.append(NSAttributedString(string: "\u{00a0}\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 1), .foregroundColor: NSColor.clear, .paragraphStyle: paragraph
+        ]))
+        return range
     }
 
     private func append(
@@ -139,11 +154,14 @@ final class LyricsTextLayout {
         manager.ensureLayout(for: container)
         if let preludeRange {
             let glyphs = manager.glyphRange(forCharacterRange: preludeRange, actualCharacterRange: nil)
-            preludeFrame = manager.boundingRect(forGlyphRange: glyphs, in: container)
+            preludeFrame = manager.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
         }
         for index in rows.indices {
+            guard rows[index].originalRange.length > 0 else { continue }
             let glyphs = manager.glyphRange(forCharacterRange: rows[index].originalRange, actualCharacterRange: nil)
-            rows[index].frame = manager.boundingRect(forGlyphRange: glyphs, in: container)
+            rows[index].frame = waitingSlotLineIds.contains(rows[index].id)
+                ? manager.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+                : manager.boundingRect(forGlyphRange: glyphs, in: container)
             var groupFrame = rows[index].frame
             if let range = rows[index].translationRange {
                 let translated = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
@@ -151,7 +169,15 @@ final class LyricsTextLayout {
             }
             rows[index].interactionFrame = NSRect(x: 0, y: groupFrame.minY, width: width, height: groupFrame.height)
         }
-        return ceil(manager.usedRect(for: container).height)
+        let height = ceil(manager.usedRect(for: container).height)
+        var nextY = height
+        for index in rows.indices.reversed() {
+            if rows[index].originalRange.length == 0 {
+                rows[index].frame = NSRect(x: 0, y: nextY, width: 0, height: 0)
+                rows[index].interactionFrame = rows[index].frame
+            } else { nextY = rows[index].frame.minY }
+        }
+        return height
     }
 
     func highlight(lineIds: Set<UUID>) {

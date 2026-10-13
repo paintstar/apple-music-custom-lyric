@@ -64,3 +64,15 @@ public actor MockPlaybackOptionsController: PlaybackOptionsControlling {
         return snapshot
     }
 }
+
+/// Mock 资料库启动和播放选项共享同一份状态，刷新控件能读回上下文实际设置。
+extension MockPlaybackController: PlaybackOptionsControlling {
+    public func readOptions() async throws -> PlaybackOptionsSnapshot { try await mockPlaybackOptions.readOptions() }
+    public func setVolume(_ volume: Int) async throws -> PlaybackOptionsSnapshot { try await mockPlaybackOptions.setVolume(volume) }
+    public func setShuffleEnabled(_ enabled: Bool) async throws -> PlaybackOptionsSnapshot {
+        try await mockPlaybackOptions.setShuffleEnabled(enabled)
+    }
+    public func setRepeatMode(_ mode: PlaybackRepeatMode) async throws -> PlaybackOptionsSnapshot {
+        try await mockPlaybackOptions.setRepeatMode(mode)
+    }
+}

@@ -12,6 +12,90 @@ import ShinAppServices
 @main
 private struct ImportPasteCheck {
 
+    @MainActor private static func eventually(_ message: String, _ predicate: () -> Bool) async throws {
+        for _ in 0..<200 {
+            if predicate() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        preconditionFailure(message)
+    }
+
+    @MainActor private static func checkAutomaticReturn(store: GRDBLyricsStore) async throws {
+        let timedText = "[00:00.00]晨风拂过纸船\n[00:05.00]晚灯照着浅湾"
+        let cases: [(String, Int64?, String, Int?)] = [
+            ("FACE0A11", 6_000, timedText, 1),
+            ("FACE0A12", nil, timedText, nil),
+            ("FACE0A13", 6_000, "晨风拂过纸船\n晚灯照着浅湾", nil)
+        ]
+        for (identifier, position, text, currentLineIndex) in cases {
+            let snapshot = PlaybackSnapshot(
+                trackEpoch: 1, positionMs: position, durationMs: 30_000, status: .paused,
+                trackRef: "music-script:persistent:\(identifier)"
+            )
+            let model = AppModel(isMock: true, controller: MockPlaybackController(), searchService: nil)
+            model.applySnapshot(snapshot)
+            model.installLyricsServiceGraph(store: store, note: "原创测试临时歌词库")
+            let flow = model.importFlow!
+            let panel = model.lyricsPanel!
+            model.isImportPresented = true
+            await flow.openSession(target: ImportSessionTarget(trackKey: snapshot.trackKey!))
+            flow.pastedText = text
+            await flow.ingestPastedText()
+            guard case let .ready(preview, _) = flow.phase else { preconditionFailure("预览应已就绪") }
+            await flow.confirm()
+            precondition(!model.isImportPresented && flow.phase == .idle && flow.target == nil,
+                         "保存成功应自动关闭导入页并清理会话")
+            try await eventually("导入后应立即恢复 FOLLOW，不等待手动阅读超时") {
+                panel.currentDocumentId == preview.documentId && panel.browseMode == .follow
+            }
+            if let currentLineIndex, let document = try await store.document(id: preview.documentId) {
+                precondition(panel.scrollRequest?.lineId == document.lines[currentLineIndex].id,
+                             "暂停导入也应按权威位置回到当前歌词")
+            } else {
+                precondition(panel.scrollRequest == nil, "未知位置或纯文本不得猜测当前歌词")
+            }
+        }
+
+        let original = PlaybackSnapshot(trackEpoch: 1, positionMs: 6_000, durationMs: 30_000,
+                                        status: .paused, trackRef: "music-script:persistent:FACE0A14")
+        let model = AppModel(isMock: true, controller: MockPlaybackController(), searchService: nil)
+        model.applySnapshot(original)
+        model.installLyricsServiceGraph(store: store, note: "原创测试临时歌词库")
+        let flow = model.importFlow!
+        let panel = model.lyricsPanel!
+        model.isImportPresented = true
+        await flow.openSession(target: ImportSessionTarget(trackKey: original.trackKey!))
+        flow.pastedText = timedText
+        await flow.ingestPastedText()
+        var next = original
+        next.trackEpoch += 1
+        next.trackRef = "music-script:persistent:FACE0A15"
+        model.applySnapshot(next)
+        await panel.refresh(trackKey: next.trackKey, trackEpoch: next.trackEpoch)
+        await flow.confirm()
+        precondition(panel.displayedTrackKey == next.trackKey && panel.currentDocumentId == nil,
+                     "旧目标导入成功不得覆盖切歌后的内容")
+        let originalBinding = try await store.binding(forTrackKey: original.trackKey!)
+        precondition(originalBinding != nil, "导入仍应保存到打开时固定的目标")
+
+        // 完成任务尚未执行时立即在同一歌曲重开导入，旧代次必须失效。
+        var returning = original
+        returning.trackEpoch = next.trackEpoch + 1
+        model.applySnapshot(returning)
+        model.isImportPresented = true
+        await flow.openSession(target: ImportSessionTarget(trackKey: original.trackKey!))
+        flow.pastedText = timedText
+        await flow.ingestPastedText()
+        await flow.confirm()
+        model.isImportPresented = true
+        await flow.openSession(target: ImportSessionTarget(trackKey: original.trackKey!))
+        try await Task.sleep(for: .milliseconds(50))
+        precondition(model.isImportPresented && panel.browseMode == .manual && panel.scrollRequest == nil,
+                     "同歌曲的新导入不得被旧完成任务抢回跟随或关闭")
+        await flow.cancel()
+        print("PASS 导入自动关闭与跟随：暂停定位、未知位置、纯文本、切歌与同歌曲重开保护")
+    }
+
     @MainActor private static func runChecks() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("shin-import-paste-check-\(UUID())")
@@ -101,6 +185,7 @@ private struct ImportPasteCheck {
         precondition(flow.pastedText.isEmpty && flow.phase == .idle, "新会话应从空输入开始")
 
         print("PASS 粘贴导入：空白拒绝/LRC 与纯文本解析/双语成对/重新输入保留/超限拒绝/确认落库/取消与会话清理")
+        try await checkAutomaticReturn(store: store)
     }
 
     static func main() {

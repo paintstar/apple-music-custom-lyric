@@ -21,6 +21,8 @@ open .build/xcode/Build/Products/Debug/ShinApple.app
 
 可用 `--arch arm64`、`--arch x86_64` 或 `--arch universal` 指定构建架构，用 `--derived-data .build/其他目录` 隔离派生数据。省略这两个参数时保留原有 Xcode 构建行为，`ci-local.sh` 继续使用 `.build/xcode/`。
 
+应用图标源图为 `Resources/AppIcon-source.png`，macOS 各尺寸位于 `App/Assets.xcassets/AppIcon.appiconset/`，由 `project.yml` 的 AppIcon 设置打包。替换为至少 1024 × 1024 像素的正方形源图后，运行 `bash scripts/generate-app-icon.sh` 更新全部尺寸；脚本只使用 macOS 自带的 `sips`，透明角会保留。
+
 ## 安装包
 
 在仓库根目录运行：

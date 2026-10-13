@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// 透明宽边只负责缩放；中央返回 nil，歌词滚动、顶部拖动和按钮按原有层级命中。
+/// 透明宽边只负责缩放；中央返回 nil，由正文拖动层接收，工具按钮仍按层级优先命中。
 struct FloatingLyricsResizeRegion: NSViewRepresentable {
     let isEnabled: Bool
 
@@ -18,36 +18,72 @@ struct FloatingLyricsResizeRegion: NSViewRepresentable {
             didSet {
                 guard isEnabled != oldValue else { return }
                 if !isEnabled { cancelResize() }
-                window?.invalidateCursorRects(for: self)
+                updateTrackingAreas()
+                scheduleCursorRefresh()
             }
         }
         private var edge: FloatingLyricsResizeGeometry.Edge?
+        var activeEdge: FloatingLyricsResizeGeometry.Edge? { edge }
         private var initialFrame: NSRect?
         private var initialPoint: NSPoint?
         private var visibleFrame: NSRect?
         private weak var dragWindow: NSWindow?
+        private var cursorTrackingArea: NSTrackingArea?
 
         override var mouseDownCanMoveWindow: Bool { false }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
+            let localPoint = convert(point, from: superview)
             guard isEnabled, !isHiddenOrHasHiddenAncestor, window?.ignoresMouseEvents != true,
-                  FloatingLyricsResizeGeometry.handle(at: convert(point, from: superview), in: bounds) != nil else { return nil }
+                  !toolbarExclusion.contains(localPoint),
+                  FloatingLyricsResizeGeometry.handle(at: localPoint, in: bounds) != nil else { return nil }
             return self
         }
 
-        override func resetCursorRects() {
-            guard isEnabled, window?.ignoresMouseEvents != true else { return }
-            for handle in FloatingLyricsResizeGeometry.Edge.allCases {
-                let rect = FloatingLyricsResizeGeometry.region(for: handle, in: bounds)
-                if !rect.isEmpty { addCursorRect(rect, cursor: cursor(for: handle)) }
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            guard canInteract else {
+                if let cursorTrackingArea { removeTrackingArea(cursorTrackingArea); self.cursorTrackingArea = nil }
+                return
             }
+            // 可见区域由 AppKit 自动同步，保留 identity，避免每次布局都重新参与光标仲裁。
+            guard cursorTrackingArea == nil else { return }
+            let area = NSTrackingArea(rect: .zero, options: [.activeInActiveApp, .cursorUpdate, .inVisibleRect],
+                                      owner: self, userInfo: nil)
+            addTrackingArea(area)
+            cursorTrackingArea = area
+            #if DEBUG
+            (window as? FloatingLyricsPanel)?.traceFloatingCursor("resize.trackingRegistered", view: self)
+            #endif
+        }
+
+        override func resetCursorRects() {
+            super.resetCursorRects()
+            guard canInteract else { return }
+            let exclusion = toolbarExclusion
+            for handle in FloatingLyricsResizeGeometry.Edge.allCases {
+                let region = FloatingLyricsResizeGeometry.region(for: handle, in: bounds)
+                for rect in FloatingLyricsDragGeometry.subtracting(exclusion, from: region) where !rect.isEmpty {
+                    addCursorRect(rect, cursor: FloatingLyricsResizeCursor.cursor(for: handle))
+                }
+            }
+            #if DEBUG
+            (window as? FloatingLyricsPanel)?.traceFloatingCursor("resize.cursorRectsRegistered", view: self)
+            #endif
+        }
+
+        override func cursorUpdate(with event: NSEvent) {
+            #if DEBUG
+            (window as? FloatingLyricsPanel)?.traceFloatingCursor("resize.cursorUpdate", event: event, view: self)
+            #endif
+            (window as? FloatingLyricsPanel)?.receiveTrackingEvent(event)
         }
 
         override func setFrameSize(_ newSize: NSSize) {
             let changed = frame.size != newSize
             super.setFrameSize(newSize)
-            if changed { window?.invalidateCursorRects(for: self) }
+            if changed { scheduleCursorRefresh() }
         }
 
         override func mouseDown(with event: NSEvent) {
@@ -60,7 +96,6 @@ struct FloatingLyricsResizeRegion: NSViewRepresentable {
             visibleFrame = FloatingLyricsWindowGeometry.visibleFrame(for: window.frame,
                                                                      visibleFrames: NSScreen.screens.map(\.visibleFrame))
             dragWindow = window
-            cursor(for: handle).set()
         }
 
         override func mouseDragged(with event: NSEvent) {
@@ -72,7 +107,6 @@ struct FloatingLyricsResizeRegion: NSViewRepresentable {
                 edge: edge, limits: .init(minimumSize: window.minSize, maximumSize: window.maxSize, visibleFrame: visibleFrame)
             )
             window.setFrame(frame, display: true, animate: false)
-            cursor(for: edge).set()
         }
 
         override func mouseUp(with event: NSEvent) {
@@ -82,7 +116,10 @@ struct FloatingLyricsResizeRegion: NSViewRepresentable {
         }
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {
-            if newWindow !== window { cancelResize() }
+            if newWindow !== window {
+                cancelResize()
+                if let cursorTrackingArea { removeTrackingArea(cursorTrackingArea); self.cursorTrackingArea = nil }
+            }
             super.viewWillMove(toWindow: newWindow)
         }
 
@@ -94,32 +131,15 @@ struct FloatingLyricsResizeRegion: NSViewRepresentable {
             initialPoint = nil
             visibleFrame = nil
             dragWindow = nil
+            scheduleCursorRefresh()
         }
 
-        private func cursor(for edge: FloatingLyricsResizeGeometry.Edge) -> NSCursor {
-            if #available(macOS 15, *) {
-                return .frameResize(position: cursorPosition(for: edge), directions: .all)
-            }
-            switch edge {
-            case .left, .right: return .resizeLeftRight
-            case .top, .bottom: return .resizeUpDown
-            case .topLeft, .topRight, .bottomLeft, .bottomRight: return .crosshair
-            }
+        private func scheduleCursorRefresh() {
+            (window as? FloatingLyricsPanel)?.refreshFloatingCursor()
         }
 
-        @available(macOS 15, *)
-        private func cursorPosition(for edge: FloatingLyricsResizeGeometry.Edge) -> NSCursor.FrameResizePosition {
-            switch edge {
-            case .left: return .left
-            case .right: return .right
-            case .top: return .top
-            case .bottom: return .bottom
-            case .topLeft: return .topLeft
-            case .topRight: return .topRight
-            case .bottomLeft: return .bottomLeft
-            case .bottomRight: return .bottomRight
-            }
-        }
+        private var canInteract: Bool { isEnabled && !isHiddenOrHasHiddenAncestor && window?.ignoresMouseEvents != true }
+        private var toolbarExclusion: NSRect { (window as? FloatingLyricsPanel)?.floatingToolbarExclusion(in: self) ?? .zero }
     }
 }
 
@@ -127,7 +147,7 @@ enum FloatingLyricsResizeGeometry {
     /// 无边框窗的可见边缘很薄；12 点命中带更容易抓取且不占歌词中央。
     static let hitWidth: CGFloat = 12
 
-    enum Edge: CaseIterable {
+    enum Edge: CaseIterable, Hashable {
         case left, right, top, bottom, topLeft, topRight, bottomLeft, bottomRight
 
         fileprivate var movesLeft: Bool { self == .left || self == .topLeft || self == .bottomLeft }

@@ -87,8 +87,9 @@ enum FloatingLyricsPresentation: Equatable {
                    $0.id == interval.nextLineId && $0.startMs != nil
                        && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                }) {
-                return .waiting(interval: interval)
+                return interval.shouldShowIndicator ? .waiting(interval: interval) : .message("")
             }
+            if case let .cleared(startMs) = display.content, position >= startMs { return .message("") }
             return .message("暂无当前歌词")
         case .idle:
             return .message("正在载入当前歌词……")

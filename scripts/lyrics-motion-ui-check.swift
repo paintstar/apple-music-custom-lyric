@@ -9,6 +9,7 @@ import ShinLyricsEngine
 @MainActor
 enum LyricsMotionUICheck {
     static func run() async throws {
+        runCompactWaitingChecks()
         try await checkContinuousMotion()
         try await checkNarrowLongMotion()
         try await checkScrollerPresentation()
@@ -16,7 +17,82 @@ enum LyricsMotionUICheck {
         try await checkWaitingPresentation()
     }
 
-    private static func makeWindow(size: NSSize = NSSize(width: 520, height: 480)) -> (NSWindow, LyricsScrollView) {
+    /// 纯排版/圆点状态回归，可单独执行而不创建测试窗口。
+    static func runCompactWaitingChecks() {
+        let typography = LyricsTypography.resolved(line: 30, translation: 15, width: 520)
+        let first = LyricLine(startMs: 0, text: "原创窗边的纸船")
+        let last = LyricLine(startMs: 7_000, text: "原创微风经过浅湾")
+        let baseline = LyricsTextLayout()
+        baseline.rebuild(document: LyricDocument(lines: [first, last]), typography: typography, showTranslations: true)
+        let baselineHeight = baseline.layout(width: 520)
+        let blanks = [LyricLine(startMs: 1_000, text: ""), LyricLine(startMs: 2_000, text: " "), LyricLine(startMs: 4_000, text: "")]
+        let document = LyricDocument(lines: [first] + blanks + [last])
+        let layout = LyricsTextLayout()
+        layout.rebuild(document: document, typography: typography, showTranslations: true)
+        let height = layout.layout(width: 520)
+        precondition(abs(height - baselineHeight - LyricsSyncConstants.waitingSlotHeight) < 1,
+                     "多个明确空白只能共用一个紧凑槽，不能按歌词字号逐行叠高")
+        precondition(layout.rows[1].frame.height == LyricsSyncConstants.waitingSlotHeight
+                     && layout.rows[2].frame.height == 0 && layout.rows[3].frame.height == 0)
+        let lastRow = layout.rows[4]
+        precondition(layout.storage.attributedSubstring(from: lastRow.originalRange).string == last.text
+                     && layout.row(at: NSPoint(x: 40, y: lastRow.frame.minY + 2))?.id == last.id,
+                     "压缩空行后下一句的复制范围及真实行命中不能错位")
+        let shortEnd = LyricLine(startMs: 2_999, text: last.text)
+        let short = LyricsTextLayout()
+        short.rebuild(document: LyricDocument(lines: [first] + blanks.prefix(2) + [shortEnd]),
+                      typography: typography, showTranslations: true)
+        precondition(short.layout(width: 520) == baselineHeight && short.rows[1].frame.height == 0,
+                     "不足三秒的空白不保留额外占位")
+
+        let introDocument = LyricDocument(sourceOffsetMs: 11, lines: [LyricLine(startMs: 3_010, text: first.text)])
+        let intro = LyricsTextLayout()
+        intro.rebuild(document: introDocument, typography: typography, showTranslations: false, userDelayMs: 0)
+        let shortIntroHeight = intro.layout(width: 520)
+        precondition(intro.preludeFrame == nil, "来源offset让实际前奏不足三秒时不预留槽")
+        intro.rebuild(document: introDocument, typography: typography, showTranslations: false, userDelayMs: 1)
+        precondition(abs(intro.layout(width: 520) - shortIntroHeight - LyricsSyncConstants.waitingSlotHeight) < 1
+                     && intro.preludeFrame?.height == LyricsSyncConstants.waitingSlotHeight,
+                     "用户延迟使有效前奏达到三秒时预计算紧凑槽")
+
+        let translatedBlank = LyricLine(startMs: 1_000, text: "", translations: [
+            "zh-Hans": Translation(text: "原创人工译文仍保留")
+        ])
+        let translated = LyricsTextLayout()
+        translated.rebuild(document: LyricDocument(lines: [first, translatedBlank, shortEnd]),
+                           typography: typography, showTranslations: true)
+        _ = translated.layout(width: 520)
+        precondition(translated.storage.string.contains("原创人工译文仍保留"), "压缩空白不得隐藏人工译文")
+        precondition(document.lines.count == 5 && document.lines[2].text == " ", "排版不得改写原始空行")
+        let plain = LyricsTextLayout()
+        plain.rebuild(document: LyricDocument(lines: [
+            LyricLine(startMs: nil, text: first.text), LyricLine(startMs: nil, text: ""), LyricLine(startMs: nil, text: last.text)
+        ]), typography: typography, showTranslations: false)
+        _ = plain.layout(width: 520)
+        precondition(plain.rows[1].originalRange.length > 0 && plain.rows[1].frame.height > 0,
+                     "未打轴纯文本的人工段落空行保持原有排版，不套用短等待收起规则")
+
+        let dots = InterludeDotsView(frame: NSRect(x: 0, y: 0, width: 90, height: LyricsSyncConstants.waitingSlotHeight))
+        let interval = LyricsWaitingInterval(startMs: 0, endMs: 6_000, nextLineId: last.id, anchorLineId: blanks[0].id)
+        dots.configure(interval: interval, positionMs: nil, reduceMotion: false)
+        precondition(dots.progress == nil && dots.fillAmounts == nil, "未知时间不得冒充零进度")
+        for (position, expected) in [(1_000, [0.5, 0, 0]), (3_000, [1, 0.5, 0]), (5_000, [1, 1, 0.5])] {
+            dots.configure(interval: interval, positionMs: Int64(position), reduceMotion: false)
+            precondition(dots.fillAmounts == expected, "三点按真实等待区间依次填满")
+        }
+        dots.configure(interval: interval, positionMs: 500, reduceMotion: false)
+        precondition(dots.fillAmounts == [0.25, 0, 0], "seek必须立即校正三点填充，不能沿旧动画推进")
+        dots.configure(interval: interval, positionMs: nil, reduceMotion: false)
+        precondition(dots.fillAmounts == [0.25, 0, 0], "同一等待段未知/过期样本冻结最近画面")
+        dots.configure(interval: interval, positionMs: 500, reduceMotion: true)
+        precondition(dots.fillAmounts == [0.25, 0, 0], "减少动态效果保留真实进度，不能把三点冒充已填满")
+        let shortInterval = LyricsWaitingInterval(startMs: 0, endMs: 2_999, nextLineId: first.id, anchorLineId: nil)
+        dots.configure(interval: shortInterval, positionMs: 500, reduceMotion: false)
+        precondition(dots.isHidden && dots.fillAmounts == nil, "短等待不展示或保留旧圆点状态")
+        print("PASS 三秒显示阈值、有效offset/延迟、连续空白单个24点槽、人工译文保留、三点依次填满与seek/未知冻结")
+    }
+
+    private static func makeWindow(size: NSSize = NSSize(width: 520, height: 480)) async throws -> (NSWindow, LyricsScrollView) {
         let view = LyricsScrollView()
         view.frame = NSRect(origin: .zero, size: size)
         view.drawsBackground = true
@@ -26,8 +102,13 @@ enum LyricsMotionUICheck {
         window.title = "原创歌词动效检查"
         window.backgroundColor = .black
         window.contentView = view
-        window.orderFront(nil)
+        // 独立后台回归也需要实际可见；生产中的遮挡暂停规则保持生效。
+        window.level = .floating
+        window.orderFrontRegardless()
         view.layoutSubtreeIfNeeded()
+        try await settle("歌词动效夹具必须实际可见且未被遮挡") {
+            window.isVisible && window.occlusionState.contains(.visible)
+        }
         return (window, view)
     }
 
@@ -82,7 +163,7 @@ enum LyricsMotionUICheck {
             LyricLine(startMs: Int64(index) * 2_000, text: "Paper boats follow the evening light \(index).",
                       translations: ["zh-Hans": Translation(text: "纸船沿着晚霞向前，原创第 \(index) 句。")])
         })
-        let (window, view) = makeWindow()
+        let (window, view) = try await makeWindow()
         defer { view.prepareForRemoval(); window.orderOut(nil) }
         var unexpectedManual = 0
         func show(_ index: Int, reduceMotion: Bool = false, request: LyricsPanelModel.ScrollAnchorRequest? = nil) {
@@ -220,7 +301,7 @@ enum LyricsMotionUICheck {
             LyricLine(startMs: 12_000, text: "A soft breeze follows."),
             LyricLine(startMs: 14_000, text: "Our last lantern rests.")
         ])
-        let (window, view) = makeWindow(size: NSSize(width: 230, height: 360))
+        let (window, view) = try await makeWindow(size: NSSize(width: 230, height: 360))
         defer { view.prepareForRemoval(); window.orderOut(nil) }
         func show(_ index: Int) {
             view.configure(NativeLyricsScrollView(
@@ -253,8 +334,8 @@ enum LyricsMotionUICheck {
         precondition(long.duration < 1.7 && long.duration > short.duration,
                      "长句应适度放缓且及时停稳，不能留下过长拖尾")
         let resumedDistance = view.textLayout.rows[8].frame.minY - longTarget
-        precondition(resumedDistance > view.contentSize.height * LyricsMotionStyle.jumpViewportFraction,
-                     "合并空白夹具须覆盖超过远seek门槛的等待段接续")
+        precondition(resumedDistance == 0 && view.textLayout.rows[2..<8].allSatisfy { $0.frame.height == 0 },
+                     "合并的两秒短空白必须全部收起，不能继续撑出大块等待留白")
         for index in [8, 9, 10] {
             show(index)
             let normal = try await collectMotion(view)
@@ -270,7 +351,7 @@ enum LyricsMotionUICheck {
         let document = LyricDocument(lines: (0..<15).map { index in
             LyricLine(startMs: Int64(index) * 1_000, text: "An original paper boat carries a lantern \(index).")
         })
-        let (window, view) = makeWindow(size: NSSize(width: 300, height: 400))
+        let (window, view) = try await makeWindow(size: NSSize(width: 300, height: 400))
         defer { view.prepareForRemoval(); window.orderOut(nil) }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shin-scroller-check-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -293,6 +374,7 @@ enum LyricsMotionUICheck {
         }
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
         try await settle("原生滚动条测试窗口应取得键盘焦点") { window.isKeyWindow }
         func show(_ index: Int) {
             view.configure(NativeLyricsScrollView(
@@ -404,7 +486,7 @@ enum LyricsMotionUICheck {
         let document = LyricDocument(lines: (0..<6).map { index in
             LyricLine(startMs: Int64(index) * 2_000, text: "An original lantern rests beside a paper boat \(index).")
         })
-        let (window, view) = makeWindow()
+        let (window, view) = try await makeWindow()
         defer { view.prepareForRemoval(); window.orderOut(nil) }
         func show(_ index: Int) {
             view.configure(NativeLyricsScrollView(
@@ -433,7 +515,7 @@ enum LyricsMotionUICheck {
             MainActor.assumeIsolated { offsets.append(view.contentView.bounds.minY) }
         }
         defer { NotificationCenter.default.removeObserver(observer) }
-        window.orderFront(nil)
+        window.orderFrontRegardless()
         try await settle("窗口恢复可见后应准确定位最新组并结束排队位移", attempts: 500, diagnostic: {
             "offset=\(view.contentView.bounds.minY) target=\(target) animating=\(view.isScrollAnimating)"
                 + " motion=\(String(describing: view.scrollMotion)) jump=\(String(describing: view.jump))"
@@ -460,7 +542,7 @@ enum LyricsMotionUICheck {
                       text: "Along the quiet river, we fold another paper boat and let the evening breeze carry our little lantern toward the open bridge.",
                       translations: ["zh-Hans": Translation(text: "安静的河边，我们再折一只纸船，让晚风把小灯送往桥下；这是一段用于检查换行和双语排版的原创文字。")])
         ])
-        let (window, view) = makeWindow()
+        let (window, view) = try await makeWindow()
         defer { view.prepareForRemoval(); window.orderOut(nil) }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shin-lyrics-motion-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -543,8 +625,17 @@ enum LyricsMotionUICheck {
                      && view.documentView!.frame.size == documentSize && view.textLayout.rows.map(\.frame) == rowFrames,
                      "间奏结束接续双语长句不能重新排版或改变视口")
         try capture(view, name: "lyrics-bilingual-long-line")
+        let shortWait = LyricsWaitingInterval(startMs: 11_000, endMs: 12_000,
+                                             nextLineId: document.lines[2].id, anchorLineId: document.lines[1].id)
+        position = 11_500
+        panel.apply(display: PlaybackLyricsDisplay(content: .cleared(startMs: 11_000), userDelayMs: 0, waitingInterval: shortWait))
+        precondition(panel.scrollRequest == nil, "短清屏必须清掉旧跟随请求，不能滚向已收起的空白")
+        show(waiting: shortWait, reduceMotion: true)
+        precondition(view.waitingIndicator.isHidden && view.textLayout.rows.map(\.frame) == rowFrames,
+                     "短等待隐藏圆点且不随播放状态重排原文")
+        position = 500
         show(waiting: intro)
-        try await settle("等待指示应恢复显示刷新") { view.hasActiveDisplayLink }
+        try await settle("等待指示应恢复显示刷新") { view.waitingNeedsFrames && view.hasActiveDisplayLink }
         view.prepareForRemoval()
         precondition(!view.hasActiveDisplayLink, "卸载等待歌词视图后必须停止显示刷新")
         print("PASS 前奏及明确空白圆点、真实进度绘制、暂停冻结、稳定视口、双语长句接续与等待卸载")

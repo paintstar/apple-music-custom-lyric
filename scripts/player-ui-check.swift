@@ -149,7 +149,57 @@ private struct PlayerUICheck {
         try await Task.sleep(for: .milliseconds(160))
         precondition(panel.scrollRequest == nil, "切歌后不得由旧计时器滚回旧歌词")
         panel.lyricsAreaDisappeared(compactArea)
-        print("PASS 阅读空闲自动回归、无事件辅助滚动、活动延期、编辑挂起、视图交接与隐藏清理")
+        try await checkReadingSettings(store: store, document: document, snapshot: snapshot)
+        print("PASS 阅读空闲自动回归、动态等待持久化、无事件辅助滚动、活动延期、编辑挂起、视图交接与隐藏清理")
+    }
+
+    @MainActor static func checkReadingSettings(
+        store: GRDBLyricsStore, document: LyricDocument, snapshot: PlaybackSnapshot
+    ) async throws {
+        let domain = "ShinApple.reading-check.\(UUID())"
+        let defaults = UserDefaults(suiteName: domain)!
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let key = LyricsReadingSettings.resumeDelayPreferenceKey
+        precondition(LyricsReadingSettings.resumeDelay(in: defaults) == LyricsReadingSettings.defaultResumeDelay)
+        precondition(LyricsReadingSettings.normalized(.nan) == LyricsReadingSettings.defaultResumeDelay)
+        precondition(LyricsReadingSettings.normalized(-1) == LyricsReadingSettings.resumeDelayRange.lowerBound)
+        precondition(LyricsReadingSettings.normalized(100) == LyricsReadingSettings.resumeDelayRange.upperBound)
+        defaults.set(3.0, forKey: key)
+        precondition(LyricsReadingSettings.resumeDelay(in: UserDefaults(suiteName: domain)!) == 3,
+                     "阅读等待设置应保存到选用的本机偏好域")
+        @MainActor final class ReadingClock { var time: TimeInterval = 100 }
+        let readingClock = ReadingClock()
+        let panel = LyricsPanelModel(store: store, defaults: defaults, monotonicTime: { readingClock.time })
+        let coordinator = PlaybackLyricsCoordinator(onDisplayChange: { _ in })
+        coordinator.update(snapshot: snapshot)
+        panel.attach(coordinator: coordinator)
+        await panel.refresh(trackKey: snapshot.trackKey, trackEpoch: snapshot.trackEpoch)
+        panel.apply(display: coordinator.currentDisplay())
+        let area = UUID()
+        panel.lyricsAreaAppeared(area)
+        func setDelay(_ delay: TimeInterval) {
+            defaults.set(delay, forKey: key)
+            NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: defaults)
+        }
+        panel.enterManualBrowsing()
+        readingClock.time += 2.5
+        setDelay(2)
+        try await eventually("缩短设置时应从最后真实阅读活动起算，已到期即回归") { panel.browseMode == .follow }
+        precondition(panel.scrollRequest?.lineId == document.lines[0].id)
+
+        setDelay(3)
+        readingClock.time += 10
+        panel.enterManualBrowsing()
+        readingClock.time += 1.8
+        setDelay(2)
+        try await Task.sleep(for: .milliseconds(20))
+        setDelay(4)
+        try await Task.sleep(for: .milliseconds(350))
+        precondition(panel.browseMode == .manual, "延长设置后，旧的短等待任务不能提前抢回")
+        readingClock.time += 2.5
+        setDelay(2)
+        try await eventually("再次缩短设置仍从同一次阅读活动起算") { panel.browseMode == .follow }
+        panel.lyricsAreaDisappeared(area)
     }
 
     @MainActor static func checkNativeScroll() {
@@ -202,6 +252,67 @@ private struct PlayerUICheck {
         view.contentView.scroll(to: .zero)
         precondition(userScrollCount == 0, "卸载旧视图后不能再影响共享浏览状态")
         print("PASS 万行原生排版、首尾与远距离 seek、双语重排、减少动态效果、高亮不改行高")
+    }
+
+    @MainActor static func checkLyricsMenuActions(
+        store: GRDBLyricsStore, document: LyricDocument, snapshot: PlaybackSnapshot
+    ) async throws {
+        let panel = LyricsPanelModel(store: store)
+        let coordinator = PlaybackLyricsCoordinator(onDisplayChange: { _ in })
+        coordinator.update(snapshot: snapshot)
+        panel.attach(coordinator: coordinator)
+        await panel.refresh(trackKey: snapshot.trackKey, trackEpoch: snapshot.trackEpoch)
+        panel.apply(display: coordinator.currentDisplay())
+        var showsTranslations = true
+        var edits = 0
+        var unlinkRequests = 0
+        func items(_ current: LyricsPanelModel?) -> [PlaybackMenu.Item] {
+            LyricsMenuActions.items(
+                panel: current, showTranslations: Binding(get: { showsTranslations }, set: { showsTranslations = $0 }),
+                onUnlink: { unlinkRequests += 1 }, onEdit: { edits += 1 }
+            )
+        }
+        func action(_ title: String) -> PlaybackMenu.Item {
+            guard let item = items(panel).first(where: { $0.title == title }) else {
+                preconditionFailure("保留菜单缺少 \(title)")
+            }
+            return item
+        }
+        precondition(items(nil).filter { $0.action != nil }.allSatisfy { !$0.isEnabled },
+                     "歌词未载入时保留菜单的歌词动作应禁用")
+        precondition(["延后 0.1 秒", "提前 0.1 秒", "显示译文", "编辑歌词", "解除关联"].allSatisfy { action($0).isEnabled },
+                     "歌词就绪时迁移到保留菜单的动作应可用")
+        action("延后 0.1 秒").action?()
+        precondition(coordinator.currentDisplay().userDelayMs == LyricsPanelModel.delayStepMs,
+                     "保留菜单的偏移动作必须仍实际生效")
+        panel.apply(display: coordinator.currentDisplay())
+        precondition(action("归零").isEnabled)
+        action("归零").action?()
+        precondition(coordinator.currentDisplay().userDelayMs == 0)
+        panel.apply(display: coordinator.currentDisplay())
+        action("显示译文").action?()
+        precondition(!showsTranslations && !action("显示译文").isChecked)
+        action("编辑歌词").action?()
+        action("解除关联").action?()
+        precondition(edits == 1 && unlinkRequests == 1, "保留菜单仍提供编辑和解除确认入口")
+        let retainedDocument = try await store.document(id: document.id)
+        precondition(retainedDocument != nil, "请求解除确认不能直接删除歌词文档")
+        panel.setAutoScrollSuspended(true)
+        precondition(items(panel).filter { $0.action != nil }.allSatisfy { !$0.isEnabled },
+                     "导入或编辑期间歌词动作应禁用")
+        panel.setAutoScrollSuspended(false)
+
+        let model = AppModel(isMock: true, controller: MockPlaybackController(), searchService: nil)
+        model.applySnapshot(snapshot)
+        model.lyricsPanel = panel
+        let request = LyricsUnlinkRequest(model: model)!
+        precondition(request.matches(model), "解除确认在打开时固定当前曲目和文档")
+        var next = snapshot
+        next.trackEpoch += 1
+        next.trackRef = "music-script:persistent:ABC00002"
+        model.applySnapshot(next)
+        precondition(!request.matches(model), "确认期间切歌不能解除新曲目的关联")
+        print("PASS 合并歌词菜单：偏移、译文、编辑、解除确认、不可用状态与切歌保护")
     }
 
     @MainActor static func checkLyricsRowInteraction() async throws {
@@ -426,8 +537,13 @@ private struct PlayerUICheck {
         let window = NSWindow(contentRect: NSRect(x: 90, y: 90, width: 284, height: 340),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.contentView = view
-        window.orderFront(nil)
+        // 真实显示刷新会正确暂停被遮挡的歌词；测试窗口需显式位于普通桌面窗口上方。
+        window.level = .floating
+        window.orderFrontRegardless()
         defer { view.prepareForRemoval(); window.orderOut(nil) }
+        try await eventually("连续歌词动画夹具必须实际可见且未被遮挡") {
+            window.isVisible && window.occlusionState.contains(.visible)
+        }
         func render() {
             guard case let .ready(loaded) = panel.state else { return }
             view.configure(NativeLyricsScrollView(
@@ -469,6 +585,7 @@ private struct PlayerUICheck {
                 view.frame = NSRect(x: 0, y: 0, width: tick == 12 ? 640 : 284, height: tick == 12 ? 520 : 340)
                 window.setContentSize(view.frame.size)
                 window.contentView = view
+                window.orderFrontRegardless()
             }
             render()
             try await Task.sleep(for: .milliseconds(160))
@@ -498,14 +615,21 @@ private struct PlayerUICheck {
         view.contentView.scroll(to: NSPoint(x: 0, y: view.contentView.bounds.minY + 140))
         precondition(panel.browseMode == .manual)
         sample = controller.snapshot()
-        for _ in 0..<14 {
+        // 保留 14 次样本及最终权威位置；等待覆盖实际阅读设置，不沿用旧的 5 秒默认值。
+        let idleSampleCount = 14
+        let readingDelay = LyricsReadingSettings.resumeDelay(in: .standard)
+        let idleSampleInterval = Duration.seconds(max(0.4, readingDelay / Double(idleSampleCount)))
+        for _ in 0..<idleSampleCount {
             sample.positionMs = (sample.positionMs ?? 0) + 500
             sample.seq += 1
             controller.publish(sample)
-            try await Task.sleep(for: .milliseconds(400))
+            try await Task.sleep(for: idleSampleInterval)
             render()
         }
-        try await eventually("连续播放中手动浏览空闲后恢复") { panel.browseMode == .follow }
+        try await eventually("连续播放中手动浏览空闲后恢复", diagnostic: {
+            "configuredDelay=\(readingDelay) mode=\(panel.browseMode) "
+                + "latestSample=\(sample.seq) publishedSample=\(model.snapshot.seq)"
+        }) { panel.browseMode == .follow }
         try await eventually("恢复跟随应采用最后一次权威采样") {
             model.snapshot.seq == sample.seq && panel.syncDisplay.currentLineIds == [document.lines[5].id]
         }
@@ -549,17 +673,21 @@ private struct PlayerUICheck {
         return view.subviews.lazy.compactMap { findPlaybackSlider(in: $0) }.first
     }
 
+    @discardableResult
     @MainActor static func sendSliderMouse(
         _ type: NSEvent.EventType, fraction: CGFloat, slider: NSSlider, window: NSWindow, localY: CGFloat? = nil
-    ) {
-        let knobWidth = (slider.cell as! NSSliderCell).knobRect(flipped: slider.isFlipped).width
-        let local = NSPoint(x: knobWidth / 2 + fraction * (slider.bounds.width - knobWidth), y: localY ?? slider.bounds.midY)
+    ) -> NSPoint {
+        let knob = (slider.cell as! NSSliderCell).knobRect(flipped: slider.isFlipped)
+        var local = NSPoint(x: knob.width / 2 + fraction * (slider.bounds.width - knob.width), y: localY ?? slider.bounds.midY)
+        // 此夹具抓旋钮中心；原生中心已按像素取整，数学近似会意外形成抓取偏移。
+        if type == .leftMouseDown, knob.contains(local) { local.x = knob.midX }
         let location = slider.convert(local, to: nil)
         let event = NSEvent.mouseEvent(
             with: type, location: location, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
             windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1
         )!
         window.sendEvent(event)
+        return local
     }
 
     /// 向实际注册的局部tracking owner投递公开事件；不伪装成系统指针移动。
@@ -614,11 +742,51 @@ private struct PlayerUICheck {
             )
             window.isMovableByWindowBackground = true
             window.contentView = host
-            window.orderFront(nil)
+            window.level = .floating
+            window.orderFrontRegardless()
             defer { window.orderOut(nil) }
             host.layoutSubtreeIfNeeded()
             try await eventually("原生进度控件应进入窗口") { findPlaybackSlider(in: host) != nil }
             let slider = findPlaybackSlider(in: host)!
+            // 先触发 SwiftUI 测量，再跨三个30fps周期等待真实样本和原生几何稳定。
+            _ = host.fittingSize
+            var previousFrame: NSRect?
+            var previousBounds: NSRect?
+            var previousKnob: NSRect?
+            var previousBar: NSRect?
+            var previousSize: NSSize?
+            var stableSince = ProcessInfo.processInfo.systemUptime
+            try await eventually("原生进度测量后的实例、真实样本、几何和命中应稳定") {
+                let size = host.fittingSize
+                host.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                host.displayIfNeeded()
+                slider.displayIfNeeded()
+                guard window.occlusionState.contains(.visible), findPlaybackSlider(in: host) === slider, slider.isEnabled,
+                      slider.doubleValue == Double(sample.positionMs!),
+                      slider.maxValue == Double(sample.durationMs!), let cell = slider.cell as? NSSliderCell else {
+                    stableSince = ProcessInfo.processInfo.systemUptime
+                    return false
+                }
+                let knob = cell.knobRect(flipped: slider.isFlipped)
+                let bar = cell.barRect(flipped: slider.isFlipped)
+                let point = slider.convert(NSPoint(x: slider.bounds.midX, y: slider.bounds.midY), to: host.superview)
+                guard knob.width > 0, knob.height > 0, bar.width > knob.width, host.hitTest(point) === slider else {
+                    stableSince = ProcessInfo.processInfo.systemUptime
+                    return false
+                }
+                if previousFrame != slider.frame || previousBounds != slider.bounds || previousKnob != knob
+                    || previousBar != bar || previousSize != size {
+                    previousFrame = slider.frame
+                    previousBounds = slider.bounds
+                    previousKnob = knob
+                    previousBar = bar
+                    previousSize = size
+                    stableSince = ProcessInfo.processInfo.systemUptime
+                    return false
+                }
+                return ProcessInfo.processInfo.systemUptime - stableSince >= 0.1
+            }
             precondition(window.windowNumber > 0 && slider.isEnabled, "鼠标回归需要真实AppKit窗口及已启用的进度")
             // NSView.hitTest 的入参属于接收者的 superview 坐标，NSHostingView 本身是 flipped。
             let point = slider.convert(NSPoint(x: slider.bounds.midX, y: slider.bounds.midY), to: host.superview)
@@ -659,14 +827,21 @@ private struct PlayerUICheck {
                 sliderHover(false, slider: slider, window: window)
                 try await eventually("离开应恢复静止轨道") { abs(renderedTrackHeight(slider) - restingHeight) < 0.15 }
             }
-            sendSliderMouse(.leftMouseDown, fraction: 0.2, slider: slider, window: window, localY: thin ? 2 : nil)
+            let downPoint = sendSliderMouse(.leftMouseDown, fraction: 0.2, slider: slider, window: window, localY: thin ? 2 : nil)
+            let valueAfterDown = slider.doubleValue
             if thin {
                 sliderHover(false, slider: slider, window: window)
             }
-            sendSliderMouse(.leftMouseDragged, fraction: 0.78, slider: slider, window: window, localY: thin ? -6 : nil)
+            let dragPoint = sendSliderMouse(.leftMouseDragged, fraction: 0.78, slider: slider, window: window, localY: thin ? -6 : nil)
             try await Task.sleep(for: .milliseconds(25))
             precondition(controller.seekCount == 0 && abs(slider.doubleValue - 23_400) < 3,
-                         "拖动中只更新原生滑块预览，不发送seek")
+                         "拖动中只更新原生滑块预览，不发送seek：thin=\(thin)，"
+                         + "tracking=\((slider as? PlaybackScrubber.TrackingSlider)?.isTrackingMouse == true)，"
+                         + "value=\(slider.doubleValue)，seekCount=\(controller.seekCount)，"
+                         + "downPoint=\(downPoint)，dragPoint=\(dragPoint)，valueAfterDown=\(valueAfterDown)，"
+                         + "pendingSeek=\(String(describing: model.pendingSeek))，"
+                         + "bounds=\(slider.bounds)，knob=\((slider.cell as! NSSliderCell).knobRect(flipped: slider.isFlipped))，"
+                         + "windowVisible=\(window.isVisible)，unoccluded=\(window.occlusionState.contains(.visible))")
             if thin {
                 try await eventually("按住后移出仍应保持6.5点强调，进度不等待动画") { abs(renderedTrackHeight(slider) - 6.5) < 0.2 }
                 precondition(slider.focusRingType == .none, "鼠标按住不显示蓝色键盘焦点圈")
@@ -779,12 +954,14 @@ private struct PlayerUICheck {
         let window = NSWindow(contentRect: NSRect(x: 60, y: 60, width: 360, height: 100),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.contentView = host
-        window.orderFront(nil)
+        window.level = .floating
+        window.orderFrontRegardless()
         defer { window.orderOut(nil) }
         host.layoutSubtreeIfNeeded()
         try await eventually("减少动态效果夹具应完成原生状态更新") {
             guard let slider = findPlaybackSlider(in: host) else { return false }
-            return slider.isEnabled && slider.maxValue == 30_000 && slider.doubleValue == 6_000
+            return window.isVisible && window.occlusionState.contains(.visible)
+                && slider.isEnabled && slider.maxValue == 30_000 && slider.doubleValue == 6_000
         }
         let slider = findPlaybackSlider(in: host)!
         sliderHover(true, slider: slider, window: window)
@@ -803,136 +980,104 @@ private struct PlayerUICheck {
                      "减少动态效果取消应即时复位，旧动画不得回写")
     }
 
-    static func checkTranslationHintPolicy() {
-        let chineseLines = [
-            "清晨的纸船驶向远方，我把昨天的笑声放进背包。",
-            "雨后的石桥映着天空，我们沿着小路走回家。",
-            "晚风吹亮窗边的灯，我在信纸上画了一朵云。"
-        ].map { LyricLine(startMs: 0, text: $0) }
-        var document = LyricDocument(lines: chineseLines)
-        precondition(!LyricsTranslationPolicy.shouldShowMissingTranslation(document), "未知语言的多句中文无需译文提示")
-        document.lines.append(LyricLine(startMs: 1_000, text: "Oh Yeah"))
-        precondition(!LyricsTranslationPolicy.shouldShowMissingTranslation(document), "中文中少量语气词不应误提示缺译文")
-        for language in ["zh", "zh-Hans", "zh-Hant", "zh_TW"] {
-            document.sourceLanguage = language
-            precondition(!LyricsTranslationPolicy.shouldShowMissingTranslation(document), "明确中文语言 \(language) 无需译文提示")
-        }
-        let traditional = LyricDocument(lines: [LyricLine(
-            startMs: 0, text: "清晨的紙船駛向遠方，我把昨天的笑聲放進背包。晚風吹亮窗邊的燈。"
-        )])
-        precondition(!LyricsTranslationPolicy.shouldShowMissingTranslation(traditional), "无语言标记的繁体中文无需译文提示")
-        let kanji = LyricDocument(sourceLanguage: "ja", lines: [LyricLine(
-            startMs: 0, text: "未来都市 東京駅 世界旅行 静寂 星空 物語"
-        )])
-        precondition(LyricsTranslationPolicy.shouldShowMissingTranslation(kanji), "明确日语的纯汉字原文仍需要译文")
-        var unknownKanji = kanji
-        unknownKanji.sourceLanguage = nil
-        precondition(LyricsTranslationPolicy.shouldShowMissingTranslation(unknownKanji), "系统识别为日语的纯汉字不能当中文")
-        document.sourceLanguage = "en"
-        precondition(LyricsTranslationPolicy.shouldShowMissingTranslation(document), "明确外语优先于字形推断")
-        document.sourceLanguage = "und"
-        precondition(!LyricsTranslationPolicy.shouldShowMissingTranslation(document), "未知语言标记允许本机保守识别")
-        document.sourceLanguage = nil
-        let beforeEdit = LyricsTranslationPolicy.DocumentKey(document)
-        document.revision += 1
-        document.lines.append(LyricLine(startMs: 2_000, text: "小さな紙の船が朝の川を進んでいく。"))
-        precondition(beforeEdit != LyricsTranslationPolicy.DocumentKey(document), "原文修订必须重新评估提示")
-        precondition(LyricsTranslationPolicy.shouldShowMissingTranslation(document), "中文与日语混合仍需要译文")
-        document.lines.removeLast()
-        document.lines.append(LyricLine(startMs: 2_000, text: "Follow the paper boat across the quiet river."))
-        precondition(LyricsTranslationPolicy.shouldShowMissingTranslation(document), "中文与完整英文句子混合仍需要译文")
-        document.lines[0].translations["zh-Hans"] = Translation(text: "这是一句原创人工译文。", source: .manual)
-        precondition(!LyricsTranslationPolicy.shouldShowMissingTranslation(document), "已有中文译文保留显示和编辑，不提示缺失")
-        let short = LyricDocument(lines: [LyricLine(startMs: 0, text: "夢 希望")])
-        precondition(LyricsTranslationPolicy.shouldShowMissingTranslation(short), "过短且不明确的纯汉字不应武断认成中文")
-        print("PASS 中文译文提示：简繁、明确语言、未知识别、短语气词、纯汉字日语、中外混合、修订及已有译文")
-    }
-
-    @MainActor static func checkTranslationHintPresentation() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shin-translation-ui-\(UUID())")
+    @MainActor private static func checkCompactWindowLayout() async throws {
+        let suite = "shin-window-layout-\(UUID())"
+        let preferences = UserDefaults(suiteName: suite)!
+        defer { preferences.removePersistentDomain(forName: suite) }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try GRDBLyricsStore(path: directory.appendingPathComponent("lyrics.sqlite").path)
-        let chineseText = "清晨的纸船驶向远方，我把昨天的笑声放进背包。"
-        let chinese = LyricDocument(lines: [LyricLine(startMs: 0, text: chineseText)])
-        let chineseBinding = SongBinding(persistentID: "00000000A0000001", lyricDocumentId: chinese.id)
-        try await store.save(document: chinese, binding: chineseBinding)
-        let snapshot = PlaybackSnapshot(
-            trackEpoch: 1, title: "原创中文提示测试", positionMs: 500, durationMs: 30_000,
-            status: .paused, seq: 1, sessionEpoch: 1, trackRef: chineseBinding.trackKey
-        )
-        let controller = CheckController(snapshot)
-        let model = AppModel(
-            isMock: true, controller: controller, searchService: nil,
-            makeLyricsDatabase: {
-                LyricsDatabase.Database(store: store, locationDescription: "临时测试库", directory: directory)
-            }
-        )
+        let snapshot = PlaybackSnapshot(trackEpoch: 1, title: "原创窗口练习", positionMs: 1_000,
+                                        durationMs: 30_000, status: .paused,
+                                        trackRef: "music-script:persistent:ACED0010")
+        func makeModel() -> AppModel {
+            AppModel(isMock: true, controller: CheckController(snapshot), searchService: nil,
+                     makeLyricsDatabase: {
+                         LyricsDatabase.Database(store: store, locationDescription: "原创窗口临时库", directory: directory)
+                     })
+        }
+        func makeWindow(_ model: AppModel, size: NSSize) -> (NSWindow, NSHostingView<AnyView>) {
+            let host = NSHostingView(rootView: AnyView(ContentView(preferences: preferences)
+                .environmentObject(model).defaultAppStorage(preferences)))
+            let window = NSWindow(contentRect: NSRect(origin: NSPoint(x: 80, y: 80), size: size),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            window.collectionBehavior = [.fullScreenPrimary]
+            window.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate()
+            return (window, host)
+        }
+        func probe(in view: NSView) -> PlayerWindowAccessor.WindowProbe? {
+            if let probe = view as? PlayerWindowAccessor.WindowProbe { return probe }
+            return view.subviews.lazy.compactMap { probe(in: $0) }.first
+        }
+        preferences.set("compact", forKey: "player.presentationMode")
+        preferences.set("nowPlaying", forKey: "player.compactReturnMode")
+        let model = makeModel()
         await model.start()
-        let suite = "shin-translation-ui-\(UUID())"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.set(true, forKey: LyricsPanelView.translationsSettingKey)
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let host = NSHostingView(rootView: LyricsPanelView()
-            .environmentObject(model)
-            .defaultAppStorage(defaults)
-            .frame(width: 340, height: 400)
-            .padding(20))
-        let window = NSWindow(
-            contentRect: NSRect(x: 120, y: 120, width: 380, height: 440),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false
-        )
-        window.isReleasedWhenClosed = false
-        window.contentView = host
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        let (window, host) = makeWindow(model, size: NSSize(width: 1180, height: 780))
         defer { window.close() }
-        func lyricsViewport(in view: NSView) -> LyricsScrollView? {
-            if let lyrics = view as? LyricsScrollView { return lyrics }
-            for child in view.subviews {
-                if let lyrics = lyricsViewport(in: child) { return lyrics }
+        try await eventually("持久化compact冷启动应恢复紧凑尺寸", attempts: 600) {
+            host.layoutSubtreeIfNeeded()
+            return abs(window.contentLayoutRect.width - PlayerWindowController.compactContentSize.width) < 2
+                && preferences.string(forKey: "player.presentationMode") == "compact"
+                && probe(in: host)?.controller.hasRestoredInitialLayout == true
+        }
+        window.setContentSize(NSSize(width: 1180, height: 780))
+        try await eventually("用户拖宽应恢复原完整页面而非横向拉伸compact", attempts: 600) {
+            host.layoutSubtreeIfNeeded()
+            return preferences.string(forKey: "player.presentationMode") == "nowPlaying"
+                && (findPlaybackSlider(in: host)?.bounds.width ?? 1180) < window.contentLayoutRect.width / 2
+        }
+        let controller = probe(in: host)!.controller
+        @MainActor final class FullScreenTransitions {
+            var entered = false
+            var exited = false
+        }
+        let transitions = FullScreenTransitions()
+        let entered = NotificationCenter.default.addObserver(forName: NSWindow.didEnterFullScreenNotification,
+                                                             object: window, queue: .main) { _ in
+            Task { @MainActor in transitions.entered = true }
+        }
+        let exited = NotificationCenter.default.addObserver(forName: NSWindow.didExitFullScreenNotification,
+                                                            object: window, queue: .main) { _ in
+            Task { @MainActor in transitions.exited = true }
+        }
+        defer { NotificationCenter.default.removeObserver(entered); NotificationCenter.default.removeObserver(exited) }
+        window.toggleFullScreen(nil)
+        try await eventually("模拟窗口应完成原生全屏进入", attempts: 1_200) {
+            transitions.entered && window.styleMask.contains(.fullScreen)
+        }
+        precondition(!controller.showCompact(reduceMotion: true), "全屏期间compact请求必须拒绝且不改变模式")
+        precondition(preferences.string(forKey: "player.presentationMode") == "nowPlaying")
+        window.toggleFullScreen(nil)
+        try await eventually("模拟窗口应完成原生全屏退出", attempts: 1_200) {
+            transitions.exited && !window.styleMask.contains(.fullScreen)
+        }
+        window.close()
+
+        for presentBeforeAttach in [true, false] {
+            preferences.set("compact", forKey: "player.presentationMode")
+            let sheetModel = makeModel()
+            await sheetModel.start()
+            if presentBeforeAttach { sheetModel.isLibraryPresented = true }
+            let (sheetWindow, sheetHost) = makeWindow(sheetModel, size: PlayerWindowController.compactContentSize)
+            defer { sheetModel.isLibraryPresented = false; sheetWindow.close() }
+            if !presentBeforeAttach { sheetModel.isLibraryPresented = true }
+            try await eventually("预览必须优先展开，不受先openWindow再呈现的时序影响", attempts: 600) {
+                sheetHost.layoutSubtreeIfNeeded()
+                return sheetWindow.contentLayoutRect.width >= PlayerWindowController.compactBreakpoint
+                    && probe(in: sheetHost)?.controller.hasRestoredInitialLayout == true
+                    && sheetWindow.attachedSheet != nil
             }
-            return nil
+            await Task.yield()
+            precondition(sheetWindow.contentLayoutRect.width >= PlayerWindowController.compactBreakpoint)
+            sheetModel.isLibraryPresented = false
+            try await eventually("模拟预览应完成收起", attempts: 600) { sheetWindow.attachedSheet == nil }
         }
-        func containsRenderedText(_ text: String) -> Bool {
-            host.layoutSubtreeIfNeeded()
-            return lyricsViewport(in: host)?.textLayout.textView.string.contains(text) == true
-        }
-        func viewportHeight() -> CGFloat {
-            host.layoutSubtreeIfNeeded()
-            return lyricsViewport(in: host)?.bounds.height ?? 0
-        }
-        // SwiftUI 在未启用系统辅助功能时不提供 AX 子树。固定宿主尺寸后，
-        // 缺译文提示是正文上方唯一占位；检查实际视口高度及原生文本，不依赖 AX 开关。
-        try await eventually("中文歌词必须真实显示且不出现缺译文提示") {
-            window.isVisible && containsRenderedText(chineseText) && abs(viewportHeight() - 400) < 1
-        }
-        let fullViewportHeight = viewportHeight()
-        let fixedHostBounds = host.bounds
-        var english = LyricDocument(sourceLanguage: "en", lines: [LyricLine(
-            startMs: 0, text: "Follow the paper boat across the quiet river."
-        )])
-        let englishBinding = SongBinding(persistentID: "00000000A0000002", lyricDocumentId: english.id)
-        try await store.save(document: english, binding: englishBinding)
-        var englishSnapshot = snapshot
-        englishSnapshot.trackEpoch += 1
-        englishSnapshot.seq += 1
-        englishSnapshot.trackRef = englishBinding.trackKey
-        controller.publish(englishSnapshot)
-        try await eventually("切入无译文英文时，task与观察更新必须显示缺译文提示") {
-            containsRenderedText(english.lines[0].text) && viewportHeight() < fullViewportHeight - 16
-                && host.bounds == fixedHostBounds
-        }
-        english.revision += 1
-        english.sourceLanguage = nil
-        english.lines[0].text = chineseText
-        try await store.save(document: english, binding: englishBinding)
-        await model.lyricsPanel?.refresh(trackKey: englishBinding.trackKey, trackEpoch: englishSnapshot.trackEpoch)
-        try await eventually("同一文档修订为中文后必须撤下旧的缺译文提示") {
-            containsRenderedText(chineseText) && abs(viewportHeight() - fullViewportHeight) < 1
-                && host.bounds == fixedHostBounds
-        }
-        print("PASS 真实窗口译文提示：中文隐藏、英文切歌显示、同文档原文修订重新计算并隐藏")
+        print("PASS 窗口布局：compact冷启动、拖宽回完整、全屏拒绝compact、已有预览优先展开")
     }
 
     @MainActor static func main() {
@@ -952,7 +1097,14 @@ private struct PlayerUICheck {
     }
 
     @MainActor private static func runChecks() async throws {
-        checkTranslationHintPolicy()
+        if CommandLine.arguments.contains("--playback-options-only") {
+            try await PlaybackOptionsUICheck.runChecks()
+            return
+        }
+        if CommandLine.arguments.contains("--window-layout-only") {
+            try await checkCompactWindowLayout()
+            return
+        }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shin-ui-check-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1091,6 +1243,7 @@ private struct PlayerUICheck {
         }
         precondition(mockModel.playbackMessage == nil, "生产Mock不得被误报无确认样本")
         try await checkAutoReturn(store: store, document: document, snapshot: initial)
+        try await checkLyricsMenuActions(store: store, document: document, snapshot: initial)
         checkNativeScroll()
         try await checkLyricsRowInteraction()
         try await checkContinuousPlayback(store: store)
@@ -1099,7 +1252,6 @@ private struct PlayerUICheck {
         try await PlaybackOptionsUICheck.runChecks()
         try await checkPlaybackDragging(store: store, snapshot: initial)
         fflush(nil)
-        try await checkTranslationHintPresentation()
         print("App player UI checks: AUTOMATED_PASS（未执行真实 Music 验证）")
     }
 }

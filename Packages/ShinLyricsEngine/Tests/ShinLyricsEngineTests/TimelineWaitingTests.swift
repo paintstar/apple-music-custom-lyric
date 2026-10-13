@@ -4,6 +4,35 @@ import Testing
 
 @Suite("歌词等待区间")
 struct TimelineWaitingTests {
+    @Test("三秒是展示阈值，短空白保留清屏；前奏槽资格采用来源偏移及用户延迟")
+    func indicatorThresholdUsesEffectiveIntervals() throws {
+        let introDoc = TimelineFixture.document(sourceOffsetMs: 11, lines: [(3_010, "原创窗边小船")])
+        let shortIntro = LyricsTimelineIndex(document: introDoc, userDelayMs: 0)
+        #expect(shortIntro.waitingInterval(playbackMs: 0, durationMs: nil) != nil)
+        #expect(shortIntro.indicatorIntervals.isEmpty)
+        let delayed = shortIntro.withUserDelayMs(1)
+        #expect(delayed.indicatorIntervals.count == 1 && delayed.indicatorIntervals[0].endMs == 3_000)
+        #expect(delayed.withUserDelayMs(-1).indicatorIntervals.isEmpty)
+
+        let shortDoc = TimelineFixture.document(lines: [(0, "原创晨光"), (1_000, ""), (3_999, "原创微风")])
+        let short = LyricsTimelineIndex(document: shortDoc, userDelayMs: 0)
+        #expect(short.indicatorIntervals.isEmpty)
+        #expect(short.waitingInterval(playbackMs: 2_000, durationMs: nil)?.shouldShowIndicator == false)
+        guard case .cleared = short.query(playbackMs: 2_000, durationMs: nil) else {
+            Issue.record("省略圆点不能改变原空白的清屏语义")
+            return
+        }
+        let longDoc = TimelineFixture.document(lines: [
+            (0, "原创晨光"), (1_000, ""), (2_000, ""), (4_000, " "), (7_000, "原创微风")
+        ])
+        let long = LyricsTimelineIndex(document: longDoc, userDelayMs: 0)
+        #expect(long.indicatorIntervals.count == 1)
+        #expect(long.indicatorIntervals[0].anchorLineId == longDoc.lines[1].id)
+        #expect(long.indicatorIntervals[0].startMs == 1_000 && long.indicatorIntervals[0].endMs == 7_000)
+        #expect(long.waitingInterval(playbackMs: 1_000, durationMs: nil)
+                == long.waitingInterval(playbackMs: 6_999, durationMs: nil))
+    }
+
     @Test("前奏从零起算，开头连续空白不重启等待")
     func introductionHasStableInterval() throws {
         let doc = TimelineFixture.document(lines: [

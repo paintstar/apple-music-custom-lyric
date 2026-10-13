@@ -174,6 +174,38 @@ extension MusicScriptPlaybackController: MusicLibraryBrowsing {
         try await performLibraryPlay(MusicLibraryScriptSources.play(persistentID: persistentID, in: source))
     }
 
+    public func playTracks(_ trackRefs: [String], startingAt trackRef: String, in source: MusicLibrarySource,
+                           shuffleEnabled: Bool?) async throws {
+        let ids = try trackRefs.map { ref in
+            guard let id = MusicScriptMapping.persistentID(fromTrackRef: ref) else { throw MusicLibraryError.invalidRequest }
+            return id
+        }
+        guard let id = MusicScriptMapping.persistentID(fromTrackRef: trackRef) else { throw MusicLibraryError.invalidRequest }
+        try await performContextPlay(ids, startingAt: id, in: source, shuffleEnabled: shuffleEnabled)
+    }
+
+    public func shuffleTracks(_ trackRefs: [String], in source: MusicLibrarySource) async throws {
+        let ids = try trackRefs.map { ref in
+            guard let id = MusicScriptMapping.persistentID(fromTrackRef: ref) else { throw MusicLibraryError.invalidRequest }
+            return id
+        }
+        try await performContextShuffle(ids, in: source)
+    }
+
+    /// 建立筛选列表时只占串行命令队列，各批次之间允许播放采样读取。
+    func performContextPlay(_ ids: [String], startingAt id: String, in source: MusicLibrarySource,
+                            shuffleEnabled: Bool?) async throws {
+        try await performContextCommand { context, cancellation in
+            try context.play(ids, startingAt: id, in: source, shuffleEnabled: shuffleEnabled, checkCancellation: cancellation)
+        }
+    }
+
+    func performContextShuffle(_ ids: [String], in source: MusicLibrarySource) async throws {
+        try await performContextCommand { context, cancellation in
+            try context.shuffle(ids, in: source, checkCancellation: cancellation)
+        }
+    }
+
     public func artworkData(for trackRef: String) async throws -> Data? {
         do {
             return try await libraryCache.artworkData(for: trackRef)

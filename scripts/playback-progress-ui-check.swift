@@ -51,12 +51,14 @@ enum PlaybackProgressUICheck {
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = host
-        window.orderFront(nil)
+        window.level = .floating
+        window.orderFrontRegardless()
         defer { window.close() }
         try await settle("生产进度和歌词控件挂载") {
             host.layoutSubtreeIfNeeded()
             guard let slider = findSlider(host), findLyrics(host) != nil else { return false }
-            return slider.isEnabled && slider.maxValue == 32_000 && slider.doubleValue >= 8_000
+            return window.isVisible && window.occlusionState.contains(.visible)
+                && slider.isEnabled && slider.maxValue == 32_000 && slider.doubleValue >= 8_000
         }
         let slider = findSlider(host)!
         let lyrics = findLyrics(host)!
@@ -65,6 +67,39 @@ enum PlaybackProgressUICheck {
         let trackingArea = slider.trackingAreas.first {
             ($0.owner as? NSView) === slider && $0.options.contains(.mouseEnteredAndExited)
         }!
+        let exited = NSEvent.enterExitEvent(
+            with: .mouseExited,
+            location: slider.convert(NSPoint(x: slider.bounds.midX, y: slider.bounds.midY), to: nil),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, eventNumber: 0, trackingNumber: 0, userData: nil
+        )!
+        (trackingArea.owner as! NSResponder).mouseExited(with: exited)
+        // 播放位置持续推进，只固定布局及静止外观；先完成宿主测量再跨帧确认。
+        _ = host.fittingSize
+        var previousFrame: NSRect?
+        var previousBounds: NSRect?
+        var previousSize: NSSize?
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        try await settle("连续播放夹具的布局与静止轨道应完成初始化") {
+            let size = host.fittingSize
+            host.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            host.displayIfNeeded()
+            slider.displayIfNeeded()
+            guard window.occlusionState.contains(.visible), findSlider(host) === slider,
+                  slider.isEnabled, slider.interactionAmount == 0 else {
+                stableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            if previousFrame != slider.frame || previousBounds != slider.bounds || previousSize != size {
+                previousFrame = slider.frame
+                previousBounds = slider.bounds
+                previousSize = size
+                stableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            return ProcessInfo.processInfo.systemUptime - stableSince >= 0.1
+        }
         let initialFrame = slider.frame
         let initialBounds = slider.bounds
         let restingPaint = trackPaint(slider)
@@ -110,7 +145,25 @@ enum PlaybackProgressUICheck {
             context: nil, eventNumber: 0, trackingNumber: 0, userData: nil
         )!
         (trackingArea.owner as! NSResponder).mouseEntered(with: entered)
-        try await settle("悬停外观应完成原生动画") { abs(trackPaint(slider).height - 5.5) < 0.2 }
+        // 像素进入终点附近不代表动画已结束，必须等原生动画状态达到终点再取稳定基线。
+        var previousHoverHeight: CGFloat?
+        var previousHoverOpacity: CGFloat?
+        var hoverStableSince = ProcessInfo.processInfo.systemUptime
+        try await settle("悬停外观应完成原生动画") {
+            let paint = trackPaint(slider)
+            guard window.occlusionState.contains(.visible), slider.interactionAmount == 1,
+                  abs(paint.height - 5.5) < 0.2 else {
+                hoverStableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            if previousHoverHeight != paint.height || previousHoverOpacity != paint.opacity {
+                previousHoverHeight = paint.height
+                previousHoverOpacity = paint.opacity
+                hoverStableSince = ProcessInfo.processInfo.systemUptime
+                return false
+            }
+            return ProcessInfo.processInfo.systemUptime - hoverStableSince >= 0.1
+        }
         let hoveredPaint = trackPaint(slider)
         var hoverRequestChanges = 0
         for _ in 0..<60 {
@@ -121,7 +174,9 @@ enum PlaybackProgressUICheck {
             let paint = trackPaint(slider)
             precondition(abs(paint.height - hoveredPaint.height) < 0.15
                          && abs(paint.opacity - hoveredPaint.opacity) < 0.02,
-                         "歌词换句和采样不能闪回或重启已完成的进度悬停外观")
+                         "歌词换句和采样不能闪回或重启已完成的进度悬停外观："
+                         + "height=\(hoveredPaint.height)→\(paint.height)，opacity=\(hoveredPaint.opacity)→\(paint.opacity)，"
+                         + "interaction=\(slider.interactionAmount)，unoccluded=\(window.occlusionState.contains(.visible))")
             precondition(findSlider(host).map(ObjectIdentifier.init) == identity
                          && slider.trackingAreas.contains { $0 === trackingArea },
                          "悬停期间换句仍须保留原生控件及跟踪区")
@@ -141,8 +196,8 @@ enum PlaybackProgressUICheck {
         preconditionFailure(message)
     }
 
-    private static func findSlider(_ view: NSView) -> NSSlider? {
-        if let slider = view as? NSSlider, slider.accessibilityLabel() == "播放进度" { return slider }
+    private static func findSlider(_ view: NSView) -> PlaybackScrubber.TrackingSlider? {
+        if let slider = view as? PlaybackScrubber.TrackingSlider, slider.accessibilityLabel() == "播放进度" { return slider }
         return view.subviews.lazy.compactMap(findSlider).first
     }
 

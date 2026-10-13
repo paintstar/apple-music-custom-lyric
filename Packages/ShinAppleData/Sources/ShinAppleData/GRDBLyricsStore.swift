@@ -183,7 +183,8 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
         }
     }
 
-    /// 更新/新建单条绑定（如调整 userDelayMs、重新关联），不改动文档 revision。
+    /// 更新/新建单条绑定（如重新关联），不改动文档 revision。
+    /// 播放期间调整偏移须使用带事务条件校验的 updateBindingDelay。
     /// 绑定必须指向已存在的文档。
     public func updateBinding(_ binding: SongBinding) async throws {
         try Self.validateBindingShape(binding, referencedDocument: binding.lyricDocumentId)

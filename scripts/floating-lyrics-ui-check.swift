@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Foundation
 import SwiftUI
 import ShinAppleKit
@@ -81,6 +82,11 @@ private struct FloatingToggleFramePreference: PreferenceKey {
     var frame = CGRect.zero
 }
 
+@MainActor private final class FloatingHoverProbe {
+    var point = NSPoint(x: -90_000, y: -90_000)
+    var time: TimeInterval = 100
+}
+
 @main
 private struct FloatingLyricsUICheck {
     @MainActor static func main() {
@@ -106,13 +112,21 @@ private struct FloatingLyricsUICheck {
         let suite = "ShinApple.FloatingCheck.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
+        // 旧版的纵向间距 4 点不得迁移为新字距。
+        defaults.set(4.0, forKey: "floatingLyrics.spacing")
         let store = try GRDBLyricsStore(path: directory.appendingPathComponent("lyrics.sqlite").path)
         let fixture = FloatingFixture()
         try await fixture.save(to: store)
-        try await checkProjection(store: store, fixture: fixture)
-        checkGeometry()
-        checkResizeGeometry()
-        try await checkWindowAndLifecycle(store: store, directory: directory, fixture: fixture, defaults: defaults)
+        let typographyOnly = ProcessInfo.processInfo.environment["SHIN_FLOATING_TYPOGRAPHY_CHECK_ONLY"] == "1"
+            || ProcessInfo.processInfo.environment["SHIN_FLOATING_SETTINGS_SYNC_INTERACTIVE"] == "1"
+        if !typographyOnly {
+            try await checkProjection(store: store, fixture: fixture)
+            checkGeometry()
+            checkResizeGeometry()
+            checkUnlockHover()
+        }
+        try await checkWindowAndLifecycle(store: store, directory: directory, fixture: fixture,
+                                          defaults: defaults, typographyOnly: typographyOnly)
     }
 
     @MainActor private static func eventually(_ message: @autoclosure () -> String, _ predicate: () -> Bool) async throws {
@@ -173,8 +187,14 @@ private struct FloatingLyricsUICheck {
         for position: Int64 in [300, 7_000] {
             let snapshot = fixture.snapshot(position: position)
             coordinator.update(snapshot: snapshot)
+            if position < 1_000 {
+                guard presentation(panel, coordinator, snapshot) == .message("") else {
+                    preconditionFailure("不足 3 秒的短前奏不显示等待提示")
+                }
+                continue
+            }
             guard case let .waiting(interval) = presentation(panel, coordinator, snapshot) else {
-                preconditionFailure("前奏与明确空白段应复用等待区间")
+                preconditionFailure("明确长空白段应复用等待区间")
             }
             precondition(interval.nextLineId == fixture.first.lines[position < 1_000 ? 0 : 3].id)
             precondition(position >= interval.startMs && position < interval.endMs)
@@ -249,7 +269,8 @@ private struct FloatingLyricsUICheck {
     }
 
     @MainActor private static func checkWindowAndLifecycle(
-        store: GRDBLyricsStore, directory: URL, fixture: FloatingFixture, defaults: UserDefaults
+        store: GRDBLyricsStore, directory: URL, fixture: FloatingFixture, defaults: UserDefaults,
+        typographyOnly: Bool
     ) async throws {
         let player = FloatingCheckController(fixture.snapshot(status: .paused))
         let model = AppModel(isMock: true, controller: player, searchService: nil, makeLyricsDatabase: {
@@ -257,10 +278,17 @@ private struct FloatingLyricsUICheck {
         })
         await model.start()
         try await eventually("暂停时关联结果也应更新浮窗") { model.lyricsPanel?.currentDocumentId == fixture.first.id }
+        if ProcessInfo.processInfo.environment["SHIN_FLOATING_SETTINGS_SYNC_INTERACTIVE"] == "1" {
+            try await showSettingsSynchronizationFixture(model: model, defaults: defaults)
+            return
+        }
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1_280, height: 800)
         defaults.set(NSStringFromRect(NSRect(x: 90_000, y: 90_000, width: 900, height: 200)),
                      forKey: FloatingLyricsWindowController.framePreferenceKey)
-        let floating = FloatingLyricsWindowController(defaults: defaults, visibleFrames: { [visible] })
+        let hoverProbe = FloatingHoverProbe()
+        let floating = FloatingLyricsWindowController(defaults: defaults, visibleFrames: { [visible] },
+                                                      mouseLocation: { hoverProbe.point },
+                                                      monotonicTime: { hoverProbe.time })
         defer { floating.close() }
         let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let wasActive = NSApplication.shared.isActive
@@ -268,7 +296,15 @@ private struct FloatingLyricsUICheck {
         floating.show(model: model)
         try await eventually("浮窗应显示") { floating.isPresented && floating.window?.isVisible == true }
         guard let panel = floating.window else { preconditionFailure("浮窗必须使用独立panel") }
+        if typographyOnly {
+            try await checkIndependentScrolling(panel, model: model, player: player, fixture: fixture, defaults: defaults)
+            return
+        }
         precondition(panel.level == .floating && panel.styleMask.contains(.nonactivatingPanel))
+        precondition(panel.collectionBehavior.contains(.fullScreenNone)
+                     && !panel.collectionBehavior.contains(.fullScreenAuxiliary), "悬浮窗不参与全屏")
+        panel.toggleFullScreen(nil)
+        precondition(!panel.styleMask.contains(.fullScreen), "悬浮窗不能进入原生全屏")
         precondition(visible.contains(panel.frame), "离屏偏好必须修正")
         precondition(NSApplication.shared.isActive == wasActive && NSApplication.shared.keyWindow === keyWindow,
                      "展示浮窗不得抢应用激活状态或键盘焦点")
@@ -283,20 +319,34 @@ private struct FloatingLyricsUICheck {
         var initialFrame = panel.frame
         initialFrame.size = FloatingLyricsWindowGeometry.defaultSize
         panel.setFrame(initialFrame, display: true)
+        try await checkTrackingAndFocus(panel)
+        checkDetachedTrackingCleanup()
         try await saveScreenshot(panel, name: "floating-lyrics-initial-original.png")
-        try await checkBottomToggle(floating, model: model, player: player, fixture: fixture,
-                                    visible: visible, defaults: defaults)
+        // 保留本检查自己的 key 窗，避免 accessory App 在关闭最后一扇主窗后异步失去激活。
+        let bottomWindow = try await checkBottomToggle(floating, model: model, player: player, fixture: fixture,
+                                                       visible: visible, defaults: defaults)
+        defer { bottomWindow.close() }
+        try await checkLockedHoverWindow(floating, model: model, probe: hoverProbe, defaults: defaults)
         await model.start()
         precondition(player.subscriberCount == 1, "浮窗反复开关不能增建采样订阅")
         try await checkIndependentScrolling(panel, model: model, player: player, fixture: fixture, defaults: defaults)
         try await checkNativeResize(panel)
+        try await checkNativeDrag(floating, model: model)
+        try await checkTrackingAfterResizeAndUnlock(floating)
+        try await checkFloatingSettings(floating, model: model)
         let main = NSWindow(contentRect: NSRect(x: visible.minX + 20, y: visible.minY + 20, width: 420, height: 240),
                             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         main.isReleasedWhenClosed = false
         main.contentView = NSHostingView(rootView: Text("原创检查主窗口").defaultAppStorage(defaults))
+        // 本项显式准备可成为 key 的模拟主窗；此前的后台浮窗检查均已完成。
+        NSApplication.shared.activate()
         main.makeKeyAndOrderFront(nil)
-        try await eventually("主窗准备超时：key=\(main.isKeyWindow)，visible=\(main.isVisible)") {
+        try await eventually("主窗准备超时：key=\(main.isKeyWindow)，visible=\(main.isVisible)，appActive=\(NSApplication.shared.isActive)") {
             main.isKeyWindow && main.isVisible
+        }
+        bottomWindow.close()
+        try await eventually("焦点已交给模拟主窗后，底栏夹具应关闭且主窗保持 key") {
+            !bottomWindow.isVisible && main.isKeyWindow
         }
         main.miniaturize(nil)
         player.publish(fixture.snapshot(position: 11_000, seq: 2))
@@ -333,10 +383,105 @@ private struct FloatingLyricsUICheck {
         print("PASS 独立唯一窗口、开关/关闭同步、背景焦点、暂停初始化、主窗最小化/销毁及长句双语")
     }
 
+    /// 供外部 GUI 工具操作原有 Stepper；不复制绑定实现，也不直接写入字号或字距。
+    @MainActor private static func showSettingsSynchronizationFixture(model: AppModel, defaults: UserDefaults) async throws {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720),
+                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "原创夹具：悬浮歌词设置双向同步"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: VStack(spacing: 0) {
+            Text("左侧改为 27 点 / 0.5 点并核对右侧；右侧改为 28 点 / 1 点并核对左侧；最后恢复 26 点 / 0 点，核对两侧后关闭窗口。")
+                .font(.callout).padding(12)
+            Divider()
+            HStack(alignment: .top, spacing: 0) {
+                SettingsPageView(bottomContentInset: 0).environmentObject(model)
+                Divider()
+                FloatingLyricsSettingsPopover(model: model, onFetch: {}, onImport: {})
+            }
+        }.defaultAppStorage(defaults))
+        window.center()
+        defer { window.close() }
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate()
+        window.makeKeyAndOrderFront(nil)
+        print("INFO 双向同步交互夹具已就绪：真实主设置与浮窗设置共用隔离偏好；请通过控件与两侧标签核对，关闭窗口结束。")
+        fflush(nil)
+        while window.isVisible { try await Task.sleep(for: .milliseconds(250)) }
+        print("INFO 交互夹具已关闭；双向同步是否通过应由外部 GUI 的真实控件与标签核对结果确认。")
+    }
+
+    private static func checkUnlockHover() {
+        var hover = FloatingLyricsUnlockHover()
+        precondition(!hover.shouldShow(isInside: true, time: 10, delay: 3))
+        precondition(!hover.shouldShow(isInside: true, time: 12.99, delay: 3))
+        precondition(hover.shouldShow(isInside: true, time: 13, delay: 3), "持续悬浮默认 3 秒显示锁标志")
+        precondition(!hover.shouldShow(isInside: false, time: 14, delay: 3))
+        precondition(!hover.shouldShow(isInside: true, time: 14.1, delay: 3), "移出后重新计时")
+        precondition(hover.shouldShow(isInside: true, time: 14.7, delay: 0.5), "设置降低立即使用已有持续悬浮时间")
+        precondition(!hover.shouldShow(isInside: true, time: 14.7, delay: 10), "增加等待时长立即生效")
+        hover.reset()
+        precondition(!hover.shouldShow(isInside: true, time: 20, delay: 0.5), "解锁或关闭不能保留旧计时")
+        precondition(!hover.shouldShow(isInside: true, time: 19, delay: 0.5), "无效的时钟倒退重新计时")
+        precondition(FloatingLyricsUnlockSettings.normalized(.nan) == 3)
+        precondition(FloatingLyricsUnlockSettings.normalized(-1) == FloatingLyricsUnlockSettings.delayRange.lowerBound)
+        print("PASS 连续悬浮 3 秒、移出复位、动态等待、生命周期复位与无效偏好")
+    }
+
+    @MainActor private static func checkLockedHoverWindow(
+        _ controller: FloatingLyricsWindowController, model: AppModel,
+        probe: FloatingHoverProbe, defaults: UserDefaults
+    ) async throws {
+        guard let panel = controller.window else { preconditionFailure("悬浮解锁检查需要歌词窗") }
+        let appWasActive = NSApplication.shared.isActive
+        let keyWindow = NSApplication.shared.keyWindow
+        probe.point = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        controller.setLocked(true)
+        probe.time = 102.9
+        try await Task.sleep(for: .milliseconds(150))
+        precondition(controller.unlockWindow?.isVisible != true, "未满 3 秒不能显示锁标志")
+        probe.time = 103
+        try await eventually("悬浮满 3 秒应显示解锁标志") { controller.unlockWindow?.isVisible == true }
+        guard let button = controller.unlockWindow else { preconditionFailure("解锁标志需要独立小窗") }
+        precondition(panel.frame.contains(button.frame) && button.frame.width <= 40 && button.frame.height <= 40,
+                     "只有锁标志区域接收鼠标，不遮挡整块歌词")
+        precondition(panel.ignoresMouseEvents && !panel.isMovable && !panel.isMovableByWindowBackground)
+        precondition(!button.ignoresMouseEvents && !button.canBecomeKey && !button.canBecomeMain)
+        precondition(NSApplication.shared.isActive == appWasActive && NSApplication.shared.keyWindow === keyWindow,
+                     "出现锁标志不能激活 App 或切换键盘焦点；beforeActive=\(appWasActive), "
+                     + "afterActive=\(NSApplication.shared.isActive), keyBefore=\(keyWindow?.windowNumber ?? -1), "
+                     + "keyAfter=\(NSApplication.shared.keyWindow?.windowNumber ?? -1)")
+        probe.point = NSPoint(x: panel.frame.maxX + 100, y: panel.frame.maxY + 100)
+        try await eventually("移出应隐藏锁标志") { !button.isVisible }
+        probe.point = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        probe.time = 200
+        try await Task.sleep(for: .milliseconds(150))
+        probe.time = 201
+        defaults.set(0.5, forKey: FloatingLyricsUnlockSettings.delayPreferenceKey)
+        try await eventually("降低设置无需重锁，应立即显示锁标志") { button.isVisible }
+        guard let host = button.contentView else { preconditionFailure("锁标志必须可实际点击") }
+        host.layoutSubtreeIfNeeded()
+        try await clickButton(frame: host.bounds, host: host, window: button)
+        try await eventually("锁标志实际点击应解锁并保持歌词窗") {
+            !controller.isLocked && !panel.ignoresMouseEvents && controller.isPresented && panel.isVisible
+                && controller.unlockWindow == nil
+        }
+        controller.setLocked(true)
+        controller.close()
+        probe.time = 1_000
+        try await Task.sleep(for: .milliseconds(150))
+        precondition(controller.unlockWindow == nil && !controller.isPresented,
+                     "关闭必须清理待显示锁标志与采样计时器")
+        controller.show(model: model)
+        precondition(!controller.isLocked && controller.unlockWindow == nil)
+        defaults.removeObject(forKey: FloatingLyricsUnlockSettings.delayPreferenceKey)
+        probe.point = NSPoint(x: panel.frame.maxX + 100, y: panel.frame.maxY + 100)
+        print("PASS 小区域解锁标志、鼠标穿透/焦点保持、移出隐藏、设置即时生效、实际点击与关闭清理")
+    }
+
     @MainActor private static func checkBottomToggle(
         _ controller: FloatingLyricsWindowController, model: AppModel, player: FloatingCheckController,
         fixture: FloatingFixture, visible: NSRect, defaults: UserDefaults
-    ) async throws {
+    ) async throws -> NSWindow {
         let probe = FloatingToggleFrameProbe()
         let control = FloatingLyricsToggleButton(controller: controller, model: model)
             .background {
@@ -360,7 +505,6 @@ private struct FloatingLyricsUICheck {
         window.contentView = host
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
         try await saveScreenshot(window, name: "floating-lyrics-bottom-bar-original.png")
         try await eventually("底栏按钮应完成实际布局并能接收点击") {
             host.layoutSubtreeIfNeeded()
@@ -373,6 +517,11 @@ private struct FloatingLyricsUICheck {
         guard let panel = controller.window else { preconditionFailure("锁定检查需要已显示浮窗") }
         controller.setLocked(true)
         precondition(controller.isLocked && panel.ignoresMouseEvents, "锁定必须使用系统整窗鼠标穿透")
+        try await eventually("锁定恢复透明背景且系统 mouseDown 命中穿过歌词窗") {
+            let point = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+            return panel.backgroundColor.alphaComponent == 0
+                && NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0) != panel.windowNumber
+        }
         player.publish(fixture.snapshot(position: 11_000, status: .paused, seq: 4))
         try await eventually("锁定后歌词仍应随已有播放快照更新") {
             currentIDs(model) == [fixture.first.lines[3].id]
@@ -396,6 +545,7 @@ private struct FloatingLyricsUICheck {
         }
         try await saveScreenshot(window, name: "floating-lyrics-bottom-bar-original.png")
         print("PASS 实际底栏开关、整窗鼠标穿透、锁态同步/无遮挡、首击解锁与关闭恢复")
+        return window
     }
 
     @MainActor private static func clickButton(frame: CGRect, host: NSView, window: NSWindow) async throws {
@@ -414,7 +564,9 @@ private struct FloatingLyricsUICheck {
         }
         RunLoop.main.add(release, forMode: .common)
         RunLoop.main.add(release, forMode: .eventTracking)
-        NSApplication.shared.postEvent(event(.leftMouseDown), atStart: false)
+        // 已知所属窗口的 down 直接走生产分发链，避免排队期间恢复 frame 改变系统坐标换算。
+        // up 保留在事件队列，支持 AppKit 按钮内部的鼠标跟踪循环。
+        window.sendEvent(event(.leftMouseDown))
         try await Task.sleep(for: .milliseconds(100))
     }
 
@@ -422,6 +574,15 @@ private struct FloatingLyricsUICheck {
         _ window: NSWindow, model: AppModel, player: FloatingCheckController,
         fixture: FloatingFixture, defaults: UserDefaults
     ) async throws {
+        precondition(FloatingLyricsSettings.defaultCharacterSpacing == 0
+                     && FloatingLyricsSettings.normalizedCharacterSpacing(.nan) == 0
+                     && FloatingLyricsSettings.normalizedCharacterSpacing(-1) == 0
+                     && FloatingLyricsSettings.normalizedCharacterSpacing(9) == 8,
+                     "字距默认 0 点，无效值回退并限制在 0–8 点")
+        precondition(FloatingLyricsSettings.normalizedFontSize(.infinity) == 26
+                     && FloatingLyricsSettings.normalizedFontSize(10) == 16
+                     && FloatingLyricsSettings.normalizedFontSize(60) == 56,
+                     "字号无效值回退并限制在 16–56 点")
         var frame = window.frame
         frame.size = NSSize(width: 420, height: 180)
         window.setFrame(frame, display: true)
@@ -436,6 +597,28 @@ private struct FloatingLyricsUICheck {
         }
         let originalMode = model.lyricsPanel?.browseMode
         let translatedHeight = document.frame.height
+        defaults.set(FloatingLyricsSettings.characterSpacingRange.upperBound,
+                     forKey: FloatingLyricsSettings.characterSpacingPreferenceKey)
+        try await eventually("仅浮窗字距偏好应立即增加长句换行高度") {
+            window.contentView?.layoutSubtreeIfNeeded()
+            return document.frame.height > translatedHeight + 20
+        }
+        defaults.set(FloatingLyricsSettings.defaultCharacterSpacing,
+                     forKey: FloatingLyricsSettings.characterSpacingPreferenceKey)
+        try await eventually("浮窗字距恢复 0 应恢复原视觉高度，旧纵向间距不得成为默认字距") {
+            window.contentView?.layoutSubtreeIfNeeded()
+            return abs(document.frame.height - translatedHeight) < 1
+        }
+        defaults.set(FloatingLyricsSettings.fontSizeRange.upperBound, forKey: FloatingLyricsSettings.fontSizePreferenceKey)
+        try await eventually("仅浮窗字号偏好应立即增加长句可滚动高度") {
+            window.contentView?.layoutSubtreeIfNeeded()
+            return document.frame.height > translatedHeight + 30
+        }
+        defaults.set(FloatingLyricsSettings.defaultFontSize, forKey: FloatingLyricsSettings.fontSizePreferenceKey)
+        try await eventually("浮窗字号恢复默认应恢复原视觉高度") {
+            window.contentView?.layoutSubtreeIfNeeded()
+            return abs(document.frame.height - translatedHeight) < 1
+        }
         defaults.set(false, forKey: LyricsPanelView.translationsSettingKey)
         try await eventually("注入的翻译偏好应只影响测试浮窗") {
             window.contentView?.layoutSubtreeIfNeeded()
@@ -463,7 +646,7 @@ private struct FloatingLyricsUICheck {
         try await eventually("恢复第一组供窗口生命周期检查") {
             currentIDs(model) == Array(fixture.first.lines.prefix(2)).map(\.id)
         }
-        print("PASS 长句独立滚动、测试域译文开关及换组复位")
+        print("PASS 字距与字号即时重排、默认恢复、长句独立滚动、测试域译文开关及换组复位")
     }
 
     @MainActor private static func findScrollView(_ view: NSView?) -> NSScrollView? {
@@ -519,7 +702,7 @@ private struct FloatingLyricsUICheck {
     @MainActor private static func checkNativeResize(_ window: NSWindow) async throws {
         try await eventually("原生缩放区应挂载") {
             window.contentView?.layoutSubtreeIfNeeded()
-            return findResizeView(window.contentView)?.bounds.width == window.contentView?.bounds.width
+            return findResizeView(window.contentView)?.bounds.size == window.contentLayoutRect.size
         }
         guard let view = findResizeView(window.contentView) else { preconditionFailure("缺少原生缩放区") }
         let initial = window.frame
@@ -542,12 +725,405 @@ private struct FloatingLyricsUICheck {
             return value
         }
         window.sendEvent(event(.leftMouseDown, start))
+        precondition(view.activeEdge == .right, "合成按下事件应选择右侧缩放动作")
         window.sendEvent(event(.leftMouseDragged, end))
         window.sendEvent(event(.leftMouseUp, end))
         precondition(abs(window.frame.width - initial.width - 40) < 1 && window.frame.minX == initial.minX,
-                     "实际原生边缘拖拽应增宽且保持对侧锚点")
+                     "合成缩放事件应增宽且保持对侧锚点")
         window.setFrame(initial, display: true)
-        print("PASS 原生宽边命中、锁态放行、中心不拦截与实际鼠标拖拽缩放")
+        let northwest = FloatingLyricsResizeCursor.fallbackCursor(for: .topLeft)
+        let northeast = FloatingLyricsResizeCursor.fallbackCursor(for: .topRight)
+        precondition(northwest !== NSCursor.crosshair && northeast !== NSCursor.crosshair && northwest !== northeast,
+                     "macOS 14 两组对角方向应映射到不同光标对象，不能使用crosshair对象")
+        precondition(northwest === FloatingLyricsResizeCursor.fallbackCursor(for: .bottomRight)
+                     && northeast === FloatingLyricsResizeCursor.fallbackCursor(for: .bottomLeft))
+        print("PASS 原生缩放view合成事件的几何、宽边命中、禁用放行与对角光标对象映射")
+    }
+
+    @MainActor private static func checkNativeDrag(
+        _ controller: FloatingLyricsWindowController, model: AppModel
+    ) async throws {
+        guard let window = controller.window, let host = window.contentView as? NSHostingView<AnyView> else {
+            preconditionFailure("正文拖动检查需要实际悬浮歌词host")
+        }
+        let originalFrame = window.frame
+        let visibleFrames = NSScreen.screens.map(\.visibleFrame)
+        guard let screen = FloatingLyricsWindowGeometry.visibleFrame(for: originalFrame, visibleFrames: visibleFrames) else {
+            preconditionFailure("实际正文拖动检查需要可用显示器")
+        }
+        // 离屏恢复检查可能将窗放在屏幕顶部；本项先留出实际拖动余量，再恢复夹具位置。
+        window.setFrame(NSRect(x: screen.midX - originalFrame.width / 2, y: screen.midY - originalFrame.height / 2,
+                               width: originalFrame.width, height: originalFrame.height), display: true)
+        defer { window.setFrame(originalFrame, display: true) }
+        try await eventually("正文拖动层应挂载") {
+            host.layoutSubtreeIfNeeded()
+            guard let drag = findDragView(host) else { return false }
+            return drag.bounds.size == window.contentLayoutRect.size && host.bounds.size == drag.bounds.size
+        }
+        guard let drag = findDragView(host), let scroll = findScrollView(host) else {
+            preconditionFailure("拖动层与长句滚动视图必须同时存在")
+        }
+        // 显式准备按钮检查的工具条状态；这不是系统鼠标悬浮或屏幕光标验收。
+        drag.reportHover(true)
+        try await eventually("按钮夹具的工具条排除位置应就绪") {
+            host.layoutSubtreeIfNeeded()
+            return toolbarLayoutIsCurrent(window, drag: drag)
+        }
+        let center = NSPoint(x: drag.bounds.midX, y: drag.bounds.midY)
+        precondition(host.hitTest(drag.convert(center, to: host.superview)) === drag,
+                     "正文实际命中拖动层，不能被歌词文本或ScrollView吞掉")
+        let toolbar = drag.excludedRect
+        let lockFrame = NSRect(x: toolbar.minX + 67, y: toolbar.minY + 4, width: 28, height: 28)
+        let lockPoint = NSPoint(x: lockFrame.midX, y: lockFrame.midY)
+        precondition(drag.hitTest(drag.convert(lockPoint, to: drag.superview)) == nil,
+                     "工具按钮真实位置不能被拖动层覆盖")
+        let corner = NSPoint(x: drag.bounds.maxX - 6, y: drag.bounds.maxY - 6)
+        precondition(drag.hitTest(drag.convert(corner, to: drag.superview)) == nil,
+                     "边角缩放优先于正文拖动")
+        let initial = window.frame
+        let appWasActive = NSApplication.shared.isActive
+        let keyWindow = NSApplication.shared.keyWindow
+        let start = window.convertPoint(toScreen: drag.convert(center, to: nil))
+        let end = NSPoint(x: start.x + 36, y: start.y + 28)
+        let event: @MainActor (NSEvent.EventType, NSPoint) -> NSEvent = { type, point in
+            NSEvent.mouseEvent(with: type, location: window.convertPoint(fromScreen: point), modifierFlags: [],
+                              timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                              context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+        }
+        let downEvent = event(.leftMouseDown, start)
+        window.sendEvent(downEvent)
+        let draggingAfterDown = drag.isDragging
+        precondition(drag.isDragging, "正文合成按下应开始拖动动作")
+        host.layoutSubtreeIfNeeded()
+        window.resetCursorRects()
+        precondition(drag.isDragging, "布局与光标区域重建不能取消拖动动作")
+        let draggedEvent = event(.leftMouseDragged, end)
+        window.sendEvent(draggedEvent)
+        let upEvent = event(.leftMouseUp, end)
+        window.sendEvent(upEvent)
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        let downHit = host.hitTest(drag.convert(center, to: host.superview)).map { String(describing: type(of: $0)) } ?? "nil"
+        let dragDiagnostic = "initial=\(initial), current=\(window.frame), desiredDelta=(36,28), screens=\(screens), "
+            + "draggingAfterDown=\(draggingAfterDown), draggingNow=\(drag.isDragging), downHit=\(downHit), "
+            + "eventWindow=\(downEvent.windowNumber)/\(window.windowNumber), down=\(downEvent.locationInWindow), "
+            + "drag=\(draggedEvent.locationInWindow), up=\(upEvent.locationInWindow), locked=\(controller.isLocked), "
+            + "movable=\(window.isMovable), ignoresMouse=\(window.ignoresMouseEvents)"
+        precondition(abs(window.frame.minX - initial.minX - 36) < 1 && abs(window.frame.minY - initial.minY - 28) < 1
+                     && window.frame.size == initial.size, "正文合成拖动事件应移动窗口且不改变尺寸；\(dragDiagnostic)")
+        precondition(!drag.isDragging, "合成松开事件应结束拖动动作")
+        precondition(NSApplication.shared.isActive == appWasActive && NSApplication.shared.keyWindow === keyWindow,
+                     "正文拖动不得切换 App 激活状态或键盘焦点")
+        window.setFrame(initial, display: true)
+        let originalMode = model.lyricsPanel?.browseMode
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        let before = scroll.contentView.bounds.minY
+        let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -45, wheel2: 0, wheel3: 0)!
+        wheel.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        drag.scrollWheel(with: NSEvent(cgEvent: wheel)!)
+        try await eventually("正文拖动层仍应转交实际滚轮事件，长句可以阅读") {
+            scroll.contentView.bounds.minY > before + 10
+        }
+        precondition(model.lyricsPanel?.browseMode == originalMode, "浮窗滚轮不改变主窗歌词浏览模式")
+        drag.reportHover(true)
+        try await eventually("锁按钮夹具的工具条应重新就绪") {
+            host.layoutSubtreeIfNeeded()
+            return toolbarLayoutIsCurrent(window, drag: drag)
+        }
+        try await clickButton(frame: lockFrame, host: host, window: window)
+        try await eventually("浮窗工具锁按钮首击必须生效，不能被正文拖动抢走") {
+            controller.isLocked && window.ignoresMouseEvents
+        }
+        try await eventually("锁态拖动层不可命中") {
+            host.layoutSubtreeIfNeeded()
+            guard let lockedDrag = findDragView(host) else { return false }
+            return !lockedDrag.isEnabled && lockedDrag.hitTest(lockedDrag.convert(center, to: lockedDrag.superview)) == nil
+        }
+        controller.setLocked(false)
+        print("PASS 正文合成事件拖窗几何、布局不取消拖动、焦点保持、滚轮转交、工具首击与锁态禁用")
+    }
+
+    /// 内部注册、命中与焦点检查；不移动系统指针，不断言屏幕实际显示哪一种光标。
+    @MainActor private static func checkTrackingAndFocus(_ window: NSWindow) async throws {
+        try await eventually("悬浮窗应准备原生交互层") {
+            window.contentView?.layoutSubtreeIfNeeded()
+            return findDragView(window.contentView)?.bounds.size == window.contentLayoutRect.size
+                && findResizeView(window.contentView)?.bounds.size == window.contentLayoutRect.size
+        }
+        guard let drag = findDragView(window.contentView), let resize = findResizeView(window.contentView),
+              window is FloatingLyricsPanel else { preconditionFailure("缺少真实浮窗原生交互层") }
+        let wasActive = NSApplication.shared.isActive
+        let keyWindow = NSApplication.shared.keyWindow
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        precondition(!window.isKeyWindow && !window.canBecomeKey && window.areCursorRectsEnabled)
+        let clickPoints = [NSPoint(x: drag.bounds.midX, y: drag.bounds.midY), NSPoint(x: 2, y: 2),
+                           NSPoint(x: drag.bounds.maxX - 2, y: drag.bounds.maxY - 2)]
+        try await eventually("正文和边缘应成为实际窗口命中目标") {
+            clickPoints.allSatisfy { point in
+                let screenPoint = window.convertPoint(toScreen: drag.convert(point, to: nil))
+                return NSWindow.windowNumber(at: screenPoint, belowWindowWithWindowNumber: 0) == window.windowNumber
+            }
+        }
+        drag.updateTrackingAreas()
+        resize.updateTrackingAreas()
+        let dragAreas = interactionTrackingAreas(drag)
+        let resizeAreas = interactionTrackingAreas(resize)
+        precondition(dragAreas.count == 2 && resizeAreas.count == 1,
+                     "正文应分开登记activeAlways鼠标tracking与合法cursorUpdate，边缘应登记合法cursorUpdate")
+        precondition((dragAreas + resizeAreas).allSatisfy { $0.options.contains(.inVisibleRect) },
+                     "交互tracking必须让AppKit自动同步可见区域")
+        for _ in 0..<3 {
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.resetCursorRects()
+            drag.updateTrackingAreas()
+            resize.updateTrackingAreas()
+            precondition(sameTrackingAreas(interactionTrackingAreas(drag), as: dragAreas)
+                         && sameTrackingAreas(interactionTrackingAreas(resize), as: resizeAreas),
+                         "同一交互view的布局、光标区域重建与重复update不能替换inVisibleRect tracking对象")
+        }
+        let overlay = NSPanel(contentRect: NSRect(x: window.frame.maxX - 70, y: window.frame.minY, width: 70, height: 70),
+                              styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        overlay.isReleasedWhenClosed = false
+        overlay.level = .popUpMenu
+        overlay.contentView = NSHostingView(rootView: Text("原创设置浮层").frame(width: 70, height: 70).background(.black))
+        overlay.orderFrontRegardless()
+        defer { overlay.close() }
+        let coveredPoint = NSPoint(x: window.frame.maxX - 6, y: window.frame.minY + 6)
+        try await eventually("覆盖浮层应成为该位置的WindowServer命中目标") {
+            NSWindow.windowNumber(at: coveredPoint, belowWindowWithWindowNumber: 0) == overlay.windowNumber
+        }
+        let activeAfter = NSApplication.shared.isActive
+        let keyAfter = NSApplication.shared.keyWindow
+        let frontmostAfter = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let focusDiagnostic = "appActiveBefore=\(wasActive), appActiveAfter=\(activeAfter), "
+            + "keySame=\(keyAfter === keyWindow), floatingIsKey=\(window.isKeyWindow), overlayIsKey=\(overlay.isKeyWindow)"
+        let externalSwitch = frontmostAfter != frontmost && frontmost != ownPID && frontmostAfter != ownPID
+            && !wasActive && !activeAfter && keyAfter === keyWindow
+        precondition(activeAfter == wasActive && keyAfter === keyWindow && (frontmostAfter == frontmost || externalSwitch),
+                     "tracking与原生区域重建不能切换前台App或键盘焦点；\(focusDiagnostic)")
+        print("PASS 原生tracking身份稳定、窗口/覆盖命中与非激活焦点")
+        print("INFO 屏幕实际光标与真实鼠标进出另行人工验收；NSCursor.current和合成事件不作为该项通过证据")
+    }
+
+    @MainActor private static func interactionTrackingAreas(_ view: NSView) -> [NSTrackingArea] {
+        view.trackingAreas.filter { area in
+            (area.owner as? NSView) === view
+                && (area.options.contains([.activeAlways, .mouseEnteredAndExited, .mouseMoved])
+                    || area.options.contains([.activeInActiveApp, .cursorUpdate]))
+        }
+    }
+
+    @MainActor private static func sameTrackingAreas(_ current: [NSTrackingArea], as original: [NSTrackingArea]) -> Bool {
+        current.count == original.count && original.allSatisfy { old in current.contains { $0 === old } }
+    }
+
+    @MainActor private static func checkDetachedTrackingCleanup() {
+        // 不展示此窗口，只验证同一对原生view脱离/重新加入窗口时的资源清理。
+        let probe = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 120),
+                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        probe.isReleasedWhenClosed = false
+        defer { probe.contentView = nil; probe.close() }
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
+        let drag = FloatingLyricsDragRegion.DragView(frame: content.bounds)
+        let resize = FloatingLyricsResizeRegion.ResizeView(frame: content.bounds)
+        content.addSubview(drag)
+        content.addSubview(resize)
+        probe.contentView = content
+        drag.updateTrackingAreas()
+        resize.updateTrackingAreas()
+        precondition(interactionTrackingAreas(drag).count == 2 && interactionTrackingAreas(resize).count == 1)
+        probe.contentView = nil
+        precondition(drag.window == nil && resize.window == nil
+                     && interactionTrackingAreas(drag).isEmpty && interactionTrackingAreas(resize).isEmpty,
+                     "离窗必须清理正文与边缘的自有tracking")
+        probe.contentView = content
+        drag.updateTrackingAreas()
+        resize.updateTrackingAreas()
+        precondition(drag.window === probe && resize.window === probe
+                     && interactionTrackingAreas(drag).count == 2 && interactionTrackingAreas(resize).count == 1,
+                     "同一view重新挂载后应恢复有效tracking")
+        print("PASS 同一原生交互view离窗清理与重新挂载恢复tracking")
+    }
+
+    @MainActor private static func checkTrackingAfterResizeAndUnlock(_ controller: FloatingLyricsWindowController) async throws {
+        guard let window = controller.window else { preconditionFailure("缺少光标生命周期窗口") }
+        for _ in 0..<3 {
+            controller.setLocked(true)
+            try await eventually("锁定取消拖动和缩放") {
+                window.contentView?.layoutSubtreeIfNeeded()
+                return findDragView(window.contentView)?.isEnabled == false
+                    && findResizeView(window.contentView)?.isEnabled == false
+            }
+            guard let disabledDrag = findDragView(window.contentView), let disabledResize = findResizeView(window.contentView) else {
+                preconditionFailure("锁定检查缺少原生交互层")
+            }
+            precondition(interactionTrackingAreas(disabledDrag).isEmpty && interactionTrackingAreas(disabledResize).isEmpty,
+                         "禁用后必须移除正文与边缘自有tracking")
+            controller.setLocked(false)
+            try await eventually("解锁重新启用交互") {
+                window.contentView?.layoutSubtreeIfNeeded()
+                return findDragView(window.contentView)?.isEnabled == true
+                    && findResizeView(window.contentView)?.isEnabled == true
+            }
+            try await checkTrackingAndFocus(window)
+            try await checkNativeResize(window)
+            try await checkTrackingAndFocus(window)
+        }
+        print("PASS 锁定禁用tracking、解锁恢复及合成缩放后的原生区域注册")
+    }
+
+    @MainActor private static func findDragView(_ view: NSView?) -> FloatingLyricsDragRegion.DragView? {
+        guard let view else { return nil }
+        if let drag = view as? FloatingLyricsDragRegion.DragView { return drag }
+        return view.subviews.lazy.compactMap(findDragView).first
+    }
+
+    @MainActor private static func toolbarLayoutIsCurrent(_ window: NSWindow, drag: FloatingLyricsDragRegion.DragView) -> Bool {
+        let toolbar = drag.excludedRect
+        return drag.bounds.size == window.contentLayoutRect.size && toolbar.width > 0
+            && abs(toolbar.maxX - drag.bounds.maxX) < 0.5 && drag.bounds.contains(toolbar)
+    }
+
+    @MainActor private static func checkFloatingSettings(_ controller: FloatingLyricsWindowController, model: AppModel) async throws {
+        guard let window = controller.window, let host = window.contentView else { preconditionFailure("缺少设置浮窗") }
+        var routeCount = 0
+        let previousRoute = controller.presentMainWindow
+        controller.presentMainWindow = {
+            precondition(!model.isLyricsFetchPresented && !model.isImportPresented, "必须先展示主窗，再启动获取/导入")
+            routeCount += 1
+        }
+        defer { controller.presentMainWindow = previousRoute }
+        func clickGear() async throws {
+            guard let drag = findDragView(host) else { preconditionFailure("设置工具条缺少交互层") }
+            let gear = NSRect(x: drag.excludedRect.minX + 35, y: drag.excludedRect.minY + 4, width: 28, height: 28)
+            try await clickButton(frame: gear, host: host, window: window)
+        }
+        func openGear() async throws -> NSWindow {
+            guard let drag = findDragView(host) else { preconditionFailure("设置工具条缺少交互层") }
+            // 前一覆盖夹具刚关闭，先让当前窗口与 WindowServer 命中准备就绪，不激活 App。
+            window.orderFrontRegardless()
+            try await eventually("设置浮窗当前布局和正文点击命中应就绪") {
+                host.layoutSubtreeIfNeeded()
+                let point = window.convertPoint(toScreen: drag.convert(NSPoint(x: drag.bounds.midX, y: drag.bounds.midY), to: nil))
+                return drag.bounds.size == window.contentLayoutRect.size
+                    && NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0) == window.windowNumber
+            }
+            // 只为设置按钮流程准备工具条，不将夹具状态当作真实鼠标hover通过。
+            drag.reportHover(true)
+            do {
+                try await eventually("悬浮设置工具条应显示") {
+                    host.layoutSubtreeIfNeeded()
+                    return toolbarLayoutIsCurrent(window, drag: drag)
+                }
+            } catch {
+                let point = window.convertPoint(toScreen: drag.convert(NSPoint(x: drag.bounds.midX, y: drag.bounds.midY), to: nil))
+                print("GEAR toolbar=\(drag.excludedRect), dragBounds=\(drag.bounds), contentLayout=\(window.contentLayoutRect), "
+                      + "pointHitsOwn=\(NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0) == window.windowNumber), "
+                      + "frontmostOwn=\(NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier), "
+                      + "routeCount=\(routeCount), presentedSheet=\(FloatingLyricsActions.hasPresentedSheet(model))")
+                fflush(nil)
+                throw error
+            }
+            let existing = Set(NSApplication.shared.windows.filter(\.isVisible).map(\.windowNumber))
+            try await clickGear()
+            var popup: NSWindow?
+            try await eventually("gear 首击应打开实际可见的设置 popover") {
+                popup = NSApplication.shared.windows.first { $0.isVisible && !existing.contains($0.windowNumber) && $0.contentView != nil }
+                return popup != nil
+            }
+            guard let popup else { preconditionFailure("缺少实际设置 popover") }
+            return popup
+        }
+        var reportedAXLimitation = false
+        func perform(_ identifier: String, in popup: NSWindow, fallback: () -> Void) async throws {
+            let result = pressAccessibleControl(identifier)
+            if result.found {
+                precondition(result.hasSpacing, "设置 popover 必须有悬浮歌词字间距控件")
+                precondition(result.status == AXError.success.rawValue, "实际设置控件必须可操作")
+            } else {
+                // 独立 CLI 没有外部 AX 客户端时，整个 SwiftUI 树可能未构建。已有树但缺控件仍报错。
+                precondition(result.status != AXError.success.rawValue || popup.contentView?.accessibilityChildren()?.isEmpty != false,
+                             "已有 SwiftUI AX 节点时，设置控件不能缺失")
+                if !reportedAXLimitation {
+                    print("INFO 独立检查进程无法查询 SwiftUI AX 控件（公开 own-PID AX 状态：\(result.status)）；实际 gear/弹窗已验证，按钮操作需外部 AX 验证")
+                    reportedAXLimitation = true
+                }
+                try await clickGear()
+                try await eventually("再次点击 gear 应关闭实际设置 popover") { !popup.isVisible }
+                fallback()
+            }
+        }
+        precondition(model.canBeginOnlineFetch)
+        let trackKey = model.currentTrackKey
+        let fetchPopup = try await openGear()
+        try await perform("floating-lyrics-fetch", in: fetchPopup) {
+            FloatingLyricsActions.fetch(model, presentMainWindow: { controller.presentMainWindow?() })
+        }
+        try await eventually("浮窗获取复用主模型并冻结当前目标") {
+            routeCount == 1 && model.isLyricsFetchPresented && model.lyricsFetchModel?.target.trackKey == trackKey
+        }
+        model.isLyricsFetchPresented = false
+        model.lyricsFetchModel = nil
+        try await eventually("获取入口操作后设置 popover 应关闭") { !fetchPopup.isVisible }
+        let importPopup = try await openGear()
+        try await perform("floating-lyrics-import", in: importPopup) {
+            FloatingLyricsActions.importLyrics(model, presentMainWindow: { controller.presentMainWindow?() })
+        }
+        try await eventually("浮窗导入复用原流程并冻结当前目标") {
+            routeCount == 2 && model.isImportPresented && model.importFlow?.target?.trackKey == trackKey
+        }
+        guard let flow = model.importFlow else { preconditionFailure("已有导入草稿需要原会话") }
+        flow.pastedText = "[00:00.00]纸船上的新注记"
+        let generation = flow.operationGeneration
+        var focusedExisting = 0
+        controller.presentMainWindow = { focusedExisting += 1 }
+        FloatingLyricsActions.fetch(model, presentMainWindow: { focusedExisting += 1 })
+        FloatingLyricsActions.importLyrics(model, presentMainWindow: { focusedExisting += 1 })
+        precondition(flow.operationGeneration == generation && flow.pastedText == "[00:00.00]纸船上的新注记"
+                     && model.isImportPresented && !model.isLyricsFetchPresented, "已有导入草稿不能被重复获取/导入覆盖")
+        try await eventually("导入入口操作后设置 popover 应关闭") { !importPopup.isVisible }
+        let resumePopup = try await openGear()
+        try await perform("floating-lyrics-resume", in: resumePopup) { controller.presentMainWindow?() }
+        precondition(focusedExisting == 3 && flow.operationGeneration == generation
+                     && flow.pastedText == "[00:00.00]纸船上的新注记", "继续操作只聚焦现有会话，保留人工草稿")
+        model.isImportPresented = false
+        try await eventually("导入入口操作后设置 popover 应关闭") { !resumePopup.isVisible }
+        print("PASS gear 首击/弹窗开关、先展示主窗再获取/导入、目标固定及人工草稿防重入")
+    }
+
+    @MainActor private static func pressAccessibleControl(_ identifier: String) -> (found: Bool, hasSpacing: Bool, status: Int32) {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        // 自进程 AX 会直接执行 SwiftUI action，必须留在 MainActor；不使用私有属性或申请辅助权限。
+        let application = AXUIElementCreateApplication(pid)
+        _ = AXUIElementSetMessagingTimeout(application, 0.5)
+        var rootChildren: CFTypeRef?
+        let query = AXUIElementCopyAttributeValue(application, kAXChildrenAttribute as CFString, &rootChildren)
+        guard query == .success else { return (false, false, query.rawValue) }
+        var queue = [application]
+        var visited: [AXUIElement] = []
+        var control: AXUIElement?
+        var hasSpacing = false
+        while !queue.isEmpty {
+            let element = queue.removeFirst()
+            guard !visited.contains(where: { CFEqual($0, element) }) else { continue }
+            visited.append(element)
+            var owner: pid_t = 0
+            guard AXUIElementGetPid(element, &owner) == .success, owner == pid else { continue }
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &value) == .success {
+                if value as? String == identifier { control = element }
+                if value as? String == "floating-lyrics-spacing" { hasSpacing = true }
+            }
+            let attributes = CFEqual(element, application) ? [kAXChildrenAttribute, kAXWindowsAttribute] : [kAXChildrenAttribute]
+            for attribute in attributes {
+                value = nil
+                if AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+                   let children = value as? [AXUIElement] { queue.append(contentsOf: children) }
+            }
+        }
+        guard let control else { return (false, hasSpacing, query.rawValue) }
+        return (true, hasSpacing, AXUIElementPerformAction(control, kAXPressAction as CFString).rawValue)
     }
 
     @MainActor private static func findResizeView(_ view: NSView?) -> FloatingLyricsResizeRegion.ResizeView? {

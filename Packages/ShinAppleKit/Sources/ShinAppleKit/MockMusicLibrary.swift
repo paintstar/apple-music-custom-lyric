@@ -2,6 +2,8 @@ import Foundation
 
 /// 原创虚构资料库，仅供 Mock 模式；不读取用户歌曲或任何网络服务。
 public enum MockMusicLibrary {
+    /// 原创 Mock 歌单的固定协议身份，与真实 Music 资料库无关。
+    static let playbackContextID = "C000000000000001"
     public static let tracks: [MusicLibraryTrack] = [
         MusicLibraryTrack(persistentID: "A000000000000001", title: "窗边的纸船", artist: "演示歌手甲", album: "晴日手记",
                           durationMs: 180_000, isFavorite: true, dateAdded: Date(timeIntervalSince1970: 1_700_000_003)),
@@ -39,7 +41,10 @@ extension MockPlaybackController: MusicLibraryBrowsing {
 
     public func loadPlaylists() async throws -> [MusicLibraryPlaylist] {
         try Task.checkCancellation()
-        return MockMusicLibrary.playlists
+        let context = mockPlaybackContext.withLock { $0 }
+        return MockMusicLibrary.playlists + (context.isEmpty ? [] : [
+            MusicLibraryPlaylist(id: MockMusicLibrary.playbackContextID, name: "ShinApple · 当前播放")
+        ])
     }
 
     public func currentPlaybackSource() async throws -> MusicLibrarySource? {
@@ -51,7 +56,7 @@ extension MockPlaybackController: MusicLibraryBrowsing {
         try Task.checkCancellation()
         guard offset >= 0, (1...500).contains(limit) else { throw MusicLibraryError.invalidRequest }
         let overrides = mockLibraryFavorites.withLock { $0 }
-        let tracks = try MockMusicLibrary.tracks(in: source).map { track in
+        let tracks = try libraryTracks(in: source).map { track in
             var copy = track
             copy.isFavorite = overrides[track.trackRef] ?? track.isFavorite
             return copy
@@ -64,7 +69,7 @@ extension MockPlaybackController: MusicLibraryBrowsing {
 
     public func playTrack(_ trackRef: String, in source: MusicLibrarySource) async throws {
         try Task.checkCancellation()
-        let tracks = try MockMusicLibrary.tracks(in: source)
+        let tracks = try libraryTracks(in: source)
         guard let index = tracks.firstIndex(where: { $0.trackRef == trackRef }) else {
             throw MusicLibraryError.sourceUnavailable
         }
@@ -72,6 +77,43 @@ extension MockPlaybackController: MusicLibraryBrowsing {
             MockTrack(identity: CatalogIdentity(storefront: "mock", catalogSongId: track.persistentID),
                       title: track.title, artist: track.artist, durationMs: track.durationMs, trackRef: track.trackRef)
         }, startAt: index, librarySource: source)
+    }
+
+    public func playTracks(_ trackRefs: [String], startingAt trackRef: String, in source: MusicLibrarySource,
+                           shuffleEnabled: Bool?) async throws {
+        try Task.checkCancellation()
+        guard !trackRefs.isEmpty, Set(trackRefs).count == trackRefs.count,
+              trackRefs.contains(trackRef) else { throw MusicLibraryError.invalidRequest }
+        let available = try libraryTracks(in: source)
+        let lookup = Dictionary(uniqueKeysWithValues: available.map { ($0.trackRef, $0) })
+        let tracks = try trackRefs.map { ref in
+            guard let track = lookup[ref] else { throw MusicLibraryError.sourceUnavailable }
+            return track
+        }
+        mockPlaybackContext.withLock { $0 = tracks }
+        try await playTrack(trackRef, in: .playlist(id: MockMusicLibrary.playbackContextID))
+        if let shuffleEnabled { _ = try await setShuffleEnabled(shuffleEnabled) }
+    }
+
+    public func shuffleTracks(_ trackRefs: [String], in source: MusicLibrarySource) async throws {
+        try Task.checkCancellation()
+        guard !trackRefs.isEmpty, Set(trackRefs).count == trackRefs.count else { throw MusicLibraryError.invalidRequest }
+        let available = try libraryTracks(in: source)
+        if case .playlist = source, source != .playlist(id: MockMusicLibrary.playbackContextID),
+           available.count == trackRefs.count, Set(available.map(\.trackRef)) == Set(trackRefs) {
+            guard let first = available.randomElement() else { throw MusicLibraryError.invalidRequest }
+            try await playTrack(first.trackRef, in: source)
+            _ = try await setShuffleEnabled(true)
+        } else {
+            try await playTracks(trackRefs, startingAt: trackRefs.randomElement()!, in: source, shuffleEnabled: true)
+        }
+    }
+
+    private func libraryTracks(in source: MusicLibrarySource) throws -> [MusicLibraryTrack] {
+        if source == .playlist(id: MockMusicLibrary.playbackContextID) {
+            return mockPlaybackContext.withLock { $0 }
+        }
+        return try MockMusicLibrary.tracks(in: source)
     }
 
     public func playTrackRef(_ trackRef: String) async throws {

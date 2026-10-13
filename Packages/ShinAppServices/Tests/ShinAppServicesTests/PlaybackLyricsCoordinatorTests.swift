@@ -11,6 +11,10 @@ import ShinLyricsEngine
 // 偏移调整立即生效并持久化、时间同步路径零写库。
 // 全部夹具为原创虚构文本，不使用任何真实歌词。
 
+private final class DelayPersistErrorBox: @unchecked Sendable {
+    var value: Error?
+}
+
 @Suite("PlaybackLyricsCoordinator")
 struct PlaybackLyricsCoordinatorTests {
 
@@ -184,7 +188,7 @@ struct PlaybackLyricsCoordinatorTests {
     func thousandSnapshotsNotifyOnlyOnGroupChange() {
         let counter = WriterCounter()
         let (coordinator, collector) = Self.makeCollector(delayWriter: { track, delay in
-            counter.record(track, delay)
+            counter.record(track.binding.trackKey, delay)
         })
         let doc = Self.document(starts: [1_000, 2_000, 5_000])
 
@@ -328,7 +332,7 @@ struct PlaybackLyricsCoordinatorTests {
         ))
         coordinator.applyLyrics(
              trackKey: SongBinding.trackKey(for: Fixture.trackA), trackEpoch: 1, document: doc,
-            userDelayMs: try await env.store.binding(for: Fixture.trackA)?.userDelayMs ?? -1
+            userDelayMs: 0, binding: try await env.store.binding(for: Fixture.trackA)
         )
         #expect(collector.last?.content == .current(lineIds: [doc.lines[1].id]))
 
@@ -356,7 +360,7 @@ struct PlaybackLyricsCoordinatorTests {
     func setDelayWithoutTrackSkipsPersist() async {
         let counter = WriterCounter()
         let (coordinator, _) = Self.makeCollector(delayWriter: { track, delay in
-            counter.record(track, delay)
+            counter.record(track.binding.trackKey, delay)
         })
         await coordinator.setDelay(300).value
         #expect(counter.callCount == 0)
@@ -365,17 +369,20 @@ struct PlaybackLyricsCoordinatorTests {
 
     @Test("持久化失败经 onDelayPersistError 报告且不影响内存生效")
     func setDelayPersistErrorIsReported() async {
-        final class ErrorBox: @unchecked Sendable {
-            var value: Error?
-        }
-        let box = ErrorBox()
+        let box = DelayPersistErrorBox()
         let coordinator = PlaybackLyricsCoordinator(
             onDisplayChange: { _ in },
-            onDelayPersistError: { box.value = $0 },
+            onDelayPersistError: { error, _ in box.value = error },
             delayWriter: { _, _ in throw ShinAppleDataError.invalidBinding("注入失败") }
         )
-        // 先建立曲目身份（无身份时持久化被正确跳过，见专用测试）。
+        // 先建立可靠绑定；仅有曲目身份不会发出持久化命令。
         coordinator.update(snapshot: Self.snapshot(track: Fixture.trackA, epoch: 1, positionMs: 0))
+        let document = Self.document(starts: [1_000])
+        coordinator.applyLyrics(
+            trackKey: SongBinding.trackKey(for: Fixture.trackA), trackEpoch: 1,
+            document: document, userDelayMs: 0,
+            binding: SongBinding(track: Fixture.trackA, lyricDocumentId: document.id)
+        )
         await coordinator.setDelay(200).value
         #expect(box.value != nil)
         #expect(coordinator.currentDisplay().userDelayMs == 200)

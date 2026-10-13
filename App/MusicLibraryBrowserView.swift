@@ -157,14 +157,14 @@ struct MusicLibraryBrowserView: View {
                 if !browser.displayedTracks.isEmpty, !browser.isFolder {
                     HStack(spacing: 10) {
                         Button {
-                            browser.playFromStart(shuffleEnabled: false, preparePlayback: model.playbackOptions.preparePlayback)
+                            browser.playFromStart(shuffleEnabled: false, playbackStarted: model.playbackOptions.refreshAfterPlayback)
                         } label: {
                             Label("播放", systemImage: "play.fill")
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 4)
                         }
                         Button {
-                            browser.playFromStart(shuffleEnabled: true, preparePlayback: model.playbackOptions.preparePlayback)
+                            browser.playFromStart(shuffleEnabled: true, playbackStarted: model.playbackOptions.refreshAfterPlayback)
                         } label: {
                             Label("随机播放", systemImage: "shuffle")
                                 .padding(.horizontal, 14)
@@ -175,6 +175,16 @@ struct MusicLibraryBrowserView: View {
                     .tint(Color.appleMusicPink)
                     .disabled(browser.isPlayingRequest)
                     .padding(.top, 10)
+                    HStack(spacing: 6) {
+                        if browser.isPlayingRequest {
+                            ProgressView().controlSize(.mini).accessibilityHidden(true)
+                        }
+                        Text(browser.isPlayingRequest ? "正在准备播放…" : "播放当前列表中的歌曲。")
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    // 固定说明行高度，准备与完成状态切换时不挤动歌曲列表。
+                    .frame(height: 18, alignment: .leading)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

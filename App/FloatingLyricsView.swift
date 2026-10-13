@@ -7,16 +7,20 @@ struct FloatingLyricsView: View {
     let isLocked: Bool
     let onLock: () -> Void
     let onClose: () -> Void
+    var onPresentMainWindow: () -> Void = {}
     @AppStorage(LyricsPanelView.translationsSettingKey) private var showsTranslations = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.accessibilitySwitchControlEnabled) private var switchControlEnabled
     @State private var isHovered = false
+    @State private var toolbarFrame = CGRect.zero
+    @State private var showsSettings = false
     private static let toolbarHeight: CGFloat = 34
     private static let bottomInset: CGFloat = 16
     private static let lyricsAnchor = "floating-current-lyrics"
+    private static let coordinateSpace = "floating-lyrics-window"
 
-    private var showsToolbar: Bool { !isLocked && (isHovered || voiceOverEnabled || switchControlEnabled) }
+    private var showsToolbar: Bool { !isLocked && (isHovered || showsSettings || voiceOverEnabled || switchControlEnabled) }
 
     var body: some View {
         GeometryReader { geometry in
@@ -43,33 +47,34 @@ struct FloatingLyricsView: View {
                 .strokeBorder(.white.opacity(showsToolbar ? 0.20 : 0), lineWidth: 0.75)
                 .allowsHitTesting(false)
         }
-        .overlay(alignment: .top) {
-            FloatingLyricsDragRegion(isEnabled: !isLocked).frame(height: Self.toolbarHeight)
-                .overlay(alignment: .leading) {
-                    Capsule().fill(.white.opacity(0.35)).frame(width: 28, height: 3)
-                        .padding(.leading, 16).opacity(showsToolbar ? 1 : 0)
-                        .allowsHitTesting(false).accessibilityHidden(true)
-                }
+        .overlay {
+            FloatingLyricsDragRegion(isEnabled: !isLocked, excludedRect: showsToolbar ? toolbarFrame : .zero,
+                                     onHover: { isHovered = !isLocked && $0 })
+        }
+        .overlay(alignment: .topLeading) {
+            Capsule().fill(.white.opacity(0.35)).frame(width: 28, height: 3)
+                .padding(.leading, 16).padding(.top, 16).opacity(showsToolbar ? 1 : 0)
+                .allowsHitTesting(false).accessibilityHidden(true)
         }
         .overlay {
             FloatingLyricsResizeRegion(isEnabled: !isLocked)
         }
-        .overlay(alignment: .bottomTrailing) {
-            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.white.opacity(0.55))
-                .padding(8).opacity(showsToolbar ? 1 : 0)
-                .allowsHitTesting(false).accessibilityHidden(true)
-        }
         .overlay(alignment: .topTrailing) {
             toolbar.padding(.trailing, 8).padding(.top, 3)
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: FloatingLyricsToolbarFramePreference.self,
+                                               value: geometry.frame(in: .named(Self.coordinateSpace)))
+                    }
+                }
                 .opacity(showsToolbar ? 1 : 0)
                 .allowsHitTesting(showsToolbar)
                 .accessibilityHidden(!showsToolbar)
         }
+        .coordinateSpace(name: Self.coordinateSpace)
+        .onPreferenceChange(FloatingLyricsToolbarFramePreference.self) { toolbarFrame = $0 }
         .contentShape(Rectangle())
-        .onHover { isHovered = !isLocked && $0 }
-        .onChange(of: isLocked) { _, locked in if locked { isHovered = false } }
+        .onChange(of: isLocked) { _, locked in if locked { isHovered = false; showsSettings = false } }
         .animation(reduceMotion || isLocked ? nil : .easeOut(duration: 0.15), value: showsToolbar)
         .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .contain)
@@ -100,13 +105,32 @@ struct FloatingLyricsView: View {
             .foregroundStyle(showsTranslations ? Color.appleMusicPink : .white.opacity(0.82))
             .accessibilityLabel(showsTranslations ? "隐藏悬浮歌词译文" : "显示悬浮歌词译文")
             .help(showsTranslations ? "隐藏译文" : "显示译文")
+            Button { showsSettings.toggle() } label: {
+                Image(systemName: "gearshape").frame(width: 28, height: 28)
+            }
+            .buttonStyle(PlaybackButtonStyle(isSelected: showsSettings))
+            .foregroundStyle(.white.opacity(0.82))
+            .accessibilityLabel("悬浮歌词设置")
+            .help("悬浮歌词设置")
+            .popover(isPresented: $showsSettings, arrowEdge: .bottom) {
+                FloatingLyricsSettingsPopover(model: model, onFetch: {
+                    showsSettings = false
+                    FloatingLyricsActions.fetch(model, presentMainWindow: onPresentMainWindow)
+                }, onImport: {
+                    showsSettings = false
+                    FloatingLyricsActions.importLyrics(model, presentMainWindow: onPresentMainWindow)
+                }, onContinue: {
+                    showsSettings = false
+                    onPresentMainWindow()
+                })
+            }
             Button(action: onLock) {
                 Image(systemName: "lock").frame(width: 28, height: 28)
             }
             .buttonStyle(PlaybackButtonStyle())
             .foregroundStyle(.white.opacity(0.82))
             .accessibilityLabel("锁定悬浮歌词")
-            .help("锁定后鼠标穿透，可在底栏或应用菜单解锁")
+            .help("锁定后鼠标穿透；将鼠标停在歌词上，等待锁标志出现后点击解锁")
             Button(action: onClose) {
                 Image(systemName: "xmark").frame(width: 28, height: 28)
             }
@@ -119,6 +143,15 @@ struct FloatingLyricsView: View {
         .padding(.horizontal, 3)
         .padding(.vertical, 1)
         .background(.black.opacity(0.32), in: Capsule())
+    }
+}
+
+private struct FloatingLyricsToolbarFramePreference: PreferenceKey {
+    static let defaultValue = CGRect.zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let frame = nextValue()
+        // 设置弹窗等子树会传播默认空值，不能覆盖工具条实际测得的位置。
+        if !frame.isEmpty { value = frame }
     }
 }
 
@@ -141,19 +174,32 @@ private struct ObservedFloatingLyricsContent: View {
 private struct FloatingLyricsText: View {
     let presentation: FloatingLyricsPresentation
     let onContentChange: () -> Void
-    @ScaledMetric(relativeTo: .title2) private var originalSize: CGFloat = 26
-    @ScaledMetric(relativeTo: .body) private var translationSize: CGFloat = 17
+    @ScaledMetric(relativeTo: .title2) private var originalSize = CGFloat(FloatingLyricsSettings.defaultFontSize)
+    @ScaledMetric(relativeTo: .body) private var translationSize = CGFloat(FloatingLyricsSettings.defaultTranslationFontSize)
+    @AppStorage(FloatingLyricsSettings.fontSizePreferenceKey)
+    private var fontSize = FloatingLyricsSettings.defaultFontSize
+    @AppStorage(FloatingLyricsSettings.characterSpacingPreferenceKey)
+    private var characterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
+    private var normalizedFontSize: CGFloat { CGFloat(FloatingLyricsSettings.normalizedFontSize(fontSize)) }
+    private var fontScale: CGFloat { normalizedFontSize / CGFloat(FloatingLyricsSettings.defaultFontSize) }
+    private var normalizedCharacterSpacing: CGFloat { CGFloat(FloatingLyricsSettings.normalizedCharacterSpacing(characterSpacing)) }
+    // 延续原默认排版；字距只影响文字测量，不改变纵向层次。
+    private static let wrappedLineSpacing: CGFloat = 3
+    private static let translationSpacing: CGFloat = 4
+    private static let lyricGroupSpacing: CGFloat = 12
 
     var body: some View {
         Group {
             switch presentation {
             case let .current(lines):
-                VStack(spacing: 12) {
+                VStack(spacing: Self.lyricGroupSpacing) {
                     ForEach(lines) { line in
-                        VStack(spacing: 4) {
-                            Text(line.text).font(.system(size: originalSize, weight: .semibold))
+                        VStack(spacing: Self.translationSpacing) {
+                            Text(line.text).tracking(normalizedCharacterSpacing)
+                                .font(.system(size: originalSize * fontScale, weight: .semibold))
                             if let translation = line.translation {
-                                Text(translation).font(.system(size: translationSize, weight: .medium))
+                                Text(translation).tracking(normalizedCharacterSpacing)
+                                    .font(.system(size: translationSize * fontScale, weight: .medium))
                                     .foregroundStyle(.white.opacity(0.86))
                                 if line.translationNeedsReview {
                                     Text("译文待复核").font(.caption2).foregroundStyle(.orange)
@@ -170,13 +216,15 @@ private struct FloatingLyricsText: View {
         }
         .foregroundStyle(.white)
         .multilineTextAlignment(.center)
-        .lineSpacing(3)
+        .lineSpacing(Self.wrappedLineSpacing)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity)
         .shadow(color: .black.opacity(0.96), radius: 1)
         .shadow(color: .black.opacity(0.88), radius: 4, x: 0, y: 1)
         .onAppear(perform: onContentChange)
         .onChange(of: presentation) { _, _ in onContentChange() }
+        .onChange(of: normalizedCharacterSpacing) { _, _ in onContentChange() }
+        .onChange(of: normalizedFontSize) { _, _ in onContentChange() }
     }
 
     private func message(_ text: String) -> some View {
@@ -221,22 +269,5 @@ struct FloatingLyricsToggleButton: View {
 
     private func toggleFloatingLyrics() {
         if isPresentedAndLocked { controller.setLocked(false) } else { controller.toggle(model: model) }
-    }
-}
-
-/// 拖动只占顶部空白区域；隐藏的工具按钮不会拦截此处的原生窗口拖动。
-private struct FloatingLyricsDragRegion: NSViewRepresentable {
-    let isEnabled: Bool
-    func makeNSView(context: Context) -> DragView { DragView() }
-    func updateNSView(_ nsView: DragView, context: Context) { nsView.isEnabled = isEnabled }
-
-    final class DragView: NSView {
-        var isEnabled = true
-        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { isEnabled }
-        override func hitTest(_ point: NSPoint) -> NSView? { isEnabled ? super.hitTest(point) : nil }
-        override func mouseDown(with event: NSEvent) {
-            guard isEnabled else { return }
-            window?.performDrag(with: event)
-        }
     }
 }

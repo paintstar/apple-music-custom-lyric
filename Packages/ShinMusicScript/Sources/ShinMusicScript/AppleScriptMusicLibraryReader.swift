@@ -77,6 +77,7 @@ struct AppleScriptMusicLibraryReader: MusicLibraryScriptReading {
         }
         let count = columns[0].count
         guard columns.allSatisfy({ $0.count == count }) else { throw MusicLibraryError.contentsChanged }
+        let ownedNames = MusicPlaybackContext.ownedPlaylistNames()
         var playlists: [MusicLibraryPlaylist] = []
         for index in 0..<count {
             try cancellation.check()
@@ -86,8 +87,9 @@ struct AppleScriptMusicLibraryReader: MusicLibraryScriptReading {
             let script = try MusicLibraryScriptSources.playlistParent(id)
             let parent = try MusicLibraryScriptExecution.execute(script, cancellation: cancellation)
             let parentID = MusicLibraryDescriptorParser.text(parent)
+            let name = MusicLibraryDescriptorParser.text(columns[1][index]) ?? ""
             playlists.append(MusicLibraryPlaylist(
-                id: id, name: MusicLibraryDescriptorParser.text(columns[1][index]) ?? "",
+                id: id, name: ownedNames[id] == name ? MusicPlaybackContextScripts.playlistName : name,
                 isFolder: columns[2][index].enumCodeValue == 0x6B53_7046, // sdef eSpK.folder ('kSpF')
                 parentID: parentID.flatMap { SongBinding.isValidPersistentID($0) ? $0 : nil },
                 isSmart: MusicLibraryDescriptorParser.boolean(columns[3][index]) ?? false

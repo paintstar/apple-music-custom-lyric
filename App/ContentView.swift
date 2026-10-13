@@ -7,27 +7,38 @@ struct ContentView: View {
     private static let lyricsRailWidth: CGFloat = 260
     private static let floatingPlayerMargin: CGFloat = 16
     @EnvironmentObject private var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var windowController = PlayerWindowController()
     @State private var selection: SidebarPage = .music(.recent)
-    @State private var presentation = Presentation(
-        rawValue: UserDefaults.standard.string(forKey: "player.presentationMode") ?? ""
-    ) ?? .browser
-    @State private var compactReturn = Presentation(
-        rawValue: UserDefaults.standard.string(forKey: "player.compactReturnMode") ?? ""
-    ) ?? .browser
+    @State private var presentation: Presentation
+    @State private var compactReturn: Presentation
+    private let preferences: UserDefaults
     @AppStorage("player.hasSavedPresentation") private var hasSavedPresentation = false
     @State private var windowWidth: CGFloat = 1180
     @State private var floatingPlayerHeight: CGFloat = 0
     @AppStorage("player.showLibraryLyrics") private var showsLibraryLyrics = true
     var floatingLyricsWindow: FloatingLyricsWindowController?
 
+    init(preferences: UserDefaults = .standard, floatingLyricsWindow: FloatingLyricsWindowController? = nil) {
+        self.preferences = preferences
+        self.floatingLyricsWindow = floatingLyricsWindow
+        _presentation = State(initialValue: Presentation(rawValue: preferences.string(forKey: "player.presentationMode") ?? "") ?? .browser)
+        let savedReturn = Presentation(rawValue: preferences.string(forKey: "player.compactReturnMode") ?? "") ?? .browser
+        _compactReturn = State(initialValue: savedReturn == .compact ? .browser : savedReturn)
+    }
+
+    private var expandedPresentation: Presentation { presentation == .compact ? compactReturn : presentation }
+    private var hasPresentedSheet: Bool {
+        model.isImportPresented || model.isLyricsFetchPresented || model.isLyricsEditorPresented || model.isLibraryPresented
+    }
+
     var body: some View {
         GeometryReader { geometry in
-            let usesCompact = presentation == .compact || geometry.size.width < PlayerWindowController.compactBreakpoint
-            let hasSidebar = presentation == .browser && geometry.size.width >= 900
+            let usesCompact = geometry.size.width < PlayerWindowController.compactBreakpoint
+            let hasSidebar = expandedPresentation == .browser && geometry.size.width >= 900
             let availableWidth = geometry.size.width - (hasSidebar ? SidebarView.width : 0)
-            let hasLyrics = presentation == .browser && showsLibraryLyrics && availableWidth >= 740
+            let hasLyrics = expandedPresentation == .browser && showsLibraryLyrics && availableWidth >= 740
             HStack(spacing: 0) {
                 if hasSidebar {
                     SidebarView(selection: $selection, browser: model.musicLibraryBrowser,
@@ -37,7 +48,7 @@ struct ContentView: View {
                 }
                 if usesCompact {
                     CompactPlayerView(artworkStore: model.artworkStore, topControls: AnyView(compactWindowControls))
-                } else if presentation == .nowPlaying {
+                } else if expandedPresentation == .nowPlaying {
                     NowPlayingView(artworkStore: model.artworkStore)
                 } else {
                     browserArea(hasLyrics: hasLyrics, availableWidth: availableWidth)
@@ -45,15 +56,25 @@ struct ContentView: View {
             }
             .ignoresSafeArea(.container, edges: hasSidebar || usesCompact ? .top : [])
             .background(VisualEffectBackground(material: .contentBackground))
-            .background(PlayerWindowAccessor(controller: windowController))
+            .background(PlayerWindowAccessor(controller: windowController,
+                                             initiallyCompact: presentation == .compact,
+                                             needsExpandedWindow: hasPresentedSheet))
             .overlay(alignment: .top) {
-                if presentation != .browser && !usesCompact {
+                if expandedPresentation != .browser && !usesCompact {
                     windowControls
                         .padding(.leading, 76)
                         .offset(y: -geometry.safeAreaInsets.top)
                 }
             }
-            .onChange(of: geometry.size.width, initial: true) { _, width in windowWidth = width }
+            .onChange(of: geometry.size.width, initial: true) { previousWidth, width in
+                windowWidth = width
+                if windowController.hasRestoredInitialLayout, presentation == .compact,
+                   windowController.hasExpandedContent,
+                   previousWidth < PlayerWindowController.compactBreakpoint,
+                   width >= PlayerWindowController.compactBreakpoint {
+                    presentation = compactReturn
+                }
+            }
             .task {
                 guard !hasSavedPresentation else { return }
                 hasSavedPresentation = true
@@ -80,6 +101,12 @@ struct ContentView: View {
                 LyricsEditorView(model: editor) { model.requestCloseLyricsEditor() }
             }
         })
+        .onAppear {
+            configureMainWindowPresentation()
+            if hasPresentedSheet {
+                expandForSheet(true)
+            }
+        }
         .onChange(of: model.isImportPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLyricsFetchPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLibraryPresented) { _, shown in expandForSheet(shown) }
@@ -88,10 +115,10 @@ struct ContentView: View {
             if case let .music(destination) = page { model.musicLibraryBrowser.select(destination) }
         }
         .onChange(of: presentation) { _, mode in
-            UserDefaults.standard.set(mode.rawValue, forKey: "player.presentationMode")
+            preferences.set(mode.rawValue, forKey: "player.presentationMode")
         }
         .onChange(of: compactReturn) { _, mode in
-            UserDefaults.standard.set(mode.rawValue, forKey: "player.compactReturnMode")
+            preferences.set(mode.rawValue, forKey: "player.compactReturnMode")
         }
         .onReceive(NotificationCenter.default.publisher(for: .shinSelectLibraryPage)) { _ in openPage(.library) }
     }
@@ -211,10 +238,9 @@ struct ContentView: View {
                 if presentation == .compact {
                     presentation = compactReturn
                     windowController.showExpanded(reduceMotion: reduceMotion)
-                } else {
+                } else if windowController.showCompact(reduceMotion: reduceMotion) {
                     compactReturn = presentation
                     presentation = .compact
-                    windowController.showCompact(reduceMotion: reduceMotion)
                 }
             } label: {
                 Image(systemName: presentation == .compact ? "pip.exit" : "pip.enter")
@@ -233,14 +259,25 @@ struct ContentView: View {
     private func navigationMenu(compact: Bool = false) -> some View {
         MusicLibraryNavigationMenu(
             browser: model.musicLibraryBrowser,
+            panel: model.lyricsPanel,
             compact: compact,
             canImport: model.canBeginImport,
-            canEdit: model.canBeginLyricsEditing,
             onSelect: openPage,
             onNowPlaying: showNowPlaying,
             onImport: { expandBeforeAction { model.beginImport() } },
             onEdit: { expandBeforeAction { model.beginLyricsEditing() } }
         )
+    }
+
+    /// 浮窗只展示已知主窗；主窗关闭后由同一个 WindowGroup 重建并沿用已有 sheet。
+    private func configureMainWindowPresentation() {
+        let action = openWindow
+        let controller = windowController
+        floatingLyricsWindow?.presentMainWindow = { [weak controller] in
+            if controller?.presentAttachedWindow() != true {
+                action(id: PlayerWindowController.mainWindowGroupID)
+            }
+        }
     }
 
     private func openPage(_ page: SidebarPage) {
@@ -298,23 +335,42 @@ private struct FloatingPlayerHeightKey: PreferenceKey {
 
 /// 单独观察资料库模型，暂停播放时加载完成的歌单也会立即出现在窄窗口导航中。
 private struct MusicLibraryNavigationMenu: View {
+    @EnvironmentObject private var model: AppModel
     @ObservedObject var browser: MusicLibraryBrowserModel
+    var panel: LyricsPanelModel?
     var compact = false
     let canImport: Bool
-    let canEdit: Bool
     let onSelect: (SidebarPage) -> Void
     let onNowPlaying: () -> Void
     let onImport: () -> Void
     let onEdit: () -> Void
+    @AppStorage(LyricsPanelView.translationsSettingKey) private var showTranslations = true
+    @State private var unlinkRequest: LyricsUnlinkRequest?
 
     var body: some View {
-        PlaybackMenu(items: menuItems, iconSize: compact ? 14 : PlaybackControlSizing.iconSize,
-                     width: compact ? 28 : PlaybackControlSizing.optionSide,
-                     height: compact ? 30 : PlaybackControlSizing.optionSide,
-                     accessibilityLabel: "播放器菜单", help: "资料库、学习与设置")
+        Group {
+            if let panel {
+                SyncLyricsMenu(
+                    panel: panel, showTranslations: $showTranslations,
+                    onUnlink: requestUnlink, onEdit: onEdit,
+                    leadingItems: navigationItems, trailingItems: settingsItems, compact: compact,
+                    accessibilityLabel: "播放器菜单", help: "资料库、歌词选项、学习与设置"
+                )
+            } else {
+                PlaybackMenu(items: navigationItems + LyricsMenuActions.items(
+                    panel: nil, showTranslations: $showTranslations, onUnlink: requestUnlink, onEdit: onEdit
+                ) + settingsItems, iconSize: compact ? 14 : PlaybackControlSizing.iconSize,
+                             width: compact ? 28 : PlaybackControlSizing.optionSide,
+                             height: compact ? 30 : PlaybackControlSizing.optionSide,
+                             accessibilityLabel: "播放器菜单", help: "资料库、歌词选项、学习与设置")
+            }
+        }
+        .modifier(LyricsUnlinkConfirmation(request: $unlinkRequest))
     }
 
-    private var menuItems: [PlaybackMenu.Item] {
+    private func requestUnlink() { unlinkRequest = LyricsUnlinkRequest(model: model) }
+
+    private var navigationItems: [PlaybackMenu.Item] {
         var items = [PlaybackMenu.Item(title: "资料库")]
         for destination in [MusicLibraryDestination.search, .recent, .artists, .albums, .songs, .favorites] {
             items.append(.init(title: destination.title, symbol: destination.symbol,
@@ -331,10 +387,13 @@ private struct MusicLibraryNavigationMenu: View {
             .init(title: "学习"),
             .init(title: "学习歌曲与备份", symbol: "books.vertical", action: { onSelect(.library) }),
             .init(title: "导入本地歌词", symbol: "square.and.arrow.down", isEnabled: canImport, action: onImport),
-            .init(title: "编辑当前歌词", symbol: "square.and.pencil", isEnabled: canEdit, action: onEdit),
             .separator,
-            .init(title: "设置", symbol: "gearshape", action: { onSelect(.settings) })
+            .init(title: "当前歌词")
         ]
         return items
+    }
+
+    private var settingsItems: [PlaybackMenu.Item] {
+        [.separator, .init(title: "设置", symbol: "gearshape", action: { onSelect(.settings) })]
     }
 }

@@ -100,7 +100,7 @@ struct PlaybackSyncEndToEndTests {
         }
         coordinator.applyLyrics(
             trackKey: SongBinding.trackKey(for: track),
-            trackEpoch: epoch, document: document, userDelayMs: binding.userDelayMs
+            trackEpoch: epoch, document: document, userDelayMs: binding.userDelayMs, binding: binding
         )
     }
 

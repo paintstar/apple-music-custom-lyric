@@ -3,6 +3,38 @@ import GRDB
 import ShinAppleKit
 
 public extension GRDBLyricsStore {
+    /// 偏移命令只作用于装载时的现有绑定与文档版本；不创建或整行回写绑定。
+    /// delay 字段不参与关联校验，连续合法命令可按调用顺序保存；文档 revision
+    /// 与绑定的其余字段保持不变，人工编辑、换绑和解绑会拒绝过期命令。
+    func updateBindingDelay(
+        _ delayMs: Int64, expectedBinding: SongBinding, documentRevision: Int
+    ) async throws {
+        try Self.validateBindingShape(expectedBinding, referencedDocument: expectedBinding.lyricDocumentId)
+        try await performWrite { db in
+            let conflict = ShinAppleDataError.invalidBinding("歌曲或歌词关联已变化，偏移未保存。请刷新后重试。")
+            guard let current = try SongBindingRow.fetchOne(db, key: expectedBinding.trackKey)
+            else { throw conflict }
+            var currentBinding = try current.songBinding()
+            var expected = expectedBinding
+            currentBinding.userDelayMs = 0
+            expected.userDelayMs = 0
+            guard currentBinding == expected else { throw conflict }
+            guard let document = try LyricDocumentRow.fetchOne(db, key: expectedBinding.lyricDocumentId.uuidString)
+            else { throw ShinAppleDataError.documentNotFound(expectedBinding.lyricDocumentId) }
+            guard document.revision == documentRevision else {
+                throw ShinAppleDataError.revisionConflict(
+                    documentId: expectedBinding.lyricDocumentId,
+                    storedRevision: document.revision, submittedRevision: documentRevision
+                )
+            }
+            try db.execute(
+                sql: "UPDATE songBinding SET userDelayMs = ? WHERE trackKey = ? AND lyricDocumentId = ?",
+                arguments: [delayMs, expectedBinding.trackKey, expectedBinding.lyricDocumentId.uuidString]
+            )
+            guard db.changesCount == 1 else { throw conflict }
+        }
+    }
+
     /// 自动导入只接受事务内仍未绑定的曲目；既有人工或自动内容均不覆盖。
     func saveIfUnbound(
         document: LyricDocument, binding: SongBinding,

@@ -26,8 +26,9 @@ extension AppModel {
                     self.lyricsPanel?.apply(display: display)
                 }
             },
-            onDelayPersistError: { [weak self] error in
+            onDelayPersistError: { [weak self] error, target in
                 Task { @MainActor in
+                    guard target.isValid() else { return }
                     self?.playbackMessage = "偏移保存失败：\(ErrorText.describe(error))"
                 }
             },
@@ -40,8 +41,9 @@ extension AppModel {
         lyricsPanel = panel
         updateLyricsScrollSuspension()
         let flow = ImportFlowModel(store: store)
-        flow.onDidConfirm = { [weak self] in
-            self?.refreshLyricsPanel()
+        flow.onDidConfirm = { [weak self, weak flow] confirmation in
+            guard let self, let flow else { return }
+            self.finishLyricsImport(confirmation, from: flow)
         }
         importFlow = flow
         // 编辑器：保存成功后同样刷新面板，译文/待复核即时生效。
@@ -66,6 +68,30 @@ extension AppModel {
             self?.refreshLyricsPanel()
         }
         autoFetch = autoFetchModel
+    }
+
+    /// 保存成功后收起导入页，在目标仍为当前歌曲时立即回到当前歌词。
+    /// 切歌、切换歌词库或重新导入后，旧查询不得改变新面板的浏览状态。
+    func finishLyricsImport(_ confirmation: ImportConfirmation, from flow: ImportFlowModel) {
+        guard importFlow === flow else { return }
+        isImportPresented = false
+        flow.finish()
+        let flowGeneration = flow.operationGeneration
+        let trackKey = confirmation.binding.trackKey
+        guard currentTrackKey == trackKey, let panel = lyricsPanel else { return }
+        let epoch = snapshot.trackEpoch
+        Task { [weak self, weak panel, weak flow] in
+            guard let self, let panel, let flow, self.importFlow === flow,
+                  flow.operationGeneration == flowGeneration, self.lyricsPanel === panel,
+                  self.currentTrackKey == trackKey, self.snapshot.trackEpoch == epoch else { return }
+            await panel.refresh(trackKey: trackKey, trackEpoch: epoch)
+            guard self.importFlow === flow, flow.operationGeneration == flowGeneration,
+                  self.lyricsPanel === panel, self.currentTrackKey == trackKey,
+                  self.snapshot.trackEpoch == epoch, panel.displayedTrackEpoch == epoch,
+                  panel.currentDocumentId == confirmation.document.id else { return }
+            if let display = self.lyricsCoordinator?.currentDisplay() { panel.apply(display: display) }
+            panel.resumeFollowing()
+        }
     }
 
     private func resumeAutoFetchIfCurrent(_ previous: AutoFetchModel?) {

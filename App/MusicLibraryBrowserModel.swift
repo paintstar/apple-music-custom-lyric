@@ -52,6 +52,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
     @Published private(set) var filteredTracks: [MusicLibraryTrack] = []
     @Published private(set) var isLoading = false
     @Published private(set) var isPlayingRequest = false
+    /// 已确认的播放上下文变更；同一首歌换列表时也应重新读取当前列表。
+    @Published private(set) var confirmedPlaybackContextVersion = 0
     @Published private(set) var errorMessage: String?
     @Published private(set) var playbackError: String?
     @Published private(set) var favoriteWrites: Set<String> = []
@@ -193,17 +195,19 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     func play(_ track: MusicLibraryTrack) {
-        beginPlayback(track, prepare: nil)
+        beginPlayback(track, shuffleEnabled: nil, playbackStarted: nil)
     }
 
-    func playFromStart(shuffleEnabled: Bool, preparePlayback: @escaping @MainActor (Bool) async -> Bool) {
+    func playFromStart(shuffleEnabled: Bool, playbackStarted: (@MainActor () -> Void)? = nil) {
         let currentTracks = displayedTracks
-        guard !isFolder, let start = shuffleEnabled ? currentTracks.randomElement() : currentTracks.first else { return }
-        beginPlayback(start, prepare: { await preparePlayback(shuffleEnabled) })
+        guard !isFolder, let start = currentTracks.first else { return }
+        beginPlayback(start, shuffleEnabled: shuffleEnabled, playbackStarted: playbackStarted)
     }
 
-    private func beginPlayback(_ track: MusicLibraryTrack, prepare: (@MainActor () async -> Bool)?) {
+    private func beginPlayback(_ track: MusicLibraryTrack, shuffleEnabled: Bool?, playbackStarted: (@MainActor () -> Void)?) {
         guard let service else { return }
+        let trackRefs = displayedTracks.map(\.trackRef)
+        guard !isFolder, trackRefs.contains(track.trackRef) else { return }
         playSequence += 1
         let sequence = playSequence
         let source = destination.source
@@ -213,19 +217,19 @@ final class MusicLibraryBrowserModel: ObservableObject {
         playTask = Task { [weak self] in
             do {
                 try Task.checkCancellation()
-                if let prepare {
-                    let prepared = await prepare()
-                    try Task.checkCancellation()
-                    guard let self, sequence == self.playSequence else { return }
-                    guard prepared else {
-                        self.isPlayingRequest = false
-                        self.playbackError = "播放方式未能更新，请检查「音乐」App 后重试。"
-                        return
-                    }
+                try await service.prepareMusicInBackground()
+                try Task.checkCancellation()
+                if shuffleEnabled == true {
+                    try await service.shuffleTracks(trackRefs, in: source)
+                } else {
+                    try await service.playTracks(trackRefs, startingAt: track.trackRef, in: source,
+                                                 shuffleEnabled: shuffleEnabled)
                 }
-                try await service.playTrack(track.trackRef, in: source)
+                try Task.checkCancellation()
                 guard let self, sequence == self.playSequence else { return }
                 self.isPlayingRequest = false
+                self.confirmedPlaybackContextVersion += 1
+                playbackStarted?()
             } catch {
                 guard let self, sequence == self.playSequence else { return }
                 self.isPlayingRequest = false
@@ -377,6 +381,7 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     private static func message(for error: Error, playing: Bool = false) -> String {
+        if let error = error as? MusicPlaybackContextError { return error.localizedDescription }
         if let error = error as? MusicLibraryError { return error.localizedDescription }
         if let error = error as? PlaybackError {
             switch error {

@@ -45,12 +45,30 @@ public struct PlaybackLyricsDisplay: Equatable, Sendable {
     }
 }
 
-/// 用户延迟持久化写入器：把「某曲目（按命名空间化 trackKey）当前应生效的
-/// userDelayMs」写入仓库。生产实现走 `GRDBLyricsStore.updateBinding`
-/// （读改写，只改延迟字段）；测试可注入计数/门控实现。
+/// 用户发出偏移命令时的保存目标，以及错误提示所属的界面生命周期。
+public struct PlaybackLyricsDelayTarget: Sendable {
+    public let binding: SongBinding
+    public let documentRevision: Int
+    private let validity: @Sendable () -> Bool
+
+    fileprivate init(
+        binding: SongBinding, documentRevision: Int,
+        isValid: @escaping @Sendable () -> Bool
+    ) {
+        self.binding = binding
+        self.documentRevision = documentRevision
+        validity = isValid
+    }
+
+    /// 错误提示是否仍属于当前界面；切歌不会取消已经提交给原绑定的保存意图。
+    public func isValid() -> Bool { validity() }
+}
+
+/// 用户延迟持久化写入器。生产实现事务内检查命令目标，只修改现有绑定的
+/// delay 字段，不创建绑定；测试可注入计数/门控实现。
 /// 时间同步路径绝不调用本写入器。
 public typealias PlaybackLyricsDelayWriter = @Sendable (
-    _ trackKey: String, _ delayMs: Int64
+    _ target: PlaybackLyricsDelayTarget, _ delayMs: Int64
 ) async throws -> Void
 
 // MARK: - 协调器
@@ -87,6 +105,14 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
         /// 当前用户延迟（正数 = 延后）；曲目切换时清零，装载关联时按绑定恢复。
         var userDelayMs: Int64 = 0
         var load: Load?
+        /// 装载时的可靠绑定与文档版本；不随偏移调整变化。
+        var delayBinding: SongBinding?
+        var documentRevision: Int?
+        /// 本地偏移命令及最新保存完成时推进；关联查询用它识别旧偏移样本。
+        var delaySequence: UInt64 = 0
+        var delayPersistencePending = false
+        /// 换曲、换文档或关联变化后，原命令的错误提示不再属于当前界面。
+        var lyricsGeneration: UInt64 = 0
         var lastNotified = PlaybackLyricsDisplay.empty
         /// 延迟持久化任务链尾部；新写入等它完成后再执行，保证按调用序落盘。
         var persistTask: Task<Void, Never>?
@@ -99,18 +125,19 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
     }
 
     private let onDisplayChange: @Sendable (PlaybackLyricsDisplay) -> Void
-    private let onDelayPersistError: @Sendable (Error) -> Void
+    private let onDelayPersistError: @Sendable (Error, PlaybackLyricsDelayTarget) -> Void
     private let delayWriter: PlaybackLyricsDelayWriter
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     /// - Parameters:
     ///   - onDisplayChange: 显示状态变化回调（仅变化时调用；调用线程 = 触发线程，
     ///     宿主自行桥接主线程）。
-    ///   - onDelayPersistError: 延迟持久化失败回调（原始错误，宿主负责中文呈现）。
+    ///   - onDelayPersistError: 延迟持久化失败回调（原始错误与命令目标）；宿主异步
+    ///     呈现前须再次检查目标有效性，防止旧错误覆盖新歌曲状态。
     ///   - delayWriter: 延迟持久化写入器；生产用 `standardDelayWriter(store:)`。
     public init(
         onDisplayChange: @escaping @Sendable (PlaybackLyricsDisplay) -> Void,
-        onDelayPersistError: @escaping @Sendable (Error) -> Void = { _ in },
+        onDelayPersistError: @escaping @Sendable (Error, PlaybackLyricsDelayTarget) -> Void = { _, _ in },
         delayWriter: @escaping PlaybackLyricsDelayWriter = { _, _ in }
     ) {
         self.onDisplayChange = onDisplayChange
@@ -118,14 +145,14 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
         self.delayWriter = delayWriter
     }
 
-    /// 生产装配：延迟持久化写入 GRDB 歌词库（读现有绑定 → 只改 userDelayMs → 写回）。
-    /// 绑定已不存在（如刚解除关联后到达的迟到写入）时静默跳过：无处可写，不报错。
+    /// 生产装配：事务内重验命令捕获的绑定与文档版本，仅更新偏移。
+    /// 关联已变化或不存在时明确报告冲突，不覆盖新关联或恢复已解除的绑定。
     public static func standardDelayWriter(store: GRDBLyricsStore) -> PlaybackLyricsDelayWriter {
-        { trackKey, delayMs in
-            guard let binding = try await store.binding(forTrackKey: trackKey) else { return }
-            var updated = binding
-            updated.userDelayMs = delayMs
-            try await store.updateBinding(updated)
+        { target, delayMs in
+            try await store.updateBindingDelay(
+                delayMs, expectedBinding: target.binding,
+                documentRevision: target.documentRevision
+            )
         }
     }
 
@@ -141,6 +168,10 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
                 s.epoch = snapshot.trackEpoch
                 s.load = nil
                 s.userDelayMs = 0
+                s.delayBinding = nil
+                s.documentRevision = nil
+                s.delayPersistencePending = false
+                s.lyricsGeneration &+= 1
             }
             s.lastSnapshot = snapshot
             return Self.recompute(&s)
@@ -152,21 +183,43 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
     ///
     /// 过期结果（trackKey 或 epoch 与当前快照不一致）被丢弃，绝不覆盖新曲目。
     /// `document == nil` 或文档没有任何打轴行 → 无同步内容（idle）。
+    /// 宿主须提供与本文档和曲目匹配的 binding，才允许偏移持久化。
     public func applyLyrics(
         trackKey: String?,
         trackEpoch: Int,
         document: LyricDocument?,
-        userDelayMs: Int64
+        userDelayMs: Int64,
+        binding: SongBinding? = nil,
+        expectedDelaySequence: UInt64? = nil
     ) {
         let outcome: MutationOutcome = state.withLock { s in
             guard trackKey == s.trackKey, trackEpoch == s.epoch else { return .unchanged }
+            var delayBinding: SongBinding?
+            var documentRevision: Int?
             if let document, document.lines.contains(where: { $0.startMs != nil }) {
-                s.userDelayMs = userDelayMs
-                s.load = Load(index: LyricsTimelineIndex(document: document, userDelayMs: userDelayMs))
+                if var binding, binding.trackKey == trackKey, binding.lyricDocumentId == document.id {
+                    // 偏移命令互相采用最后写胜出，不能把自身前一次写入当作换绑。
+                    binding.userDelayMs = 0
+                    delayBinding = binding
+                    documentRevision = document.revision
+                }
+                let sameTarget = delayBinding != nil && s.delayBinding == delayBinding
+                    && s.documentRevision == documentRevision
+                let queryIsStale = expectedDelaySequence.map { $0 != s.delaySequence } ?? false
+                let effectiveDelay = sameTarget && (queryIsStale || s.delayPersistencePending)
+                    ? s.userDelayMs : userDelayMs
+                s.userDelayMs = effectiveDelay
+                s.load = Load(index: LyricsTimelineIndex(document: document, userDelayMs: effectiveDelay))
             } else {
                 s.userDelayMs = 0
                 s.load = nil
             }
+            if s.delayBinding != delayBinding || s.documentRevision != documentRevision {
+                s.lyricsGeneration &+= 1
+                s.delayPersistencePending = false
+            }
+            s.delayBinding = delayBinding
+            s.documentRevision = documentRevision
             return Self.recompute(&s)
         }
         notify(outcome)
@@ -189,17 +242,36 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
             if let load = s.load {
                 s.load = Load(index: load.index.withUserDelayMs(newDelayMs))
             }
-            let capturedTrackKey = s.trackKey
+            s.delaySequence &+= 1
+            let capturedDelaySequence = s.delaySequence
+            let capturedGeneration = s.lyricsGeneration
+            let target = s.delayBinding.flatMap { binding in
+                s.documentRevision.map { revision in
+                    PlaybackLyricsDelayTarget(
+                        binding: binding, documentRevision: revision,
+                        isValid: { [weak self] in
+                            self?.state.withLock { $0.lyricsGeneration == capturedGeneration } ?? false
+                        }
+                    )
+                }
+            }
             let writer = delayWriter
             let reportError = onDelayPersistError
             let previous = s.persistTask
-            let persist = Task<Void, Never> {
+            s.delayPersistencePending = target != nil
+            let persist = Task<Void, Never> { [weak self] in
                 await previous?.value
-                guard let trackKey = capturedTrackKey else { return }
+                guard let target else { return }
                 do {
-                    try await writer(trackKey, newDelayMs)
+                    try await writer(target, newDelayMs)
                 } catch {
-                    reportError(error)
+                    if target.isValid() { reportError(error, target) }
+                }
+                self?.state.withLock { current in
+                    guard current.lyricsGeneration == capturedGeneration,
+                          current.delaySequence == capturedDelaySequence else { return }
+                    current.delayPersistencePending = false
+                    current.delaySequence &+= 1
                 }
             }
             s.persistTask = persist
@@ -221,6 +293,17 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
     /// 当前显示状态（初始化/重建面板时拉取一次；此后以 onDisplayChange 推送为准）。
     public func currentDisplay() -> PlaybackLyricsDisplay {
         state.withLock { $0.lastNotified }
+    }
+
+    /// 关联查询启动前捕获，应用时传回；避免迟到的数据库偏移覆盖本地命令。
+    public func currentDelaySequence() -> UInt64 {
+        state.withLock { $0.delaySequence }
+    }
+
+    /// 重新装载关联前等待已经提交的保存链；只延后歌词查询，不阻塞播放快照。
+    public func waitForPendingDelayWrites() async {
+        let pending = state.withLock { $0.persistTask }
+        await pending?.value
     }
 
     /// 点击歌词行 → 应请求的播放位置：引擎按偏移公式反算 effectiveStartMs，

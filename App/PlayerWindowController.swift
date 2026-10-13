@@ -4,15 +4,28 @@ import SwiftUI
 /// 每个窗口保留自己的完整尺寸；尺寸都是布局参数，屏幕位置由当前显示器决定。
 @MainActor
 final class PlayerWindowController: NSObject, ObservableObject {
+    /// SwiftUI 唯一主窗口组的固定路由标识，入口与浮窗共用。
+    static let mainWindowGroupID = "main"
     static let minimumSize = NSSize(width: 300, height: 480)
     static let compactBreakpoint: CGFloat = 760
+    /// 项目默认紧凑窗口内容尺寸，冷启动和手动切换共用。
+    static let compactContentSize = NSSize(width: 320, height: 720)
     // 项目外观参数：让原生窗口按钮避开侧栏圆角内框，间距与尺寸仍由系统决定。
     private static let windowButtonInset = NSSize(width: 20, height: 12)
     private weak var window: NSWindow?
     private var expandedFrame: NSRect?
     private var buttonLayoutTask: Task<Void, Never>?
+    private var initialLayoutTask: Task<Void, Never>?
+    private var initiallyCompact = false
+    private var needsExpandedWindow = false
+    private(set) var hasRestoredInitialLayout = false
+    var hasExpandedContent: Bool {
+        (window?.contentLayoutRect.width ?? 0) >= Self.compactBreakpoint
+    }
 
-    func attach(_ window: NSWindow?) {
+    func attach(_ window: NSWindow?, initiallyCompact: Bool = false, needsExpandedWindow: Bool = false) {
+        self.initiallyCompact = initiallyCompact
+        self.needsExpandedWindow = needsExpandedWindow
         guard let window, self.window !== window else { return }
         for name in [NSWindow.didResizeNotification, NSWindow.didExitFullScreenNotification] {
             NotificationCenter.default.removeObserver(self, name: name, object: self.window)
@@ -26,12 +39,37 @@ final class PlayerWindowController: NSObject, ObservableObject {
             NotificationCenter.default.addObserver(self, selector: #selector(windowGeometryChanged),
                                                    name: name, object: window)
         }
+        hasRestoredInitialLayout = false
+        initialLayoutTask?.cancel()
+        initialLayoutTask = Task { @MainActor [weak self, weak window] in
+            await Task.yield()
+            guard let self, let window, self.window === window, !Task.isCancelled else { return }
+            // 在主窗完成附着后读取最新呈现意图，预览始终优先于紧凑恢复。
+            if self.needsExpandedWindow {
+                self.showExpanded(reduceMotion: true)
+            } else if self.initiallyCompact {
+                self.showCompact(reduceMotion: true)
+            }
+            self.hasRestoredInitialLayout = true
+            self.initialLayoutTask = nil
+            self.refreshWindowButtons()
+        }
         refreshWindowButtons()
     }
 
     deinit {
         buttonLayoutTask?.cancel()
+        initialLayoutTask?.cancel()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    /// 只恢复自己附着的主窗口，返回 false 时由 SwiftUI 重开已关闭的窗口组。
+    func presentAttachedWindow() -> Bool {
+        guard let window, window.isVisible || window.isMiniaturized else { return false }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate()
+        return true
     }
 
     @objc private func windowGeometryChanged(_ notification: Notification) {
@@ -74,25 +112,35 @@ final class PlayerWindowController: NSObject, ObservableObject {
         }
     }
 
-    func showCompact(reduceMotion: Bool) {
-        guard let window else { return }
+    @discardableResult
+    func showCompact(reduceMotion: Bool) -> Bool {
+        guard let window else { return false }
         // 全屏窗口由系统管理尺寸；退出全屏后用户即可切换。
-        guard !window.styleMask.contains(.fullScreen) else { return }
+        guard !window.styleMask.contains(.fullScreen) else { return false }
+        finishInitialRestoration()
         if window.frame.width >= Self.compactBreakpoint {
             expandedFrame = window.frame
         }
-        let content = NSRect(origin: .zero, size: NSSize(width: 320, height: 720))
+        let content = NSRect(origin: .zero, size: Self.compactContentSize)
         var frame = window.frameRect(forContentRect: content)
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
         window.setFrame(constrained(frame, for: window), display: true, animate: !reduceMotion)
+        return true
     }
 
     func showExpanded(reduceMotion: Bool) {
         guard let window, !window.styleMask.contains(.fullScreen) else { return }
+        finishInitialRestoration()
         let fallback = NSRect(x: window.frame.minX, y: window.frame.maxY - 780,
                               width: 1180, height: 780)
         window.setFrame(constrained(expandedFrame ?? fallback, for: window),
                         display: true, animate: !reduceMotion)
+    }
+
+    private func finishInitialRestoration() {
+        initialLayoutTask?.cancel()
+        initialLayoutTask = nil
+        hasRestoredInitialLayout = true
     }
 
     private func constrained(_ proposed: NSRect, for window: NSWindow) -> NSRect {
@@ -110,20 +158,28 @@ final class PlayerWindowController: NSObject, ObservableObject {
 
 struct PlayerWindowAccessor: NSViewRepresentable {
     let controller: PlayerWindowController
+    var initiallyCompact = false
+    var needsExpandedWindow = false
 
     func makeNSView(context: Context) -> WindowProbe {
-        WindowProbe(controller: controller)
+        WindowProbe(controller: controller, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
     }
 
     func updateNSView(_ nsView: WindowProbe, context: Context) {
-        controller.attach(nsView.window)
+        nsView.initiallyCompact = initiallyCompact
+        nsView.needsExpandedWindow = needsExpandedWindow
+        controller.attach(nsView.window, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
     }
 
     final class WindowProbe: NSView {
         let controller: PlayerWindowController
+        var initiallyCompact: Bool
+        var needsExpandedWindow: Bool
 
-        init(controller: PlayerWindowController) {
+        init(controller: PlayerWindowController, initiallyCompact: Bool, needsExpandedWindow: Bool) {
             self.controller = controller
+            self.initiallyCompact = initiallyCompact
+            self.needsExpandedWindow = needsExpandedWindow
             super.init(frame: .zero)
         }
 
@@ -131,7 +187,7 @@ struct PlayerWindowAccessor: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            controller.attach(window)
+            controller.attach(window, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
         }
 
         override func layout() {
