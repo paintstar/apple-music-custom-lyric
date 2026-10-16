@@ -9,15 +9,22 @@ struct SamplingContinuityTests {
     func discardedIdentityBatchKeepsSamplerAlive() async throws {
         let executor = FakeMusicScriptExecutor(outcomes: [
             Fixtures.snapshot(position: 10, pid: Fixtures.pidA),
-            .identityChangedDuringRead
-        ] + (0..<64).map { Fixtures.snapshot(position: Double(20 + $0), pid: Fixtures.pidB) })
+            .identityChangedDuringRead,
+            Fixtures.snapshot(position: 20, pid: Fixtures.pidB)
+        ], repeating: Fixtures.snapshot(position: 21, pid: Fixtures.pidB))
         // 缩短真实采样周期只为使回归有界；仍由 startsSampler 默认路径自行推进。
         let controller = MusicScriptPlaybackController(executor: executor, samplingIntervalMs: 20)
         defer { controller.dispose() }
-        for _ in 0..<50 {
-            if executor.recordedReadCount >= 4 { break }
-            try await Task.sleep(for: .milliseconds(10))
+        let published = MusicTestSignal()
+        let subscription = controller.subscribe { snapshot in
+            if snapshot.trackRef == Fixtures.refB, (snapshot.positionMs ?? 0) >= 21_000 { published.signal() }
         }
+        defer { subscription.cancel() }
+        // 采样可能先于订阅完成；订阅后同时检查已发布状态，不能错过满足条件的首个通知。
+        if controller.snapshot().trackRef == Fixtures.refB, (controller.snapshot().positionMs ?? 0) >= 21_000 {
+            published.signal()
+        }
+        try #require(await published.wait(timeout: .milliseconds(500)))
         #expect(executor.recordedReadCount >= 4)
         #expect(controller.snapshot().trackRef == Fixtures.refB)
         #expect((controller.snapshot().positionMs ?? 0) >= 21_000)

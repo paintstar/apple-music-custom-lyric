@@ -10,23 +10,25 @@ struct IndependentArtworkTests {
         let executor = FakeMusicScriptExecutor(outcomes: [Fixtures.snapshot()])
         let controller = MusicScriptPlaybackController(executor: executor, artworkProvider: provider, startsSampler: false)
         defer { controller.dispose(); provider.release.signal() }
-        let first = Task.detached { _ = controller.fetchCurrentTrackArtwork() }
-        #expect(await waitForSignal(provider.entered))
-        let nextDone = DispatchSemaphore(value: 0)
-        let next = Task.detached {
+        let first = Task { await musicTestBackground { _ = controller.fetchCurrentTrackArtwork() } }
+        try #require(await provider.entered.wait())
+        let nextDone = MusicTestSignal()
+        let next = Task {
             defer { nextDone.signal() }
             try await controller.next()
         }
         // 不释放图像夹具，切歌仍应发送并完成读回；不靠毫秒性能阈值判断。
-        #expect(await waitForSignal(nextDone))
+        try #require(await nextDone.wait())
         #expect(executor.recordedCommands == ["nextTrack"])
         let oldRequest = ArtworkCancellation()
-        let queued = DispatchSemaphore(value: 0)
-        let second = Task.detached {
-            queued.signal()
-            _ = controller.fetchCurrentTrackArtwork(shouldCancel: { oldRequest.isCancelled })
+        let queued = MusicTestSignal()
+        let second = Task {
+            await musicTestBackground {
+                queued.signal()
+                _ = controller.fetchCurrentTrackArtwork(shouldCancel: { oldRequest.isCancelled })
+            }
         }
-        #expect(await waitForSignal(queued))
+        try #require(await queued.wait())
         oldRequest.cancel()
         provider.release.signal()
         await first.value
@@ -36,13 +38,13 @@ struct IndependentArtworkTests {
     }
 
     @Test("dispose使排队封面及其迟到结果失效，独立提供器不再读取")
-    func disposalSkipsQueuedArtwork() async {
+    func disposalSkipsQueuedArtwork() async throws {
         let provider = BlockingArtworkProvider()
         let controller = MusicScriptPlaybackController(executor: FakeMusicScriptExecutor(),
                                                        artworkProvider: provider, startsSampler: false)
         defer { controller.dispose(); provider.release.signal() }
-        let first = Task.detached { _ = controller.fetchCurrentTrackArtwork() }
-        #expect(await waitForSignal(provider.entered))
+        let first = Task { await musicTestBackground { _ = controller.fetchCurrentTrackArtwork() } }
+        try #require(await provider.entered.wait())
         controller.dispose()
         #expect(controller.fetchCurrentTrackArtwork() == nil)
         provider.release.signal()
@@ -55,18 +57,10 @@ struct IndependentArtworkTests {
         let executor = ScriptingBridgeExecutor()
         #expect(executor.makeArtworkProvider() != nil)
     }
-
-    private func waitForSignal(_ semaphore: DispatchSemaphore) async -> Bool {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                continuation.resume(returning: semaphore.wait(timeout: .now() + 5) == .success)
-            }
-        }
-    }
 }
 
 private final class BlockingArtworkProvider: MusicArtworkProviding, @unchecked Sendable {
-    let entered = DispatchSemaphore(value: 0)
+    let entered = MusicTestSignal()
     let release = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var readCount = 0

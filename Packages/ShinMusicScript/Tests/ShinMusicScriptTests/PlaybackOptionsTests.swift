@@ -102,14 +102,17 @@ struct PlaybackOptionsTests {
     }
 
     @Test("排队操作取消后不会发送；已执行操作的迟到结果不返回")
+    @available(macOS 15.0, *)
     func cancelsQueuedRequest() async throws {
         let executor = OptionsTestExecutor(result: .init(volume: 25), blocksFirst: true)
         let service = MusicScriptPlaybackOptionsService(executor: executor)
+        defer { executor.release() }
         let first = Task { try await service.readOptions() }
-        for _ in 0..<200 where executor.commands.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(await executor.entered.wait(timeout: .seconds(1)))
         #expect(executor.commands.count == 1)
-        let second = Task { try await service.setVolume(80) }
-        try await Task.sleep(for: .milliseconds(20))
+        let taskExecutor = OptionsRequestTaskExecutor()
+        let second = Task.detached(executorPreference: taskExecutor) { try await service.setVolume(80) }
+        try #require(await taskExecutor.suspended.wait(timeout: .seconds(1)))
         second.cancel()
         first.cancel()
         executor.release()
@@ -122,8 +125,9 @@ struct PlaybackOptionsTests {
     func cancelsWhileExecutorWaits() async throws {
         let executor = OptionsTestExecutor(blocksBeforeSend: true)
         let service = MusicScriptPlaybackOptionsService(executor: executor)
+        defer { executor.release() }
         let request = Task { try await service.setVolume(80) }
-        for _ in 0..<200 where !executor.hasStarted { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(await executor.entered.wait(timeout: .seconds(1)))
         #expect(executor.hasStarted)
         request.cancel()
         executor.release()
@@ -153,6 +157,26 @@ struct PlaybackOptionsTests {
 
 private enum ScriptLifetimeFailure: Error { case compile, execute }
 
+/// 非隔离请求只在此执行器运行；没有就绪 job 才报告挂起，不把首次 enqueue 或泛化跳转当作已经排队。
+/// 测试闭包唯一的挂起点是选项服务的 continuation，首请求仍持有服务队列，次请求此时已入队。
+@available(macOS 15.0, *)
+private final class OptionsRequestTaskExecutor: TaskExecutor, @unchecked Sendable {
+    private let queue = DispatchQueue(label: "ShinMusicScript.tests.options-request")
+    private let lock = NSLock()
+    private var pending = 0
+    let suspended = MusicTestSignal()
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let job = UnownedJob(job)
+        lock.withLock { pending += 1 }
+        queue.async {
+            job.runSynchronously(on: self.asUnownedTaskExecutor())
+            let idle = self.lock.withLock { self.pending -= 1; return self.pending == 0 }
+            if idle { self.suspended.signal() }
+        }
+    }
+}
+
 private final class OptionsTestExecutor: PlaybackOptionsScriptExecuting, @unchecked Sendable {
     private let lock = NSLock()
     private let result: PlaybackOptionsSnapshot
@@ -160,6 +184,7 @@ private final class OptionsTestExecutor: PlaybackOptionsScriptExecuting, @unchec
     private let blocksFirst: Bool
     private let blocksBeforeSend: Bool
     private let gate = DispatchSemaphore(value: 0)
+    let entered = MusicTestSignal()
     private var recorded: [PlaybackOptionsCommand] = []
     private var started = false
     var commands: [PlaybackOptionsCommand] { lock.withLock { recorded } }
@@ -175,10 +200,10 @@ private final class OptionsTestExecutor: PlaybackOptionsScriptExecuting, @unchec
 
     func execute(_ command: PlaybackOptionsCommand, checkCancellation: () throws -> Void) throws -> PlaybackOptionsSnapshot {
         lock.withLock { started = true }
-        if blocksBeforeSend { _ = gate.wait(timeout: .now() + 3) }
+        if blocksBeforeSend { entered.signal(); gate.wait() }
         try checkCancellation()
         let isFirst = lock.withLock { recorded.append(command); return recorded.count == 1 }
-        if blocksFirst, isFirst { _ = gate.wait(timeout: .now() + 3) }
+        if blocksFirst, isFirst { entered.signal(); gate.wait() }
         if let failure { throw failure }
         return result
     }

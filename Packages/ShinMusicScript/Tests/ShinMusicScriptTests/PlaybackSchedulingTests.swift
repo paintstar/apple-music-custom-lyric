@@ -5,11 +5,11 @@ import Testing
 @Suite(.serialized)
 struct PlaybackSchedulingTests {
     @Test("后台脚本释放后，两个已入队播放命令先于后续后台读取，嵌套脚本不死锁")
-    func playbackReservationsHavePriority() {
+    func playbackReservationsHavePriority() async throws {
         let gate = MusicScriptExecutionGate()
-        let held = DispatchSemaphore(value: 0)
+        let held = MusicTestSignal()
         let release = DispatchSemaphore(value: 0)
-        let done = DispatchSemaphore(value: 0)
+        let done = MusicTestSignal()
         let events = SchedulingEvents()
         DispatchQueue.global().async {
             gate.withLock {
@@ -17,8 +17,8 @@ struct PlaybackSchedulingTests {
                 release.wait()
             }
         }
-        #expect(held.wait(timeout: .now() + 5) == .success)
         defer { release.signal() }
+        try #require(await held.wait())
         let queue = MusicPlaybackCommandQueue(gate: gate)
         for name in ["play A", "play B"] {
             queue.async(cancellation: MusicLibraryCancellation()) {
@@ -35,23 +35,23 @@ struct PlaybackSchedulingTests {
             done.signal()
         }
         release.signal()
-        for _ in 0..<3 { #expect(done.wait(timeout: .now() + 5) == .success) }
+        for _ in 0..<3 { try #require(await done.wait()) }
         #expect(events.values == ["play A", "play B", "background"])
     }
 
     @Test("等待OSA期间取消，旧命令不发送；重复取消和迟登记回调仍安全")
-    func cancellationBeforeGateSkipsCommand() {
+    func cancellationBeforeGateSkipsCommand() async throws {
         let gate = MusicScriptExecutionGate()
-        let held = DispatchSemaphore(value: 0)
+        let held = MusicTestSignal()
         let release = DispatchSemaphore(value: 0)
-        let started = DispatchSemaphore(value: 0)
-        let done = DispatchSemaphore(value: 0)
+        let started = MusicTestSignal()
+        let done = MusicTestSignal()
         let events = SchedulingEvents()
         DispatchQueue.global().async {
             gate.withLock { held.signal(); release.wait() }
         }
-        #expect(held.wait(timeout: .now() + 5) == .success)
         defer { release.signal() }
+        try #require(await held.wait())
         let queue = MusicPlaybackCommandQueue(gate: gate)
         let cancellation = MusicLibraryCancellation()
         queue.async(cancellation: cancellation) {
@@ -64,27 +64,27 @@ struct PlaybackSchedulingTests {
             } catch { Issue.record("应报告取消") }
             done.signal()
         }
-        #expect(started.wait(timeout: .now() + 5) == .success)
+        try #require(await started.wait())
         cancellation.cancel()
         cancellation.cancel()
         cancellation.onCancel { events.append("late callback") }
         release.signal()
-        #expect(done.wait(timeout: .now() + 5) == .success)
+        try #require(await done.wait())
         #expect(events.values == ["late callback", "cancelled"])
     }
 
     @Test("dispose及其后迟到的普通请求不保留优先权，专用退出清理仍可入队")
-    func disposalReleasesPendingAndLateReservations() {
+    func disposalReleasesPendingAndLateReservations() async throws {
         let gate = MusicScriptExecutionGate()
         let queue = MusicPlaybackCommandQueue(gate: gate)
-        let held = DispatchSemaphore(value: 0)
+        let held = MusicTestSignal()
         let release = DispatchSemaphore(value: 0)
-        let backgroundDone = DispatchSemaphore(value: 0)
-        let queueDone = DispatchSemaphore(value: 0)
+        let backgroundDone = MusicTestSignal()
+        let queueDone = MusicTestSignal()
         let events = SchedulingEvents()
         queue.async(cancellation: MusicLibraryCancellation()) { held.signal(); release.wait() }
-        #expect(held.wait(timeout: .now() + 5) == .success)
         defer { release.signal() }
+        try #require(await held.wait())
         queue.async(cancellation: MusicLibraryCancellation()) {
             do {
                 try gate.withCancellableLock { events.append("old sent") }
@@ -104,7 +104,7 @@ struct PlaybackSchedulingTests {
             backgroundDone.signal()
         }
         // 在首个队列任务仍挂起时，后台已能继续，证明没有迟到预留泄漏。
-        #expect(backgroundDone.wait(timeout: .now() + 5) == .success)
+        try #require(await backgroundDone.wait())
         release.signal()
         queue.async(cancellation: MusicLibraryCancellation(), allowsAfterDisposal: true) {
             do {
@@ -112,18 +112,18 @@ struct PlaybackSchedulingTests {
             } catch { Issue.record("退出清理的专用预留应有效") }
             queueDone.signal()
         }
-        #expect(queueDone.wait(timeout: .now() + 5) == .success)
+        try #require(await queueDone.wait())
         #expect(events.values == ["background", "old cancelled", "late cancelled", "cleanup"])
     }
 
     @Test("长上下文仅预留而没有脚本等待时允许采样，库读取继续让路")
-    func samplingContinuesBetweenPlaybackScripts() {
+    func samplingContinuesBetweenPlaybackScripts() async throws {
         let gate = MusicScriptExecutionGate()
         let reservation = gate.reservePlayback()
         defer { reservation.release() }
         let events = SchedulingEvents()
         gate.withLock(priority: .sampling) { events.append("sample") }
-        let backgroundDone = DispatchSemaphore(value: 0)
+        let backgroundDone = MusicTestSignal()
         DispatchQueue.global().async {
             gate.withLock { events.append("background") }
             backgroundDone.signal()
@@ -132,7 +132,7 @@ struct PlaybackSchedulingTests {
             gate.withLock { events.append("play") }
         }
         reservation.release()
-        #expect(backgroundDone.wait(timeout: .now() + 5) == .success)
+        try #require(await backgroundDone.wait())
         #expect(events.values == ["sample", "play", "background"])
     }
 }

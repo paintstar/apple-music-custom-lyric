@@ -49,6 +49,47 @@ enum MusicScriptTestExecution {
     }
 }
 
+/// 等待测试交错时挂起协作任务；超时只报告握手失败，不替夹具释放被测资源。
+final class MusicTestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = 0
+    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+
+    func signal() {
+        let waiter = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+            guard let id = waiters.keys.first else { pending += 1; return nil }
+            return waiters.removeValue(forKey: id)
+        }
+        waiter?.resume(returning: true)
+    }
+
+    func wait(timeout: Duration = .seconds(5)) async -> Bool {
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            let immediate = lock.withLock {
+                if pending > 0 { pending -= 1; return true }
+                waiters[id] = continuation
+                return false
+            }
+            if immediate {
+                continuation.resume(returning: true)
+            } else {
+                Task {
+                    try? await Task.sleep(for: timeout)
+                    self.lock.withLock { self.waiters.removeValue(forKey: id) }?.resume(returning: false)
+                }
+            }
+        }
+    }
+}
+
+/// 故意阻塞的同步夹具使用普通 GCD 工作线程，不能占用等待释放它的 Swift 协作线程。
+func musicTestBackground<Value: Sendable>(_ operation: @escaping @Sendable () -> Value) async -> Value {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async { continuation.resume(returning: operation()) }
+    }
+}
+
 // MARK: - 测试夹具（全部原创虚构：测试曲目甲/乙/丙，16 位十六进制假 persistent ID）
 
 enum Fixtures {
@@ -91,9 +132,11 @@ final class FakeMusicScriptExecutor: MusicScriptExecutor, @unchecked Sendable {
     private var seekValues: [Double] = []
     private var playedPersistentIDs: [String] = []
     private var readCount = 0
+    private let repeatedOutcome: MusicSnapshotOutcome?
 
-    init(outcomes: [MusicSnapshotOutcome] = []) {
+    init(outcomes: [MusicSnapshotOutcome] = [], repeating outcome: MusicSnapshotOutcome? = nil) {
         queue = outcomes
+        repeatedOutcome = outcome
     }
 
     // 编排
@@ -139,7 +182,7 @@ final class FakeMusicScriptExecutor: MusicScriptExecutor, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         readCount += 1
-        guard !queue.isEmpty else { return .failed(.unknown("测试队列已空")) }
+        guard !queue.isEmpty else { return repeatedOutcome ?? .failed(.unknown("测试队列已空")) }
         return queue.removeFirst()
     }
 
