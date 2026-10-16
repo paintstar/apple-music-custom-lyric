@@ -64,35 +64,10 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
         try runSource(source, name: "seek")
     }
 
+    /// 单曲 Apple Event 会丢失连续播放范围；由控制器的完整上下文入口负责点播。
     public func playPersistentID(_ persistentID: String) throws {
-        guard SongBinding.isValidPersistentID(persistentID) else {
-            throw MusicScriptFailure.trackNotFound
-        }
-        let source = """
-        if application "Music" is not running then return "\(Marker.notRunning)"
-        tell application "Music"
-            set matches to (tracks of library playlist 1 whose persistent ID is "\(persistentID)")
-            if (count of matches) is 0 then return "\(Marker.notFound)"
-            play (item 1 of matches)
-            return "\(Marker.ok)"
-        end tell
-        """
-        try MusicAppleScriptExecution.withLock {
-            guard let script = NSAppleScript(source: source) else {
-                throw MusicScriptFailure.unknown("点播脚本编译失败")
-            }
-            let result = try execute(script)
-            switch result?.stringValue {
-            case Marker.notRunning:
-                throw MusicScriptFailure.musicNotRunning
-            case Marker.notFound:
-                throw MusicScriptFailure.trackNotFound
-            case Marker.ok:
-                return
-            default:
-                throw MusicScriptFailure.unknown("点播脚本返回意外结果")
-            }
-        }
+        guard SongBinding.isValidPersistentID(persistentID) else { throw MusicScriptFailure.trackNotFound }
+        throw MusicScriptFailure.commandUnsupported("playPersistentID")
     }
 
     // MARK: - 快照列表解析（static 纯函数，供单元测试）
@@ -223,7 +198,7 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
     // MARK: - 执行
 
     private func runSource(_ source: String, name: String) throws {
-        try MusicAppleScriptExecution.withLock {
+        try MusicAppleScriptExecution.withCancellableLock {
             guard let script = NSAppleScript(source: source) else {
                 throw MusicScriptFailure.unknown("\(name) 脚本编译失败")
             }

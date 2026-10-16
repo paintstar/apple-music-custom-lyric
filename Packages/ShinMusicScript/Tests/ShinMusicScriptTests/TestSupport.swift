@@ -2,6 +2,53 @@ import Foundation
 import ShinAppleKit
 @testable import ShinMusicScript
 
+/// OSA 的同步门和解释器不能阻塞 Swift 协作线程；有限并发仍让生命周期测试竞争真实门。
+enum MusicScriptTestExecution {
+    // 真实 OSA 生命周期共用同一门实现；不与并行的纯 Fake 播放控制器争用生产全局实例。
+    private static let gate = MusicScriptExecutionGate()
+    private static let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "ShinMusicScript.tests.OSA"
+        queue.qualityOfService = .userInitiated
+        // 至少两个工作线程竞争 OSA 门，同时避免 32 个等待者占满系统 GCD 工作线程。
+        queue.maxConcurrentOperationCount = 4
+        return queue
+    }()
+    enum Failure: Error { case construction, compile(Int?), execute(Int?) }
+
+    static func run<Value: Sendable>(_ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.addOperation {
+                do {
+                    continuation.resume(returning: try gate.withLock(operation))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    static func compile(_ source: String) async throws {
+        try await run {
+            guard let script = NSAppleScript(source: source) else { throw Failure.construction }
+            var error: NSDictionary?
+            guard script.compileAndReturnError(&error), error == nil else {
+                throw Failure.compile((error?[NSAppleScript.errorNumber] as? NSNumber)?.intValue)
+            }
+        }
+    }
+
+    static func string(_ source: String) async throws -> String? {
+        try await run {
+            guard let script = NSAppleScript(source: source) else { throw Failure.construction }
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            guard error == nil else { throw Failure.execute((error?[NSAppleScript.errorNumber] as? NSNumber)?.intValue) }
+            return result.stringValue
+        }
+    }
+}
+
 // MARK: - 测试夹具（全部原创虚构：测试曲目甲/乙/丙，16 位十六进制假 persistent ID）
 
 enum Fixtures {

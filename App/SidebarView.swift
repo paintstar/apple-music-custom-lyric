@@ -28,7 +28,6 @@ struct SidebarView: View {
                     musicRow(.artists)
                     musicRow(.albums)
                     musicRow(.songs)
-                    musicRow(.favorites)
                     sectionTitle("播放列表")
                     if browser.playlists.isEmpty {
                         Text(browser.isLoading ? "正在读取播放列表……" : "暂无可读取的播放列表")

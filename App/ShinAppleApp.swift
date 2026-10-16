@@ -5,22 +5,26 @@ import SwiftUI
 /// 其余情况使用真实 Music 脚本适配器。
 @main
 struct ShinAppleApp: App {
+    @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var terminationDelegate
     @StateObject private var model: AppModel
     @StateObject private var floatingLyricsWindow = FloatingLyricsWindowController()
 
     init() {
         let isMock = ProcessInfo.processInfo.arguments.contains("--mock")
-        if isMock {
-            _model = StateObject(wrappedValue: AppModel.makeMock())
-        } else {
-            _model = StateObject(wrappedValue: AppModel.makeReal())
-        }
+        let appModel = isMock ? AppModel.makeMock() : AppModel.makeReal()
+        _model = StateObject(wrappedValue: appModel)
+        terminationDelegate.configure(
+            prepare: { appModel.prepareForTermination() },
+            shouldCleanup: { PlaybackCleanupSettings.shouldCleanup(isMock: appModel.isMock) },
+            cleanup: { try await appModel.controller.cleanupManagedPlaylistsOnQuit() }
+        )
     }
 
     var body: some Scene {
         WindowGroup(id: PlayerWindowController.mainWindowGroupID) {
             ContentView(floatingLyricsWindow: floatingLyricsWindow)
                 .environmentObject(model)
+                .disabled(model.isTerminating)
                 .frame(minWidth: PlayerWindowController.minimumSize.width,
                        minHeight: PlayerWindowController.minimumSize.height)
                 .task { await model.start() }

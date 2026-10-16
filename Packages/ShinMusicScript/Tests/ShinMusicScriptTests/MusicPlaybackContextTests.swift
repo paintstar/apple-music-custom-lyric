@@ -6,27 +6,30 @@ import ShinAppleKit
 struct MusicPlaybackContextTests {
     private var ids: [String] { (1...50).map { String(format: "%016X", $0) } }
 
-    @Test("筛选播放把指定首曲置首并按批建立全部成员，再设置随机；连续播放不堆积歌单")
+    @Test("筛选列表按所选起点旋转，新上下文确认后有界回收，退出清理剩余")
     func buildsAndReplacesContext() throws {
         let fixture = ContextFixture()
         let (defaults, domain) = isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: domain) }
         let context = MusicPlaybackContext(executor: fixture, defaults: defaults)
         try context.play(ids, startingAt: ids[4], in: .library, shuffleEnabled: true) {}
-        #expect(fixture.currentIDs == Array(ids[4...]) + Array(ids[..<4]))
+        #expect(fixture.currentIDs == Array(ids[4...]) + ids[..<4])
         #expect(fixture.playedID == ids[4] && fixture.shuffleEnabled == true)
-        #expect(fixture.appendCount == 3)
+        #expect(fixture.appendCount == 1)
         #expect(fixture.playlists.count == 1)
         try context.play(Array(ids.suffix(2)), startingAt: ids[49], in: .library, shuffleEnabled: false) {}
         #expect(fixture.currentIDs == [ids[49], ids[48]])
-        #expect(fixture.playlists.count == 1 && fixture.shuffleEnabled == false)
+        #expect(fixture.playlists.count == 2 && fixture.shuffleEnabled == false)
         // App 重启仍只清理经本机记录和所有权重新核对的旧专用歌单。
         let restarted = MusicPlaybackContext(executor: fixture, defaults: defaults)
         try restarted.play([ids[0]], startingAt: ids[0], in: .library, shuffleEnabled: true) {}
-        #expect(fixture.playlists.count == 1 && fixture.currentIDs == [ids[0]])
+        #expect(fixture.playlists.count == 2 && fixture.currentIDs == [ids[0]])
+        #expect(fixture.removedIDs.count == 1, "成功后最多回收一份更旧清单")
+        try restarted.cleanupOnQuit {}
+        #expect(fixture.playlists.isEmpty)
     }
 
-    @Test("取消批次不启动旧请求，清理精确确认的暂存歌单并保留原播放")
+    @Test("取消批次不启动旧请求，保留原播放及暂存所有权供退出清理")
     func cancellationBeforeStart() throws {
         let fixture = ContextFixture()
         let (defaults, domain) = isolatedDefaults()
@@ -40,7 +43,7 @@ struct MusicPlaybackContextTests {
                 if fixture.appendCount > previousAppends { throw CancellationError() }
             }
         }
-        #expect(fixture.currentPlaylistID == original && fixture.playlists.count == 1)
+        #expect(fixture.currentPlaylistID == original && fixture.playlists.count == 2)
         #expect(fixture.playedID == ids[0])
     }
 
@@ -91,17 +94,17 @@ struct MusicPlaybackContextTests {
         #expect(fixture.currentIDs == Array(ids.prefix(2)) && fixture.playlists.count == 1)
         fixture.failShuffle = false
         try context.play([ids[2]], startingAt: ids[2], in: .library, shuffleEnabled: true) {}
-        #expect(fixture.currentIDs == [ids[2]] && fixture.playlists.count == 1)
+        #expect(fixture.currentIDs == [ids[2]] && fixture.playlists.count == 2)
     }
 
-    @Test("play已发送但异步确认超时或取消时，失败重试不删待切换歌单；新上下文确认后才清理")
+    @Test("play已发送但异步确认超时或取消时保护待切换歌单，退出停止后清理")
     func preservesUnconfirmedRequestsAcrossRetries() throws {
-        let fixture = ContextFixture()
-        let (defaults, domain) = isolatedDefaults()
-        defer { defaults.removePersistentDomain(forName: domain) }
-        let context = MusicPlaybackContext(executor: fixture, defaults: defaults)
         let failures: [any Error] = [MusicPlaybackContextError(stage: .currentPlaylist, appleEventCode: -1712), CancellationError()]
         for failure in failures {
+            let fixture = ContextFixture()
+            let (defaults, domain) = isolatedDefaults()
+            defer { defaults.removePersistentDomain(forName: domain) }
+            let context = MusicPlaybackContext(executor: fixture, defaults: defaults)
             fixture.unconfirmedStartError = failure
             do {
                 try context.play([ids[0]], startingAt: ids[0], in: .library, shuffleEnabled: true) {}
@@ -116,8 +119,9 @@ struct MusicPlaybackContextTests {
             fixture.failCreate = false
             fixture.unconfirmedStartError = nil
             try context.play([ids[1]], startingAt: ids[1], in: .library, shuffleEnabled: true) {}
-            #expect(fixture.playlists.count == 1 && fixture.currentIDs == [ids[1]])
-            fixture.currentPlaylistID = nil
+            #expect(fixture.playlists.count == 2 && fixture.currentIDs == [ids[1]] && fixture.removedIDs.isEmpty)
+            try context.cleanupOnQuit {}
+            #expect(fixture.playlists.isEmpty)
         }
     }
 
@@ -171,7 +175,7 @@ struct MusicPlaybackContextTests {
     }
 
     @Test("新建/引用复制/歌单启动/异步确认/随机设置/所有权删除模板通过本机公开词典编译，不发送Music事件")
-    func templatesCompileAndRejectUserText() throws {
+    func templatesCompileAndRejectUserText() async throws {
         let ownership = MusicPlaybackContextOwnership(playlistID: Fixtures.pidB, token: UUID(), trackIDs: [Fixtures.pidA])
         let scripts = try [
             MusicPlaybackContextScripts.create(token: ownership.token),
@@ -180,6 +184,13 @@ struct MusicPlaybackContextTests {
             MusicPlaybackContextScripts.start(ownership, at: Fixtures.pidA, shuffleEnabled: true),
             MusicPlaybackContextScripts.start(ownership, at: Fixtures.pidA, shuffleEnabled: false),
             MusicPlaybackContextScripts.start(ownership, at: Fixtures.pidA, shuffleEnabled: nil),
+            MusicPlaybackContextScripts.start(ownership, at: Fixtures.pidA, shuffleEnabled: nil, reuse: true),
+            MusicPlaybackContextScripts.playSource(.library, expectedIDs: [Fixtures.pidA], at: Fixtures.pidA),
+            MusicPlaybackContextScripts.playSource(.playlist(id: Fixtures.pidB), expectedIDs: [Fixtures.pidA], at: Fixtures.pidA),
+            MusicPlaybackContextScripts.confirm(ownership, selectedID: Fixtures.pidA, shuffleEnabled: false, orderedMembers: true),
+            MusicPlaybackContextScripts.confirm(playlistID: Fixtures.pidB, expectedIDs: [Fixtures.pidA],
+                                                selectedID: Fixtures.pidA, shuffleEnabled: false, orderedMembers: true),
+            MusicPlaybackContextScripts.setSourceShuffle(Fixtures.pidB, expectedIDs: [Fixtures.pidA], enabled: false, orderedMembers: true),
             MusicPlaybackContextScripts.setShuffle(ownership, enabled: true),
             MusicPlaybackContextScripts.setShuffle(ownership, enabled: false),
             MusicPlaybackContextScripts.confirm(ownership, selectedID: Fixtures.pidA, shuffleEnabled: true),
@@ -190,15 +201,13 @@ struct MusicPlaybackContextTests {
             MusicPlaybackContextScripts.setSourceShuffle(Fixtures.pidB, expectedIDs: [Fixtures.pidA]),
             MusicPlaybackContextScripts.replayShuffle(Fixtures.pidB, expectedIDs: [Fixtures.pidA], ownership: nil),
             MusicPlaybackContextScripts.replayShuffle(Fixtures.pidB, expectedIDs: [Fixtures.pidA], ownership: ownership),
-            MusicPlaybackContextScripts.remove(ownership)
+            MusicPlaybackContextScripts.remove(ownership),
+            MusicPlaybackContextScripts.remove(ownership, allowStoppedCurrent: true),
+            MusicPlaybackContextScripts.stopForCleanup,
+            MusicPlaybackContextScripts.confirmStoppedForCleanup
         ]
         for source in scripts {
-            try MusicAppleScriptExecution.withLock {
-                let script = try #require(NSAppleScript(source: source))
-                var error: NSDictionary?
-                #expect(script.compileAndReturnError(&error))
-                #expect(error == nil)
-            }
+            try await MusicScriptTestExecution.compile(source)
         }
         #expect(throws: MusicLibraryError.invalidRequest) {
             try MusicPlaybackContextScripts.append(["\" & do shell script \"example"], to: ownership, from: .library)
@@ -218,7 +227,7 @@ struct MusicPlaybackContextTests {
     }
 
     @Test("实际所有权模板区分用户大小写改名及描述改动，纯AppleScript执行不发送Music事件")
-    func exactOwnershipTextComparison() throws {
+    func exactOwnershipTextComparison() async throws {
         let ownership = MusicPlaybackContextOwnership(playlistID: Fixtures.pidB, token: UUID(), trackIDs: [], usesUniqueName: true)
         let template = try MusicPlaybackContextScripts.remove(ownership)
         let start = try #require(template.range(of: "considering case"))
@@ -232,17 +241,13 @@ struct MusicPlaybackContextTests {
             (name, description, "kept"), (name.lowercased(), description, "released"),
             (name, description.lowercased(), "released"), (name + " ", description, "released")
         ] {
-            try MusicAppleScriptExecution.withLock {
-                let script = try #require(NSAppleScript(source: """
+            let result = try await MusicScriptTestExecution.string("""
                 set targetName to "\(testName)"
                 set targetDescription to "\(testDescription)"
                 \(comparison)
                 return "kept"
-                """))
-                var error: NSDictionary?
-                let result = script.executeAndReturnError(&error)
-                #expect(error == nil && result.stringValue == expected)
-            }
+                """)
+            #expect(result == expected)
         }
     }
 
@@ -253,23 +258,36 @@ struct MusicPlaybackContextTests {
 }
 
 /// 内存中的原创曲目引用；测试从不启动或控制用户 Music。
-private final class ContextFixture: MusicPlaybackContextExecuting, @unchecked Sendable {
+final class ContextFixture: MusicPlaybackContextExecuting, @unchecked Sendable {
     struct Playlist {
-        let token: UUID
+        var token: UUID
         var name: String
         var ids: [String]
+        var isSmart = false
+        var isFolder = false
     }
     var playlists: [String: Playlist] = [:]
     var currentPlaylistID: String?
     var playedID: String?
     var shuffleEnabled: Bool?
     var appendCount = 0
+    var appendLimit = Int.max
     var failPartialAppend = false
     var failShuffle = false
     var failCreate = false
     var unconfirmedStartError: (any Error)?
     var nativeSources: [MusicLibrarySource: [String]] = [:]
-    private var creationCount = 0
+    var startCount = 0
+    var stopCount = 0
+    var removedIDs: [String] = []
+    var musicRunning = true
+    var isPlaying = false
+    var stopConfirmed = true
+    var stopError: (any Error)?
+    var removalError: (any Error)?
+    var onRemove: ((String) throws -> Void)?
+    private(set) var creationCount = 0
+    var operations: [String] = []
     var currentIDs: [String] {
         guard let currentPlaylistID else { return [] }
         return playlists[currentPlaylistID]?.ids
@@ -280,6 +298,7 @@ private final class ContextFixture: MusicPlaybackContextExecuting, @unchecked Se
     func create(token: UUID, checkCancellation: () throws -> Void) throws -> String {
         try checkCancellation()
         if failCreate { throw MusicPlaybackContextError(stage: .create, appleEventCode: -1728) }
+        operations.append("create")
         creationCount += 1
         let id = String(format: "%016X", 1_000 + creationCount)
         playlists[id] = Playlist(token: token, name: MusicPlaybackContextScripts.playlistName(for: token), ids: [])
@@ -289,12 +308,13 @@ private final class ContextFixture: MusicPlaybackContextExecuting, @unchecked Se
     func append(_ ids: [String], to ownership: MusicPlaybackContextOwnership, from source: MusicLibrarySource,
                 checkCancellation: () throws -> Void) throws -> [String] {
         try checkCancellation()
+        operations.append("append")
         appendCount += 1
         if failPartialAppend {
             playlists[ownership.playlistID]?.ids.append(ids[0])
             throw MusicLibraryError.contentsChanged
         }
-        playlists[ownership.playlistID]?.ids += ids
+        playlists[ownership.playlistID]?.ids += ids.prefix(appendLimit)
         return playlists[ownership.playlistID]?.ids ?? []
     }
 
@@ -302,11 +322,41 @@ private final class ContextFixture: MusicPlaybackContextExecuting, @unchecked Se
                checkCancellation: () throws -> Void) throws {
         try checkCancellation()
         guard playlists[ownership.playlistID]?.ids == ownership.trackIDs else { throw MusicLibraryError.contentsChanged }
+        operations.append("start")
+        startCount += 1
         if let unconfirmedStartError { throw unconfirmedStartError }
         currentPlaylistID = ownership.playlistID
         playedID = persistentID
+        isPlaying = true
         if failShuffle { throw MusicLibraryError.playbackModeUnconfirmed }
         self.shuffleEnabled = shuffleEnabled
+    }
+
+    func reuse(_ ownership: MusicPlaybackContextOwnership, at persistentID: String, shuffleEnabled: Bool?,
+               checkCancellation: () throws -> Void) throws -> Bool {
+        try checkCancellation()
+        operations.append("reuse")
+        guard let playlist = playlists[ownership.playlistID], playlist.token == ownership.token,
+              playlist.name == MusicPlaybackContextScripts.expectedName(for: ownership),
+              !playlist.isSmart, !playlist.isFolder, playlist.ids == ownership.trackIDs else { return false }
+        try start(ownership, at: persistentID, shuffleEnabled: shuffleEnabled, checkCancellation: checkCancellation)
+        return true
+    }
+
+    func playSource(_ ids: [String], at persistentID: String, in source: MusicLibrarySource, shuffleEnabled: Bool?,
+                    checkCancellation: () throws -> Void) throws -> Bool {
+        try checkCancellation()
+        operations.append("play-source")
+        guard nativeSources[source] == ids, ids.first == persistentID else { return false }
+        if let unconfirmedStartError { throw unconfirmedStartError }
+        switch source {
+        case .library: currentPlaylistID = Fixtures.pidA
+        case let .playlist(id): currentPlaylistID = id
+        }
+        playedID = persistentID
+        isPlaying = true
+        self.shuffleEnabled = shuffleEnabled
+        return true
     }
 
     func shuffleSource(_ ids: [String], in source: MusicLibrarySource, checkCancellation: () throws -> Void) throws -> Bool {
@@ -332,12 +382,34 @@ private final class ContextFixture: MusicPlaybackContextExecuting, @unchecked Se
     }
 
     func remove(_ ownership: MusicPlaybackContextOwnership) throws -> Bool {
+        try remove(ownership, allowStoppedCurrent: false) {}
+    }
+
+    func stopForCleanup(checkCancellation: () throws -> Void) throws -> Bool {
+        try checkCancellation()
+        guard musicRunning else { throw MusicPlaybackContextError(stage: .cleanup, appleEventCode: -600) }
+        operations.append("stop")
+        stopCount += 1
+        if let stopError { throw stopError }
+        if stopConfirmed { isPlaying = false }
+        return stopConfirmed
+    }
+
+    func remove(_ ownership: MusicPlaybackContextOwnership, allowStoppedCurrent: Bool,
+                checkCancellation: () throws -> Void) throws -> Bool {
+        try checkCancellation()
+        operations.append("remove")
+        try onRemove?(ownership.playlistID)
+        if allowStoppedCurrent && isPlaying { return false }
         guard let playlist = playlists[ownership.playlistID] else { return true }
         guard playlist.token == ownership.token else { return true }
         guard playlist.name == MusicPlaybackContextScripts.expectedName(for: ownership) else { return true }
-        if currentPlaylistID == ownership.playlistID { return false }
+        guard !playlist.isSmart && !playlist.isFolder else { return true }
+        if currentPlaylistID == ownership.playlistID && !allowStoppedCurrent { return false }
         guard playlist.ids == ownership.trackIDs else { return true }
+        if let removalError { throw removalError }
         playlists.removeValue(forKey: ownership.playlistID)
+        removedIDs.append(ownership.playlistID)
         return true
     }
 

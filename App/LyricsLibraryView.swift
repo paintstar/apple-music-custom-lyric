@@ -27,6 +27,7 @@ struct LyricsLibraryView: View {
     @State private var isLRCFileExporterPresented = false
     /// 待确认的重新关联目标（行按钮设置，确认对话框消费）。
     @State private var reassociateTarget: LyricsLibraryOverviewItem?
+    @State private var deletionTarget: LyricsLibraryModel.DeletionPreview?
 
     var body: some View {
         mainColumn
@@ -61,16 +62,21 @@ struct LyricsLibraryView: View {
             .confirmationDialog(
                 "删除这份歌词？",
                 isPresented: Binding(
-                    get: { library.deletionPreview != nil },
-                    set: { if !$0 { library.cancelDeletion() } }
+                    get: { deletionTarget != nil },
+                    set: { presented in
+                        if !presented {
+                            if let target = deletionTarget { library.cancelDeletion(target) }
+                            deletionTarget = nil
+                        }
+                    }
                 ),
                 titleVisibility: .visible,
-                presenting: library.deletionPreview
+                presenting: deletionTarget
             ) { preview in
                 Button("删除歌词并解除 \(preview.bindings.count) 个歌曲关联", role: .destructive) {
-                    Task { await library.confirmDeletion() }
+                    library.beginDeletion(preview)
                 }
-                Button("取消", role: .cancel) { library.cancelDeletion() }
+                Button("取消", role: .cancel) { library.cancelDeletion(preview) }
             } message: { preview in
                 Text(Self.deletionMessage(preview))
             }
@@ -87,7 +93,7 @@ struct LyricsLibraryView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            documentList
+            documentList.disabled(library.isDeletingResources)
             backupSection
         }
         .padding(20)
@@ -192,7 +198,7 @@ struct LyricsLibraryView: View {
                         },
                         onExportLRC: { Task { await library.beginLRCExport(item) } },
                         onReassociate: { reassociateTarget = item },
-                        onDelete: { Task { await library.requestDeletion(item) } }
+                        onDelete: { Task { deletionTarget = await library.requestDeletion(item) } }
                     )
                 }
             }
@@ -258,7 +264,7 @@ struct LyricsLibraryView: View {
             binding.titleHint ?? binding.trackKey
         }
         let listing = names.isEmpty ? "（当前没有歌曲关联这份歌词）" : names.joined(separator: "、")
-        return "将删除「\(preview.displayName)」并解除以下歌曲的关联：\(listing)。删除不可撤销；完整备份可用来恢复。"
+        return "将删除「\(preview.displayName)」的歌词及全部译文（含人工译文），并解除以下歌曲的关联：\(listing)。删除不可撤销；完整备份可用来恢复。"
     }
 
     static func backupFilename() -> String {

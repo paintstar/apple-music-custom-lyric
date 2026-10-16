@@ -16,6 +16,7 @@ public enum MockMusicLibrary {
     ]
 
     public static let playlists: [MusicLibraryPlaylist] = [
+        MusicLibraryPlaylist(id: "B000000000000005", name: "喜爱歌曲", isSmart: true),
         MusicLibraryPlaylist(id: "B000000000000001", name: "学习歌单", isFolder: true),
         MusicLibraryPlaylist(id: "B000000000000002", name: "每日轻听", parentID: "B000000000000001"),
         MusicLibraryPlaylist(id: "B000000000000003", name: "夜晚练习"),
@@ -110,6 +111,10 @@ extension MockPlaybackController: MusicLibraryBrowsing {
     }
 
     private func libraryTracks(in source: MusicLibrarySource) throws -> [MusicLibraryTrack] {
+        if source == .playlist(id: "B000000000000005") {
+            let overrides = mockLibraryFavorites.withLock { $0 }
+            return MockMusicLibrary.tracks.filter { (overrides[$0.trackRef] ?? $0.isFavorite) == true }
+        }
         if source == .playlist(id: MockMusicLibrary.playbackContextID) {
             return mockPlaybackContext.withLock { $0 }
         }
@@ -125,8 +130,12 @@ extension MockPlaybackController: MusicLibraryBrowsing {
     }
 
     public func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool {
+        try await setFavorite(trackRef, value: value, in: .library)
+    }
+
+    public func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool {
         try Task.checkCancellation()
-        guard MockMusicLibrary.tracks.contains(where: { $0.trackRef == trackRef }) else {
+        guard try libraryTracks(in: source).contains(where: { $0.trackRef == trackRef }) else {
             throw MusicLibraryError.sourceUnavailable
         }
         mockLibraryFavorites.withLock { $0[trackRef] = value }

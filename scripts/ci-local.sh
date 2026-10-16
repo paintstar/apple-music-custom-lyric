@@ -19,6 +19,7 @@ for package in "${PACKAGES[@]}"; do
   xcrun swift test --package-path "$ROOT/Packages/$package"
 done
 
+"$ROOT/scripts/music-playback-script-check.sh" --skip-build
 "$ROOT/scripts/app-typecheck.sh"
 swiftlint lint --strict --quiet
 "$ROOT/scripts/check-secrets.sh"

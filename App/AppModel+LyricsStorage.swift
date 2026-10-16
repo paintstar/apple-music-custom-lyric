@@ -14,7 +14,10 @@ extension AppModel {
     /// 由一个 store 重建歌词服务全家（面板/协调器/导入/编辑/库管理）。
     /// 首次初始化与保存位置切换共用；调用方负责先持有 store 与目录。
     func installLyricsServiceGraph(store: GRDBLyricsStore, note: String) {
+        lyricsStoreChangesTask?.cancel()
+        lyricsStoreChangesTask = nil
         autoFetch?.invalidateCurrentRun()
+        library?.deactivateResources()
         lyricsDatabaseNote = note
         let panel = LyricsPanelModel(store: store)
         // 同步协调器：显示变化桥接主线程推给面板；
@@ -57,6 +60,19 @@ extension AppModel {
         libraryModel.onLibraryChanged = { [weak self] in
             self?.refreshLyricsPanel()
         }
+        libraryModel.canDeleteResources = { [weak self, weak libraryModel] in
+            guard let self, let libraryModel else { return false }
+            return self.library === libraryModel && !self.isSwitchingStorage
+        }
+        libraryModel.onWillDeleteResources = { [weak self, weak libraryModel] trackKeys in
+            guard let self, let libraryModel, self.library === libraryModel,
+                  let autoFetch = self.autoFetch else { return nil }
+            let shouldResume = try await autoFetch.suspendForResourceDeletion(trackKeys: trackKeys)
+            return { [weak self, weak autoFetch] in
+                guard let self, let autoFetch, self.autoFetch === autoFetch, shouldResume else { return }
+                autoFetch.resume()
+            }
+        }
         library = libraryModel
         // 歌单自动获取：落位/清理后刷新面板；启动就绪后自动跑一轮。
         let autoFetchModel = AutoFetchModel(
@@ -68,6 +84,20 @@ extension AppModel {
             self?.refreshLyricsPanel()
         }
         autoFetch = autoFetchModel
+        observeLyricsStoreChanges(store, panel: panel)
+    }
+
+    /// 同一首歌暂停播放时，导入、后台获取或其他实例的写入也须使空态收敛。
+    /// 文件事件由数据层合并；播放位置采样不参与数据库查询。
+    private func observeLyricsStoreChanges(_ store: GRDBLyricsStore, panel: LyricsPanelModel) {
+        let changes = store.changes()
+        lyricsStoreChangesTask = Task { [weak self, weak panel] in
+            for await _ in changes {
+                guard let self, let panel, !Task.isCancelled, !self.isTerminating,
+                      self.lyricsPanel === panel else { return }
+                self.refreshLyricsPanel()
+            }
+        }
     }
 
     /// 保存成功后收起导入页，在目标仍为当前歌曲时立即回到当前歌词。
@@ -98,13 +128,24 @@ extension AppModel {
         if autoFetch === previous { previous?.resume() }
     }
 
+    private func prepareLyricsStorageSwitch() -> Bool {
+        guard !isSwitchingStorage else { return false }
+        guard library?.isDeletingResources != true else {
+            storageSwitchMessage = "正在删除本地资源，请完成后再切换保存位置。"
+            return false
+        }
+        library?.cancelResourceDeletion()
+        library?.cancelDeletion()
+        return true
+    }
+
     /// 切换歌词库保存位置。directory = nil 表示恢复默认目录。
     /// 安全序列：校验目标目录 → 目标为空且源库有数据时在线备份（一致性快照）
     /// → 打开新库 → 关闭进行中的导入/编辑窗口并重建服务全家 → 持久化偏好。
     /// 任何一步失败：旧库、旧模型与偏好全部保持原状，仅更新结果说明。
     /// 旧位置的数据库文件始终不修改、不删除（留作安全副本，由用户手动清理）。
     func switchLyricsStorage(to directory: URL?) async {
-        guard !isSwitchingStorage else { return }
+        guard prepareLyricsStorageSwitch() else { return }
         guard !isMock else {
             storageSwitchMessage = "模拟模式使用一次性临时目录，不支持更改保存位置。"
             return

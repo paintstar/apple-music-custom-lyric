@@ -23,7 +23,7 @@ public struct MusicArtworkResult {
 /// 无封面能力的适配器走 App 层「封面主色渐变占位」，不阻塞核心功能。
 ///
 /// 线程模型与 MusicScriptExecutor 相同：调用方必须串行化访问
-/// （生产由 MusicScriptPlaybackController 的执行锁约束）。
+/// （生产的当前封面使用独立 SB 实例和封面锁，不占播放执行锁）。
 public protocol MusicArtworkProviding: AnyObject, Sendable {
     /// 读取当前曲目封面。Music 未运行 / 无曲目 / 无封面 / 读取失败 / 读取
     /// 期间身份变化一律返回 nil（未知与缺失不冒充占位图之外的东西）。

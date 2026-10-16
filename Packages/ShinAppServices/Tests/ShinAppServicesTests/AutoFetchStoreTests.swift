@@ -198,6 +198,50 @@ struct AutoFetchStoreTests {
         #expect(!pending.contains { $0.trackKey == "k-bulk-5" })
     }
 
+    @Test("显式资源删除仅清目标歌曲获取和待确认，保留其他工作与成员基准")
+    func discardOnlyTargetFetchWork() async throws {
+        let (store, dir) = try TestEnv.makeTempStore()
+        defer { TestEnv.cleanup(dir) }
+        let repo = AutoFetchStore(store: store)
+        let snapshot = PlaylistMembershipSnapshot(playlistID: "pl-1", playlistName: nil, memberTrackKeys: ["k-a", "k-b"])
+        let fetchA = AutoFetchWorkItem(kind: .fetch, trackKey: "k-a", playlistIDs: ["pl-1"])
+        let fetchB = AutoFetchWorkItem(kind: .fetch, trackKey: "k-b", playlistIDs: ["pl-1"])
+        let removeA = AutoFetchWorkItem(kind: .remove, trackKey: "k-a", playlistIDs: ["pl-1"])
+        try await repo.recordObservations([snapshot], work: [fetchA, fetchB, removeA],
+                                          activePlaylistIDs: ["pl-1"], isValid: { true })
+        for key in ["k-a", "k-b"] {
+            try await repo.enqueuePending(PendingAutoFetchItem(
+                trackKey: key, title: "原创测试曲目", artist: nil,
+                topCandidateTitle: nil, topCandidateArtist: nil
+            ))
+        }
+        try await repo.ignore(trackKey: "k-existing-ignore")
+        try await repo.discardFetchWork(forTrackKeys: ["k-a"])
+        let restarted = AutoFetchStore(store: store)
+        #expect(try await restarted.workItems() == [fetchB, removeA])
+        #expect(await restarted.pendingItems().map(\.trackKey) == ["k-b"])
+        #expect(await restarted.snapshot(playlistID: "pl-1") == snapshot)
+        #expect(await restarted.ignoredTrackKeys() == ["k-existing-ignore"])
+        let before = try await store.currentSnapshot()
+        try await restarted.discardFetchWork(forTrackKeys: [])
+        #expect(try await store.currentSnapshot() == before)
+    }
+
+    @Test("待确认数据损坏时清理失败整体回滚，不默默清掉其他资料")
+    func discardMalformedPendingRollsBack() async throws {
+        let (store, dir) = try TestEnv.makeTempStore()
+        defer { TestEnv.cleanup(dir) }
+        let repo = AutoFetchStore(store: store)
+        let work = AutoFetchWorkItem(kind: .fetch, trackKey: "k-a", playlistIDs: ["pl-1"])
+        try await repo.recordObservations([], work: [work], activePlaylistIDs: ["pl-1"], isValid: { true })
+        try await store.setSettingValue("damaged-json", forKey: AutoFetchStore.pendingKey)
+        let before = try await store.currentSnapshot()
+        await #expect(throws: ShinAppleDataError.self) {
+            try await repo.discardFetchWork(forTrackKeys: ["k-a"])
+        }
+        #expect(try await store.currentSnapshot() == before)
+    }
+
     @Test("忽略清单与审计：追加、去重、容量")
     func ignoredAndAudit() async throws {
         let (store, dir) = try TestEnv.makeTempStore()

@@ -4,7 +4,7 @@ import Foundation
 // 输出排序与置信分级。不访问网络、存储与 UI。
 //
 // 立场：网易云搜索只有文本信息，与 Music persistent ID 之间不存在强映射，
-// 所以打分只用于两件事——候选排序（永远给用户看完整候选）与
+// 明确标为伴奏的候选先排除；打分只用于两件事——其余候选排序与
 // 「高置信自动落位」的门槛判定。达不到门槛的一律进待确认队列，不猜。
 
 /// 本地一侧的匹配查询（来自 Music 库或播放快照的曲目信息）。
@@ -68,20 +68,52 @@ public enum LyricsMatchRanker {
     /// 时长差在 3–8s 之间：疑似（单曲版 / MV 混音常见），给部分分。
     public static let looseDurationToleranceMs: Int64 = 8_000
 
-    /// 对候选列表打分并按总分降序排序（同分保持网易云返回顺序，稳定）。
+    // 固定版本标签规则，只识别标题中的明确标记，不根据歌手或专辑推断。
+    // 「伴奏」需独立成段；「伴奏版」可紧接歌名；英文按完整单词识别，可接「版」。
+    private static let instrumentalVersionPatterns = [
+        #"(?:^|[\s\p{P}])伴奏(?=$|[\s\p{P}])"#,
+        #"伴奏\s*版(?=$|[\s\p{P}])"#,
+        #"(?<![\p{L}\p{N}_])instrument(?:al)?(?:\s*版)?(?![\p{L}\p{N}_])"#
+    ]
+
+    /// 排除明确伴奏版本后按总分降序，同分按原始毫秒时长差升序（已知优先），
+    /// 仍相同则保留搜索返回顺序。手动与自动获取共用此候选入口。
     public static func rank(candidates: [NeteaseSongCandidate], query: LyricsMatchQuery) -> [RankedCandidate] {
         candidates
-            .map { candidate in
-                RankedCandidate(
-                    candidate: candidate,
-                    score: score(candidate: candidate, query: query)
+            .filter { !isInstrumentalVersion($0.title) }
+            .enumerated()
+            .map { index, candidate in
+                (
+                    index: index,
+                    ranked: RankedCandidate(
+                        candidate: candidate,
+                        score: score(candidate: candidate, query: query)
+                    )
                 )
             }
             .sorted { lhs, rhs in
-                lhs.score.totalScore != rhs.score.totalScore
-                    ? lhs.score.totalScore > rhs.score.totalScore
-                    : lhs.candidate.songId < rhs.candidate.songId
+                if lhs.ranked.score.totalScore != rhs.ranked.score.totalScore {
+                    return lhs.ranked.score.totalScore > rhs.ranked.score.totalScore
+                }
+                switch (lhs.ranked.score.durationDeltaMs, rhs.ranked.score.durationDeltaMs) {
+                case let (left?, right?) where left != right:
+                    return left < right
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    return lhs.index < rhs.index
+                }
             }
+            .map { $0.ranked }
+    }
+
+    private static func isInstrumentalVersion(_ title: String) -> Bool {
+        let normalized = title.precomposedStringWithCompatibilityMapping.lowercased()
+        return instrumentalVersionPatterns.contains {
+            normalized.range(of: $0, options: .regularExpression) != nil
+        }
     }
 
     /// 单个候选打分。
@@ -151,24 +183,12 @@ public enum LyricsMatchRanker {
 
     // MARK: - 归一化
 
-    /// 歌名归一化：NFKC（全半角统一）→ 小写 → 去所有括号块（(…) （…） […] 【…】
-    /// ——「晴天 (Live)」「晴天(Live版)」都归到「晴天」→ 去空白与标点。
+    /// 歌名归一化：NFKC（全半角统一）→ 小写 → 去空白与标点。
+    /// 保留括号内文本，让伴奏、翻唱、Live、语言版本等信息参与匹配。
     /// 这是打分专用归一化，不改写任何用户可见数据。
     public static func normalizeTitle(_ value: String) -> String {
-        var text = value.precomposedStringWithCompatibilityMapping.lowercased()
-        for opener in ["(", "（", "[", "【"] {
-            let closer = Self.closingBracket(for: opener)
-            while let openRange = text.range(of: opener) {
-                let after = text.index(after: openRange.lowerBound)
-                if let closeRange = text[after...].range(of: closer) {
-                    text.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
-                } else {
-                    text.removeSubrange(openRange.lowerBound...)
-                    break
-                }
-            }
-        }
-        return text.filter { !$0.isWhitespace && !isPunctuation($0) }
+        let text = value.precomposedStringWithCompatibilityMapping.lowercased()
+        return text.filter { !$0.isWhitespace && !$0.isPunctuation }
     }
 
     /// 歌手归一化：NFKC + 小写后，按分隔符（`, / 、 + &`）与常见合作连接词
@@ -184,21 +204,6 @@ public enum LyricsMatchRanker {
         return pieces
             .map { $0.filter { !$0.isWhitespace && !$0.isPunctuation } }
             .filter { !$0.isEmpty }
-    }
-
-    private static func closingBracket(for opener: String) -> String {
-        switch opener {
-        case "(": return ")"
-        case "（": return "）"
-        case "[": return "]"
-        case "【": return "】"
-        default: return ")"
-        }
-    }
-
-    /// 只过滤标点符号（含全角），保留所有字母/数字/CJK。
-    private static func isPunctuation(_ character: Character) -> Bool {
-        character.isPunctuation
     }
 }
 

@@ -3,7 +3,7 @@ import ShinAppleKit
 
 /// 官方「音乐」资料库的浏览目的地；与本机学习歌词库分开保存。
 enum MusicLibraryDestination: Hashable, Sendable {
-    case search, recent, artists, albums, songs, favorites
+    case search, recent, artists, albums, songs
     case playlist(String)
 
     var source: MusicLibrarySource {
@@ -18,7 +18,6 @@ enum MusicLibraryDestination: Hashable, Sendable {
         case .artists: return "艺人"
         case .albums: return "专辑"
         case .songs: return "歌曲"
-        case .favorites: return "喜爱歌曲"
         case .playlist: return "播放列表"
         }
     }
@@ -30,7 +29,6 @@ enum MusicLibraryDestination: Hashable, Sendable {
         case .artists: return "music.mic"
         case .albums: return "square.stack"
         case .songs: return "music.note"
-        case .favorites: return "star.fill"
         case .playlist: return "music.note.list"
         }
     }
@@ -54,11 +52,14 @@ final class MusicLibraryBrowserModel: ObservableObject {
     @Published private(set) var isPlayingRequest = false
     /// 已确认的播放上下文变更；同一首歌换列表时也应重新读取当前列表。
     @Published private(set) var confirmedPlaybackContextVersion = 0
+    /// 用户刷新资料库时，让仍挂载的缺失封面重新尝试；不跟随播放采样更新。
+    @Published private(set) var artworkRequestVersion = 0
     @Published private(set) var errorMessage: String?
     @Published private(set) var playbackError: String?
     @Published private(set) var favoriteWrites: Set<String> = []
     @Published private(set) var totalCount = 0
     @Published private(set) var nextOffset: Int?
+    @Published private(set) var playlistSort = MusicLibraryPlaylistSort()
     @Published var searchText = "" { didSet { if searchText != oldValue { scheduleFilter() } } }
     @Published var selectedGroupID: String?
     /// 视图移出树（完整/紧凑播放器）后仍保留稳定行定位与选择。
@@ -66,14 +67,18 @@ final class MusicLibraryBrowserModel: ObservableObject {
     var scrollOffsetY: Double = 0
     private(set) var scrollResetSequence = 0
     private let service: MusicLibraryBrowsing?
+    private let sortPreferences: MusicLibraryPlaylistSortPreferences
     private var loadTask: Task<Void, Never>?
     private var filterTask: Task<Void, Never>?
     private var playTask: Task<Void, Never>?
+    private var playlistTask: Task<Void, Never>?
     private var favoriteTasks: [String: Task<Void, Never>] = [:]
     private var loadSequence = 0
     private var filterSequence = 0
     private var playSequence = 0
+    private var playlistSequence = 0
     private var didStart = false
+    private var isTerminating = false
     private var cache: [MusicLibrarySource: CachedPage] = [:]
     /// 资料库分页参数，限制单次脚本和界面载入量；与曲目内容无关。
     static let pageSize = 200
@@ -84,11 +89,32 @@ final class MusicLibraryBrowserModel: ObservableObject {
         var next: Int?
     }
 
-    init(service: MusicLibraryBrowsing?) { self.service = service }
+    init(service: MusicLibraryBrowsing?, sortDefaults: UserDefaults = .standard) {
+        self.service = service
+        sortPreferences = MusicLibraryPlaylistSortPreferences(defaults: sortDefaults)
+    }
 
     deinit {
-        loadTask?.cancel(); filterTask?.cancel(); playTask?.cancel()
+        loadTask?.cancel(); filterTask?.cancel(); playTask?.cancel(); playlistTask?.cancel()
         favoriteTasks.values.forEach { $0.cancel() }
+    }
+
+    func cancelForTermination() {
+        guard !isTerminating else { return }
+        isTerminating = true
+        loadSequence += 1
+        filterSequence += 1
+        playSequence += 1
+        playlistSequence += 1
+        loadTask?.cancel()
+        filterTask?.cancel()
+        playTask?.cancel()
+        playlistTask?.cancel()
+        favoriteTasks.values.forEach { $0.cancel() }
+        favoriteTasks.removeAll()
+        isLoading = false
+        isPlayingRequest = false
+        favoriteWrites.removeAll()
     }
 
     var title: String {
@@ -116,10 +142,6 @@ final class MusicLibraryBrowserModel: ObservableObject {
         guard case let .playlist(id) = destination else { return [] }
         return playlists.filter { $0.parentID == id }
     }
-    var lacksFavoriteMetadata: Bool {
-        destination == .favorites && !tracks.isEmpty && tracks.allSatisfy { $0.isFavorite == nil }
-    }
-
     var groups: [MusicLibraryGroup] { grouped(filteredTracks) }
     var browsingService: MusicLibraryBrowsing? { service }
 
@@ -143,15 +165,16 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     func startIfNeeded() {
-        guard !didStart else { return }
+        guard !isTerminating, !didStart else { return }
         didStart = true
         reload()
     }
 
     func select(_ destination: MusicLibraryDestination) {
-        guard self.destination != destination else { return }
+        guard !isTerminating, self.destination != destination else { return }
         let changedSource = self.destination.source != destination.source
         self.destination = destination
+        if case let .playlist(id) = destination { playlistSort = sortPreferences.value(for: id) }
         playSequence += 1
         playTask?.cancel()
         isPlayingRequest = false
@@ -182,7 +205,17 @@ final class MusicLibraryBrowserModel: ObservableObject {
         }
     }
 
-    func reload() { loadPage(reset: true, includePlaylists: true) }
+    func reload() {
+        guard !isTerminating else { return }
+        artworkRequestVersion += 1
+        loadPage(reset: true, includePlaylists: true)
+    }
+    func setPlaylistSort(_ sort: MusicLibraryPlaylistSort) {
+        guard !isTerminating, case let .playlist(id) = destination, sort != playlistSort else { return }
+        playlistSort = sort
+        sortPreferences.save(sort, for: id)
+        scheduleFilter()
+    }
     func selectGroup(_ id: String?) {
         selectedGroupID = id
         selectedTrackID = nil
@@ -205,7 +238,7 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     private func beginPlayback(_ track: MusicLibraryTrack, shuffleEnabled: Bool?, playbackStarted: (@MainActor () -> Void)?) {
-        guard let service else { return }
+        guard !isTerminating, let service else { return }
         let trackRefs = displayedTracks.map(\.trackRef)
         guard !isFolder, trackRefs.contains(track.trackRef) else { return }
         playSequence += 1
@@ -238,26 +271,27 @@ final class MusicLibraryBrowserModel: ObservableObject {
         }
     }
 
-    func artworkData(for trackRef: String) async -> Data? {
-        guard let service else { return nil }
-        return try? await service.artworkData(for: trackRef)
-    }
-
     func setFavorite(_ track: MusicLibraryTrack, value: Bool) {
-        guard let service, !favoriteWrites.contains(track.trackRef) else { return }
+        guard !isTerminating, let service, !favoriteWrites.contains(track.trackRef) else { return }
         let trackRef = track.trackRef
+        let source = destination.source
         favoriteWrites.insert(trackRef)
         playbackError = nil
         favoriteTasks[trackRef] = Task { [weak self] in
             do {
-                let confirmed = try await service.setFavorite(trackRef, value: value)
-                guard let self else { return }
+                try Task.checkCancellation()
+                let confirmed = try await service.setFavorite(trackRef, value: value, in: source)
+                guard let self, !self.isTerminating, !Task.isCancelled else { return }
                 self.updateFavorite(trackRef, value: confirmed)
                 self.favoriteWrites.remove(trackRef)
                 self.favoriteTasks[trackRef] = nil
-                if self.isLoading { self.loadPage(reset: true, includePlaylists: false) }
+                // Music 管理喜爱及智能歌单的成员，不能用本地标记推算或沿用旧成员缓存。
+                self.invalidateFavoriteMembership(changedIn: source)
+                if confirmed != value, self.tracks.contains(where: { $0.trackRef == trackRef }) {
+                    self.playbackError = "喜爱标记未保存，请刷新资料库后重试。"
+                }
             } catch {
-                guard let self else { return }
+                guard let self, !self.isTerminating, !Task.isCancelled else { return }
                 self.favoriteWrites.remove(trackRef)
                 self.favoriteTasks[trackRef] = nil
                 if self.tracks.contains(where: { $0.trackRef == trackRef }) {
@@ -267,21 +301,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
         }
     }
 
-    private func updateFavorite(_ trackRef: String, value: Bool) {
-        for key in Array(cache.keys) {
-            guard var page = cache[key] else { continue }
-            for index in page.tracks.indices where page.tracks[index].trackRef == trackRef {
-                page.tracks[index].isFavorite = value
-            }
-            cache[key] = page
-        }
-        for index in tracks.indices where tracks[index].trackRef == trackRef {
-            tracks[index].isFavorite = value
-        }
-        scheduleFilter()
-    }
-
     private func loadPage(reset: Bool, includePlaylists: Bool) {
+        guard !isTerminating else { return }
         guard let service else {
             errorMessage = "当前播放源不提供资料库浏览。"
             return
@@ -290,17 +311,19 @@ final class MusicLibraryBrowserModel: ObservableObject {
         let sequence = loadSequence
         let source = destination.source
         let initialOffset = reset ? 0 : nextOffset ?? 0
+        let directorySequence = preparePlaylistRefresh(if: includePlaylists)
         loadTask?.cancel()
         isLoading = true
         errorMessage = nil
         loadTask = Task { [weak self] in
             do {
+                try Task.checkCancellation()
                 try await service.prepareMusicInBackground()
                 try Task.checkCancellation()
                 if includePlaylists {
                     let playlists = try await service.loadPlaylists()
                     guard let self, sequence == self.loadSequence else { return }
-                    self.playlists = playlists
+                    self.applyPlaylists(playlists, sequence: directorySequence)
                 }
                 guard let self, sequence == self.loadSequence else { return }
                 if self.isFolder {
@@ -349,11 +372,13 @@ final class MusicLibraryBrowserModel: ObservableObject {
     }
 
     private func scheduleFilter() {
+        guard !isTerminating else { return }
         filterSequence += 1
         let sequence = filterSequence
         let tracks = tracks
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let destination = destination
+        let playlistSort = playlistSort
         filterTask?.cancel()
         filterTask = Task { [weak self] in
             // 快速分页和连续输入合并为一次过滤，避免每一页都重排整个资料库。
@@ -361,10 +386,9 @@ final class MusicLibraryBrowserModel: ObservableObject {
             guard !Task.isCancelled else { return }
             let result = await Task.detached(priority: .userInitiated) {
                 var filtered = tracks.filter { track in
-                    let matchesFavorite = destination != .favorites || track.isFavorite == true
                     let matchesQuery = query.isEmpty || [track.title, track.artist ?? "", track.album ?? ""]
                         .contains { $0.localizedStandardContains(query) }
-                    return matchesFavorite && matchesQuery
+                    return matchesQuery
                 }
                 if destination == .recent {
                     filtered.sort {
@@ -372,6 +396,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
                         let right = $1.dateAdded ?? .distantPast
                         return left == right ? $0.id < $1.id : left > right
                     }
+                } else if case .playlist = destination {
+                    filtered = playlistSort.applying(to: filtered)
                 }
                 return filtered
             }.value
@@ -380,7 +406,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
         }
     }
 
-    private static func message(for error: Error, playing: Bool = false) -> String {
+    /// 浏览页与当前播放列表共用固定错误说明，不透传系统或脚本原始文本。
+    static func message(for error: Error, playing: Bool = false) -> String {
         if let error = error as? MusicPlaybackContextError { return error.localizedDescription }
         if let error = error as? MusicLibraryError { return error.localizedDescription }
         if let error = error as? PlaybackError {
@@ -393,6 +420,78 @@ final class MusicLibraryBrowserModel: ObservableObject {
         }
         // 不展示执行器的原始脚本/错误内容，以免泄露资料库字段。
         return playing ? "播放未成功，请检查「音乐」App 后重试。" : "资料库暂时无法读取，请检查「音乐」App 和自动化权限后重试。"
+    }
+}
+
+extension MusicLibraryBrowserModel {
+    func artworkData(for trackRef: String, in source: MusicLibrarySource? = nil) async -> Data? {
+        guard !isTerminating, !Task.isCancelled, let service else { return nil }
+        let data = try? await service.artworkData(for: trackRef, in: source ?? destination.source)
+        guard !isTerminating, !Task.isCancelled else { return nil }
+        return data
+    }
+}
+
+private extension MusicLibraryBrowserModel {
+    func updateFavorite(_ trackRef: String, value: Bool) {
+        for key in Array(cache.keys) {
+            guard var page = cache[key] else { continue }
+            for index in page.tracks.indices where page.tracks[index].trackRef == trackRef {
+                page.tracks[index].isFavorite = value
+            }
+            cache[key] = page
+        }
+        for index in tracks.indices where tracks[index].trackRef == trackRef {
+            tracks[index].isFavorite = value
+        }
+        scheduleFilter()
+    }
+
+    func invalidateFavoriteMembership(changedIn source: MusicLibrarySource) {
+        refreshPlaylists()
+        for key in Array(cache.keys) {
+            if case .playlist = key { cache[key] = nil }
+        }
+        // Music 可配置为把新喜爱的歌单曲目加入资料库，因此跨来源写入也使全库缓存失效。
+        if source != .library { cache[.library] = nil }
+        if case .playlist = destination.source {
+            loadPage(reset: true, includePlaylists: false)
+        } else if isLoading || source != .library {
+            loadPage(reset: true, includePlaylists: false)
+        }
+        // 保留 selectedTrackID、搜索和滚动位置；实际成员仍由 Music 重新读取。
+    }
+
+    func preparePlaylistRefresh(if requested: Bool) -> Int {
+        if requested {
+            playlistSequence += 1
+            playlistTask?.cancel()
+        }
+        return playlistSequence
+    }
+
+    func applyPlaylists(_ playlists: [MusicLibraryPlaylist], sequence: Int) {
+        guard sequence == playlistSequence else { return }
+        self.playlists = playlists
+    }
+
+    func refreshPlaylists() {
+        guard !isTerminating, let service else { return }
+        playlistSequence += 1
+        let sequence = playlistSequence
+        playlistTask?.cancel()
+        playlistTask = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                try await service.prepareMusicInBackground()
+                let playlists = try await service.loadPlaylists()
+                guard let self, !self.isTerminating, !Task.isCancelled, sequence == self.playlistSequence else { return }
+                self.playlists = playlists
+            } catch {
+                guard let self, !self.isTerminating, !Task.isCancelled, sequence == self.playlistSequence else { return }
+                self.errorMessage = Self.message(for: error)
+            }
+        }
     }
 }
 

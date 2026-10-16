@@ -1,4 +1,5 @@
 import Foundation
+import ShinAppleKit
 import ShinAppServices
 import ShinLyricsProvider
 
@@ -13,22 +14,33 @@ extension AppModel {
     /// 切歌不影响进行中的获取）。
     func beginOnlineFetch() {
         guard let trackKey = currentTrackKey else { return }
+        let artistHint = onlineFetchArtistHint(for: trackKey)
         presentFetchSheet(
             target: ImportSessionTarget(
                 trackKey: trackKey,
                 titleHint: snapshot.title ?? selectedSong?.title,
-                artistHint: selectedSong?.artistName,
+                artistHint: artistHint,
                 durationHintMs: snapshot.durationMs ?? selectedSong?.durationMs
             ),
             matchQuery: LyricsMatchQuery(
                 title: snapshot.title ?? selectedSong?.title ?? "",
-                artist: selectedSong?.artistName,
+                artist: artistHint,
                 durationMs: snapshot.durationMs ?? selectedSong?.durationMs
             ),
             onDelivered: { [weak self] lyrics, provenance, target in
                 self?.handleFetchedLyrics(lyrics, provenance: provenance, target: target)
             }
         )
+    }
+
+    /// 以当前播放快照为准；回退目录信息时核实身份，避免把上一首歌的歌手带入搜索。
+    private func onlineFetchArtistHint(for trackKey: String) -> String? {
+        if let artist = snapshot.artist?.trimmingCharacters(in: .whitespacesAndNewlines), !artist.isEmpty {
+            return artist
+        }
+        guard let selectedSong, SongBinding.trackKey(for: selectedSong.identity) == trackKey else { return nil }
+        let artist = selectedSong.artistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return artist.isEmpty ? nil : artist
     }
 
     /// 从待确认队列发起获取（低置信候选由用户亲自搜索确认；确认导入后该项

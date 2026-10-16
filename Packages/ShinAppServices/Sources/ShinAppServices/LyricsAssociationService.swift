@@ -58,4 +58,16 @@ public struct LyricsAssociationService: Sendable {
     public func deleteBinding(forTrackKey trackKey: String) async throws {
         try await store.deleteBinding(forTrackKey: trackKey)
     }
+
+    /// 用户解除关联：同步删除不再被任何歌曲引用的歌词及译文。
+    /// 共享文档保留供其他歌曲使用；版本或当前关联变化时拒绝过期请求。
+    /// 返回 true 表示文档也已删除，重复请求为 false。
+    @discardableResult
+    public func deleteAssociation(
+        forTrackKey trackKey: String, expectedDocumentId: UUID, expectedRevision: Int
+    ) async throws -> Bool {
+        try await store.deleteAssociation(
+            forTrackKey: trackKey, expectedDocumentId: expectedDocumentId, expectedRevision: expectedRevision
+        )
+    }
 }

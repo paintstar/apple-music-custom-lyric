@@ -147,6 +147,19 @@ private struct FixtureFetchService: LyricsFetchServicing {
     }
 }
 
+private actor ManualSearchFixture: LyricsFetchServicing {
+    private(set) var keywords: [String] = []
+    let candidates: [NeteaseSongCandidate]
+    init(candidates: [NeteaseSongCandidate] = []) { self.candidates = candidates }
+    func searchSongs(query: String) async throws -> [NeteaseSongCandidate] {
+        keywords.append(query)
+        return candidates
+    }
+    func fetchLyrics(songId: Int64) async throws -> NeteaseLyrics {
+        NeteaseLyrics(songId: songId, originalLRC: "[00:01.000]原创纸舟沿岸出发", translatedLRC: nil)
+    }
+}
+
 private final class SilentSubscription: PlaybackSubscriptionHandle, @unchecked Sendable { func cancel() {} }
 private final class SilentController: PlaybackController, @unchecked Sendable {
     func snapshot() -> PlaybackSnapshot { PlaybackSnapshot() }
@@ -374,6 +387,225 @@ private struct AutoFetchCheck {
         print("PASS 真实 AppModel 切目录先停止旧轮，旧库与复制快照保持一致")
     }
 
+    @MainActor static func resourceDeletionStopsQueuedWork(_ root: URL) async throws {
+        let first = track("FA000060", "原创晨曦纸船")
+        let target = track("FA000061", "原创山间云窗")
+        let other = track("FA000062", "原创湖畔小灯")
+        let store = try makeStore(root, "resource-deletion")
+        let kept = LyricDocument(lines: [LyricLine(startMs: 0, text: "用户准备放弃的原创云窗歌词")])
+        try await store.save(document: kept, binding: SongBinding(persistentID: target.persistentID, lyricDocumentId: kept.id))
+        let library = FixtureLibrary(["A": [first, target, other]])
+        let http = HTTPFixture(tracks: [1060: first, 1061: target, 1062: other], holdSong: 1060)
+        let model = AutoFetchModel(store: store, library: library, fetchService: FixtureFetchService(http))
+        try await configure(model, playlists: ["A"])
+        try await model.repository.enqueuePending(PendingAutoFetchItem(
+            trackKey: target.trackRef, title: target.title, artist: target.artist,
+            topCandidateTitle: nil, topCandidateArtist: nil
+        ))
+        let refresh = Task { await model.refreshNow() }
+        try await wait("删前第一项 HTTP 挂起") { http.hasHeldResponse }
+        let revision = model.stateRevision
+        let settingChange = Task { await model.setEnabled(true) }
+        try await wait("设置变更使旧轮失效") { model.stateRevision > revision }
+        var queuedRefreshEntered = false
+        let queuedRefresh = Task {
+            queuedRefreshEntered = true
+            await model.refreshNow()
+        }
+        try await wait("另一轮刷新已排队") { queuedRefreshEntered }
+        let clock = ContinuousClock()
+        let started = clock.now
+        let shouldResume = try await model.suspendForResourceDeletion(trackKeys: [target.trackRef])
+        try require(clock.now - started < .seconds(2), "资源删除仍在等待整个 HTTP 超时")
+        try require(shouldResume && model.isSuspended, "资源删除未持有自动获取暂停")
+        await refresh.value
+        await queuedRefresh.value
+        await settingChange.value
+        try require(!model.isRefreshing, "取消后旧刷新仍在运行")
+        try http.release() // 已取消 URLProtocol 不应再回写旧响应。
+        try require(try await model.repository.workItems().allSatisfy {
+            $0.kind != .fetch || $0.trackKey != target.trackRef
+        }, "目标歌曲的获取待办未持久移除")
+        try require(await model.repository.pendingItems().allSatisfy { $0.trackKey != target.trackRef }, "目标待确认项未移除")
+        _ = try await store.deleteAssociation(forTrackKey: target.trackRef,
+                                             expectedDocumentId: kept.id, expectedRevision: kept.revision)
+        model.resume()
+        await model.refreshNow()
+        try require(try await store.document(forTrackKey: target.trackRef) == nil, "主动刷新重抓了用户删除的歌词")
+        try require(http.searchesCount(target.title) == 0 && http.lyricsCount(1061) == 0, "删除后没有成员变化却重新请求目标")
+        let firstBinding = try await store.binding(forTrackKey: first.trackRef)
+        let otherBinding = try await store.binding(forTrackKey: other.trackRef)
+        try require(firstBinding != nil && otherBinding != nil, "其他歌曲未继续既有获取待办")
+        try require(!(await model.repository.ignoredTrackKeys()).contains(target.trackRef), "资源删除误加永久忽略清单")
+        await library.setTracks([first, other], in: "A")
+        await model.refreshNow()
+        await library.setTracks([first, target, other], in: "A")
+        await model.refreshNow()
+        try require(try await store.binding(forTrackKey: target.trackRef) != nil && http.lyricsCount(1061) == 1,
+                    "真实移出再加入后目标歌曲未按新成员变化获取")
+        print("PASS 显式删除取消旧轮及排队刷新，清目标持久待办；其他工作继续，再次入歌单可重新获取")
+    }
+
+    @MainActor static func resourceDeletionFailureRestoresState(_ root: URL) async throws {
+        let store = try makeStore(root, "resource-deletion-failure")
+        let model = AutoFetchModel(store: store, library: FixtureLibrary([:]),
+                                   fetchService: FixtureFetchService(HTTPFixture(tracks: [:])))
+        try await store.setSettingValue("damaged-json", forKey: AutoFetchStore.workKey)
+        for alreadySuspended in [false, true] {
+            if alreadySuspended { try await model.suspendAndWait() }
+            do {
+                _ = try await model.suspendForResourceDeletion(trackKeys: ["music-script:persistent:FA000063"])
+                throw CheckError.failed("损坏待办应拒绝删除准备")
+            } catch is ShinAppleDataError {}
+            try require(model.isSuspended == alreadySuspended, "准备删除失败未恢复原暂停状态")
+        }
+        model.resume()
+        print("PASS 删除准备失败恢复此前暂停状态，不让自动获取永久暂停")
+    }
+
+    @MainActor static func verifyOnlineTitlePrefill() async throws {
+        let examples = [
+            ("  原创晨岸 \n", "原创晨岸"),
+            ("原创晨岸(feat. 纸灯)", "原创晨岸"),
+            ("原创晨岸 [现场]", "原创晨岸"),
+            ("原创晨岸(现场) [客席]", "原创晨岸"),
+            ("原创晨岸（现场）［客席］", "原创晨岸"),
+            ("原创晨岸（现场［客席（纸灯）］）", "原创晨岸"),
+            ("原创晨岸[现场 (客席)]", "原创晨岸"),
+            ("原创(纸舟)晨岸 [现场]", "原创(纸舟)晨岸"),
+            ("原创[纸舟]晨岸", "原创[纸舟]晨岸"),
+            ("原创晨岸(现场", "原创晨岸(现场"),
+            ("原创晨岸[现场)", "原创晨岸[现场)"),
+            ("原创晨岸（现场］", "原创晨岸（现场］"),
+            ("(原创晨岸)", "(原创晨岸)"),
+            (" ［原创晨岸］(现场) ", "［原创晨岸］(现场)")
+        ]
+        for (raw, expected) in examples {
+            let query = LyricsMatchQuery(title: raw, artist: "纸舟乐队", durationMs: 20_000)
+            let target = ImportSessionTarget(trackKey: "music-script:persistent:FA000054", titleHint: raw)
+            let model = NeteaseLyricsFetchModel(service: ManualSearchFixture(), matchQuery: query, target: target)
+            try require(model.queryTitle == expected, "末尾括号附注回填错误：\(raw)")
+            try require(model.matchQuery == query && model.target == target, "回填清理改写了原始匹配或导入目标")
+        }
+        let returned = [
+            NeteaseSongCandidate(songId: 1070, title: "原创晨岸 (Live)", artists: ["纸舟乐队"], durationMs: 20_000),
+            NeteaseSongCandidate(songId: 1071, title: "原创晨岸 [翻唱]", artists: ["纸舟乐队"], durationMs: 20_000)
+        ]
+        let service = ManualSearchFixture(candidates: returned)
+        let model = NeteaseLyricsFetchModel(
+            service: service,
+            matchQuery: LyricsMatchQuery(title: "原创晨岸 (Live)", artist: "纸舟乐队", durationMs: 20_000),
+            target: ImportSessionTarget(trackKey: "music-script:persistent:FA000054", titleHint: "原创晨岸 (Live)")
+        )
+        await model.search()
+        try require(await service.keywords == ["原创晨岸 纸舟乐队"], "首次搜索没有发送清理后的歌名及默认歌手")
+        guard case let .candidates(ranked) = model.phase else { throw CheckError.failed("未收到手动搜索候选") }
+        try require(ranked.map(\.candidate).sorted { $0.songId < $1.songId } == returned,
+                    "搜索候选的原始版本信息被清理或遗漏")
+        model.queryTitle = "  用户原创曲 [自选版]  "
+        await model.search()
+        try require(await service.keywords.last == "用户原创曲 [自选版] 纸舟乐队", "用户手填括号内容被再次清理")
+    }
+
+    @MainActor static func onlineFetchPrefillsCurrentSong() async throws {
+        try await verifyOnlineTitlePrefill()
+        let app = AppModel(isMock: false, controller: SilentController(), searchService: nil)
+        let rawTitle = "  原创晨岸(feat. 纸灯) [现场] \n"
+        var snapshot = PlaybackSnapshot(trackEpoch: 1, title: rawTitle, artist: "  纸舟乐队 \n",
+                                        durationMs: 20_000, status: .paused,
+                                        trackRef: "music-script:persistent:FA000050")
+        app.applySnapshot(snapshot)
+        app.beginOnlineFetch()
+        guard let opened = app.lyricsFetchModel else { throw CheckError.failed("未打开在线获取") }
+        try require(opened.queryTitle == "原创晨岸" && opened.matchQuery.title == rawTitle
+                    && opened.target.titleHint == rawTitle, "当前曲目没有仅清理默认搜索歌名")
+        try require(app.selectedSong == nil && opened.queryArtist == "纸舟乐队", "真实歌曲未回填快照歌手")
+        try require(opened.target.artistHint == "纸舟乐队" && opened.matchQuery.artist == "纸舟乐队",
+                    "导入目标与搜索匹配歌手不一致")
+        opened.queryArtist = "用户填写的原创歌手"
+        opened.queryTitle = "用户输入原创曲 [自选版]"
+        snapshot.trackEpoch += 1
+        snapshot.trackRef = "music-script:persistent:FA000051"
+        snapshot.title = "新曲原创歌名（重录）"
+        snapshot.artist = "新曲原创歌手"
+        app.applySnapshot(snapshot)
+        try require(app.lyricsFetchModel === opened && opened.queryArtist == "用户填写的原创歌手"
+                    && opened.queryTitle == "用户输入原创曲 [自选版]" && opened.matchQuery.title == rawTitle
+                    && opened.target.trackKey == "music-script:persistent:FA000050"
+                    && opened.matchQuery.artist == "纸舟乐队", "切歌覆盖了弹窗输入或固定目标")
+        for artist: String? in [nil, " \n\t"] {
+            snapshot.artist = artist
+            app.applySnapshot(snapshot)
+            app.beginOnlineFetch()
+            try require(app.lyricsFetchModel?.queryArtist == "" && app.lyricsFetchModel?.target.artistHint == nil,
+                        "未知或空白歌手未保持为空")
+        }
+
+        let selected = SongSummary(identity: CatalogIdentity(storefront: "test", catalogSongId: "artist-prefill"),
+                                   title: "原创旧曲", artistName: "旧曲原创歌手", durationMs: 20_000)
+        let catalogApp = AppModel(isMock: false, controller: SilentController(), searchService: MockCatalogSearchService())
+        catalogApp.play(selected)
+        snapshot.track = selected.identity
+        snapshot.trackRef = nil
+        snapshot.artist = nil
+        catalogApp.applySnapshot(snapshot)
+        catalogApp.beginOnlineFetch()
+        try require(catalogApp.lyricsFetchModel?.queryArtist == selected.artistName, "同一曲目的目录歌手未回退")
+        snapshot.track = nil
+        snapshot.trackRef = "music-script:persistent:FA000052"
+        catalogApp.applySnapshot(snapshot)
+        catalogApp.beginOnlineFetch()
+        try require(catalogApp.lyricsFetchModel?.queryArtist == "", "不同曲目借用了旧选中歌曲的歌手")
+        let pending = PendingAutoFetchItem(trackKey: "music-script:persistent:FA000053", title: "原创待确认［练习版］",
+                                          artist: "待确认原创歌手", topCandidateTitle: nil, topCandidateArtist: nil)
+        app.beginOnlineFetch(for: pending)
+        try require(app.lyricsFetchModel?.queryArtist == pending.artist
+                    && app.lyricsFetchModel?.queryTitle == "原创待确认"
+                    && app.lyricsFetchModel?.target.titleHint == pending.title, "待确认项未正确回填自身歌名和歌手")
+        print("PASS 在线获取默认清理歌名末尾附注，回填当前歌手，保留目标/候选及用户输入")
+    }
+
+    @MainActor static func importedLyricsRefreshBeforeBatchEnds(_ root: URL) async throws {
+        let playing = track("FA000071", "原创晴窗纸舟")
+        let waiting = track("FA000072", "原创岸边晚灯")
+        let store = try makeStore(root, "live-panel-refresh")
+        let http = HTTPFixture(tracks: [1071: playing, 1072: waiting], holdSong: 1072)
+        let app = AppModel(isMock: false, controller: SilentController(), searchService: nil)
+        app.applySnapshot(PlaybackSnapshot(trackEpoch: 1, positionMs: 1_500, durationMs: 20_000,
+                                           status: .paused, trackRef: playing.trackRef))
+        app.installLyricsServiceGraph(store: store, note: "原创测试临时歌词库")
+        guard let panel = app.lyricsPanel else { throw CheckError.failed("歌词面板未创建") }
+        app.refreshLyricsPanel()
+        try await wait("首次获取前歌词面板无绑定") { panel.state == .unbound && panel.displayedTrackEpoch == 1 }
+        let model = AutoFetchModel(store: store, library: FixtureLibrary(["A": [playing, waiting]]),
+                                   fetchService: FixtureFetchService(http))
+        model.onLibraryChanged = { [weak app] in app?.refreshLyricsPanel() }
+        app.autoFetch = model
+        try await configure(model, playlists: ["A"])
+        let refresh = Task { await model.refreshNow() }
+        try await wait("第二首歌词请求挂起") { http.hasHeldResponse }
+        guard let document = try await store.document(forTrackKey: playing.trackRef) else {
+            throw CheckError.failed("第一首歌词应已提交数据库")
+        }
+        await app.library?.refresh()
+        try require(app.library?.items.contains { $0.documentId == document.id && $0.bindingCount == 1 } == true,
+                    "缓存资源应能看到当前歌曲已保存歌词")
+        // 后面的 HTTP 仍未结束，已成功写入的当前歌曲应立即显示。
+        do {
+            try await wait("整轮未结束时当前歌词已显示") { panel.currentDocumentId == document.id }
+        } catch {
+            model.invalidateCurrentRun()
+            try http.release()
+            await refresh.value
+            throw error
+        }
+        model.invalidateCurrentRun()
+        try http.release()
+        await refresh.value
+        try require(panel.currentDocumentId == document.id, "后续取消不得撤回已显示的歌词")
+        print("PASS 当前歌词在批量获取尚未完成时即时显示，后续取消不遗留无歌词状态")
+    }
+
     @MainActor static func main() async {
         do {
             guard let fakeHome = ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"] else {
@@ -394,7 +626,11 @@ private struct AutoFetchCheck {
             try await settingsInvalidate(root, disable: true)
             try await settingsInvalidate(root, disable: false)
             try await storageSwitchStopsOldRun(root)
-            print("auto-fetch-check：8 项模型集成场景通过；真实 Music/网络未访问。")
+            try await onlineFetchPrefillsCurrentSong()
+            try await resourceDeletionStopsQueuedWork(root)
+            try await resourceDeletionFailureRestoresState(root)
+            try await importedLyricsRefreshBeforeBatchEnds(root)
+            print("auto-fetch-check：12 项模型集成场景通过；真实 Music/网络未访问。")
         } catch {
             FileHandle.standardError.write(Data("FAIL auto-fetch-check：\(error)\n".utf8))
             exit(1)

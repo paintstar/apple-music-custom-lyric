@@ -142,6 +142,11 @@ private struct ObservedLyricsPanelView: View {
                 .disabled(!model.canBeginImport)
                 .help("选择 LRC/文本文件或直接粘贴歌词")
             }
+            Button("重新检查本地歌词") {
+                model.refreshLyricsPanel()
+            }
+            .font(.caption)
+            .help("只重新读取本地关联，不会联网获取或覆盖歌词")
         }
     }
 

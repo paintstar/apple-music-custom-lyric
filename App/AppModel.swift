@@ -7,10 +7,8 @@ import ShinLyricsProvider
 import ShinMusicScript
 
 /// 界面状态机：通过 Music 脚本适配器获取播放状态。
-/// loading → ready；自动化权限被拒时进入 automationDenied
-/// （由快照 errorCode 驱动，用户显式打开系统设置后可恢复）。
-/// TCC「自动化」授权由系统在
-/// 首次访问「音乐」App 时弹出，拒绝与否经快照/命令错误如实呈现。
+/// loading → ready；自动化权限被拒时进入 automationDenied，由快照 errorCode 驱动。
+/// 首次访问「音乐」App 时由系统请求 TCC 授权，用户在系统设置恢复权限后可重试。
 @MainActor
 final class AppModel: ObservableObject {
     /// 稳定错误码（ShinMusicScript 执行器层约定）。
@@ -19,6 +17,7 @@ final class AppModel: ObservableObject {
 
     let isMock: Bool
     let controller: PlaybackController
+    @Published private(set) var isTerminating = false
     /// 官方音乐资料库与本机歌词库独立；首次打开浏览页时再加载。
     lazy var musicLibraryBrowser = MusicLibraryBrowserModel(service: controller as? MusicLibraryBrowsing)
     lazy var playbackOptions: PlaybackOptionsModel = {
@@ -61,9 +60,7 @@ final class AppModel: ObservableObject {
 
     // MARK: 歌词面板与导入/同步协调/编辑器
 
-    /// 歌词面板状态（nil = 歌词库尚未初始化完成）。
-    /// setter 为 internal：保存位置切换扩展（AppModel+LyricsStorage.swift）
-    /// 重建服务全家时写入。
+    /// 歌词面板状态；保存位置切换时重建，nil 表示尚未初始化。
     @Published var lyricsPanel: LyricsPanelModel?
     /// 导入流程（nil = 歌词库初始化失败，导入不可用）。
     @Published var importFlow: ImportFlowModel?
@@ -94,7 +91,7 @@ final class AppModel: ObservableObject {
     @Published var isLyricsEditorPresented = false {
         didSet { updateLyricsScrollSuspension() }
     }
-    /// 上一次驱动歌词面板刷新的曲目键与 epoch（切歌/重新装载时才刷新）。
+    /// 上一次由播放快照触发歌词查询的曲目键与 epoch。
     private var lastLyricsTrackKey: String?
     private var lastLyricsEpoch: Int?
 
@@ -113,6 +110,11 @@ final class AppModel: ObservableObject {
     /// 请求序号：丢弃过期的搜索响应。
     private var searchSequence = 0
     private var debounceTask: Task<Void, Never>?
+    private var playbackTasks: [UUID: Task<Void, Never>] = [:]
+    private var lyricsRefreshTask: Task<Void, Never>?
+    /// 当前歌词库的文件变更订阅；换库扩展安装，退出或释放时取消。
+    var lyricsStoreChangesTask: Task<Void, Never>?
+    private var importTask: Task<Void, Never>?
 
     // MARK: - 构造
 
@@ -134,29 +136,25 @@ final class AppModel: ObservableObject {
         searchTask?.cancel()
         debounceTask?.cancel()
         transportTask?.cancel()
+        playbackTasks.values.forEach { $0.cancel() }
+        lyricsRefreshTask?.cancel()
+        lyricsStoreChangesTask?.cancel()
+        importTask?.cancel()
     }
 
     // MARK: - 启动与权限
 
-    // 错误呈现与重试规则（适用于本类型全部失败路径）：
-    // - **无自动重试循环**：搜索、播放、歌词查询失败后停留在带中文说明的
-    //   静态错误态；只有用户显式操作（重新输入关键词、点「重试」、点
-    //   「打开自动化权限设置」、再点一次播放）才会发起新请求；
-    // - **错误一次性消费**：searchMessage / playbackMessage / 面板 unavailable
-    //   都是普通状态位，由下一次用户动作覆盖或清空；本 App 不使用
-    //   .alert(isPresented:) 弹窗，因此不存在「同一错误反复弹窗」的路径；
-    // - **旧请求不覆盖新状态**：搜索用 searchSequence 序号、歌词关联用
-    //   LyricsPanelModel.sequence、导入用 generation、同步结果由协调器按
-    //   (trackKey, trackEpoch) 双重校验丢弃过期返回（详见各自文件）。
+    // 失败后显示静态说明；显式重试或本地库变更可重查，旧结果按各自生命周期丢弃。
 
     func start() async {
+        guard !isTerminating else { return }
         if startupTask == nil {
             // 独立任务不随某个窗口的 .task 取消；其他窗口等待同一初始化结果。
             startupTask = Task { [weak self] in
-                guard let self else { return }
+                guard let self, !self.isTerminating, !Task.isCancelled else { return }
                 self.subscription = self.controller.subscribe { [weak self] _ in
                     Task { @MainActor in
-                        guard let self else { return }
+                        guard let self, !self.isTerminating else { return }
                         // 回调跨入主线程时读取最新权威状态，避免排队中的旧采样倒灌。
                         self.applySnapshot(self.controller.snapshot())
                     }
@@ -164,6 +162,7 @@ final class AppModel: ObservableObject {
                 // subscribe 不承诺回放初值；已暂停的歌曲也必须立即显示。
                 self.applySnapshot(self.controller.snapshot())
                 await self.setupLyricsServices()
+                guard !self.isTerminating, !Task.isCancelled else { return }
                 if self.setup == .loading { self.setup = .ready }
                 // 歌单自动获取：就绪后跑一轮快照 diff（未启用则无操作）。
                 await self.autoFetch?.refreshNow()
@@ -173,6 +172,7 @@ final class AppModel: ObservableObject {
     }
 
     func applySnapshot(_ snapshot: PlaybackSnapshot) {
+        guard !isTerminating else { return }
         if let expected = waitingForTransportChange, Self.didConfirmTransportChange(from: expected, to: snapshot) {
             waitingForTransportChange = nil
             if playbackMessage == Self.pendingTrackChangeMessage { playbackMessage = nil }
@@ -203,7 +203,7 @@ final class AppModel: ObservableObject {
     // MARK: - 搜索（防抖 + 序号防旧覆盖新；仅 Mock 模式）
 
     private func scheduleSearch() {
-        guard searchService != nil else { return }
+        guard !isTerminating, searchService != nil else { return }
         debounceTask?.cancel()
         let query = searchText
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -260,11 +260,11 @@ final class AppModel: ObservableObject {
 
     /// 点击结果行（仅 Mock 模式）：装载队列并播放（同一份结果作为队列）。
     func play(_ summary: SongSummary) {
-        guard searchService != nil else { return }
+        guard !isTerminating, searchService != nil else { return }
         selectedSong = summary
         playbackMessage = nil
         let identities = results.map(\.identity)
-        Task { [weak self] in
+        launchPlaybackTask { [weak self] in
             guard let self else { return }
             do {
                 try await self.controller.setQueue(identities, startAt: summary.identity)
@@ -277,7 +277,7 @@ final class AppModel: ObservableObject {
     }
 
     func togglePlayPause() {
-        Task { [weak self] in
+        launchPlaybackTask { [weak self] in
             guard let self else { return }
             let status = self.controller.snapshot().status
             do {
@@ -297,13 +297,13 @@ final class AppModel: ObservableObject {
     func seek(toMs ms: Int64, expectedSnapshot: PlaybackSnapshot? = nil) {
         let expected = expectedSnapshot ?? snapshot
         let current = controller.snapshot()
-        guard isCurrentTrack(expected), Self.canSeek(current, isMock: isMock) else { return }
+        guard !isTerminating, isCurrentTrack(expected), Self.canSeek(current, isMock: isMock) else { return }
         seekSequence += 1
         let sequence = seekSequence
         let target = min(max(ms, 0), max(current.durationMs ?? ms, 0))
         pendingSeek = SeekPresentation(sequence: sequence, positionMs: target, expected: expected)
         playbackMessage = nil
-        Task { [weak self] in
+        launchPlaybackTask { [weak self] in
             guard let self else { return }
             defer { if self.pendingSeek?.sequence == sequence { self.pendingSeek = nil } }
             guard sequence == self.seekSequence, self.isCurrentTrack(expected),
@@ -362,6 +362,7 @@ final class AppModel: ObservableObject {
         guard lyricsPanel == nil else { return }
         do {
             let database = try await makeLyricsDatabase()
+            guard !isTerminating, !Task.isCancelled else { return }
             lyricsStore = database.store
             lyricsDatabaseDirectory = database.directory
             installLyricsServiceGraph(store: database.store, note: database.locationDescription)
@@ -393,20 +394,23 @@ final class AppModel: ObservableObject {
         lastLyricsEpoch = nil
     }
 
-    /// 按当前曲目键刷新歌词面板（内部状态变化后的统一入口；
-    /// 也是面板「加载失败 → 重试」空态的手动重试入口，见 ContentView/歌词区）。
+    /// 按当前曲目与面板刷新，供本地库变更、切歌和手动重试使用。
     func refreshLyricsPanel() {
+        guard !isTerminating, let panel = lyricsPanel else { return }
         let trackKey = currentTrackKey
         let epoch = snapshot.trackEpoch
-        Task { [weak self] in
-            guard let self, self.currentTrackKey == trackKey, self.snapshot.trackEpoch == epoch else { return }
-            await self.lyricsPanel?.refresh(trackKey: trackKey, trackEpoch: epoch)
+        lyricsRefreshTask?.cancel()
+        lyricsRefreshTask = Task { [weak self, weak panel] in
+            guard let self, let panel, !self.isTerminating, !Task.isCancelled,
+                  self.lyricsPanel === panel, self.currentTrackKey == trackKey,
+                  self.snapshot.trackEpoch == epoch else { return }
+            await panel.refresh(trackKey: trackKey, trackEpoch: epoch)
         }
     }
 
     /// 打开导入窗口：目标在打开时从当前曲目键固定（不随后续播放变化）。
     func beginImport() {
-        guard let flow = importFlow, let trackKey = currentTrackKey else { return }
+        guard !isTerminating, let flow = importFlow, let trackKey = currentTrackKey else { return }
         let target = ImportSessionTarget(
             trackKey: trackKey,
             titleHint: snapshot.title ?? selectedSong?.title,
@@ -414,7 +418,9 @@ final class AppModel: ObservableObject {
             durationHintMs: snapshot.durationMs ?? selectedSong?.durationMs
         )
         isImportPresented = true
-        Task {
+        importTask?.cancel()
+        importTask = Task { [weak self] in
+            guard self?.isTerminating == false, !Task.isCancelled else { return }
             await flow.openSession(target: target)
         }
     }
@@ -430,6 +436,49 @@ final class AppModel: ObservableObject {
     /// 能否发起在线获取（与导入同门槛：有明确曲目键且导入服务可用）。
     var canBeginOnlineFetch: Bool {
         importFlow != nil && currentTrackKey != nil
+    }
+}
+
+extension AppModel {
+    /// 同步失效与取消先于清理，防止退出等待期间再发起播放或自动获取。
+    func prepareForTermination() {
+        guard !isTerminating else { return }
+        isTerminating = true
+        subscription?.cancel()
+        subscription = nil
+        startupTask?.cancel()
+        searchSequence += 1
+        seekSequence += 1
+        transportSequence += 1
+        searchTask?.cancel()
+        debounceTask?.cancel()
+        transportTask?.cancel()
+        playbackTasks.values.forEach { $0.cancel() }
+        playbackTasks.removeAll()
+        lyricsRefreshTask?.cancel()
+        lyricsStoreChangesTask?.cancel()
+        importTask?.cancel()
+        autoFetch?.invalidateCurrentRun()
+        lyricsFetchModel?.cancel()
+        lyricsPanel?.setAutoScrollSuspended(true)
+        artworkStore.handleTrackChange(PlaybackSnapshot(), controller: controller)
+        musicLibraryBrowser.cancelForTermination()
+        playbackOptions.cancel()
+        isChangingTrack = true
+        waitingForTransportChange = nil
+        pendingSeek = nil
+        controller.dispose()
+    }
+
+    /// 仅持有既有独立命令的任务句柄，完成即释放，退出时统一取消。
+    private func launchPlaybackTask(_ operation: @escaping @MainActor () async -> Void) {
+        guard !isTerminating else { return }
+        let id = UUID()
+        playbackTasks[id] = Task { [weak self] in
+            defer { self?.playbackTasks[id] = nil }
+            guard !Task.isCancelled, self?.isTerminating == false else { return }
+            await operation()
+        }
     }
 }
 /// 目录搜索错误的中文文案（AppModel 类型体外，约束类型长度）。

@@ -372,10 +372,11 @@ private struct MusicLibraryNavigationMenu: View {
 
     private var navigationItems: [PlaybackMenu.Item] {
         var items = [PlaybackMenu.Item(title: "资料库")]
-        for destination in [MusicLibraryDestination.search, .recent, .artists, .albums, .songs, .favorites] {
+        for destination in [MusicLibraryDestination.search, .recent, .artists, .albums, .songs] {
             items.append(.init(title: destination.title, symbol: destination.symbol,
                                action: { onSelect(.music(destination)) }))
         }
+        items += [.separator, .init(title: "播放列表")]
         for playlist in browser.playlists {
             items.append(.init(title: playlist.name, symbol: playlist.isFolder ? "folder" : "music.note.list",
                                action: { onSelect(.music(.playlist(playlist.id))) }))

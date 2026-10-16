@@ -1097,6 +1097,10 @@ private struct PlayerUICheck {
     }
 
     @MainActor private static func runChecks() async throws {
+        if CommandLine.arguments.contains("--artwork-only") {
+            try await ArtworkUICheck.runChecks()
+            return
+        }
         if CommandLine.arguments.contains("--playback-options-only") {
             try await PlaybackOptionsUICheck.runChecks()
             return
@@ -1251,6 +1255,7 @@ private struct PlayerUICheck {
         try await PlaybackProgressUICheck.runChecks()
         try await PlaybackOptionsUICheck.runChecks()
         try await checkPlaybackDragging(store: store, snapshot: initial)
+        try await ArtworkUICheck.runChecks()
         fflush(nil)
         print("App player UI checks: AUTOMATED_PASS（未执行真实 Music 验证）")
     }

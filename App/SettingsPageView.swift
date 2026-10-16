@@ -11,6 +11,8 @@ import SwiftUI
 struct SettingsPageView: View {
     @EnvironmentObject private var model: AppModel
     var bottomContentInset: CGFloat = 100
+    @AppStorage(PlaybackCleanupSettings.preferenceKey)
+    private var cleanupManagedPlaylistsOnQuit = PlaybackCleanupSettings.defaultEnabled
     /// 与歌词面板共享同一键（LyricsPanelView.translationsSettingKey）。
     @AppStorage(LyricsPanelView.translationsSettingKey)
     private var showTranslations = true
@@ -24,6 +26,7 @@ struct SettingsPageView: View {
     private var floatingLyricsCharacterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isDebugExpanded = false
+    @State private var isResourceManagementPresented = false
     /// 待确认切换的目标目录（NSOpenPanel 结果；nil = 无待确认操作）。
     @State private var pendingSwitchDirectory: URL?
     @State private var isRestoreDefaultConfirmVisible = false
@@ -45,6 +48,15 @@ struct SettingsPageView: View {
         }
         .task {
             await model.autoFetch?.reloadState()
+        }
+        .sheet(isPresented: $isResourceManagementPresented) {
+            if let library = model.library {
+                LocalResourceManagementView(library: library)
+                    .id(ObjectIdentifier(library))
+            }
+        }
+        .onChange(of: model.library.map(ObjectIdentifier.init)) { _, _ in
+            isResourceManagementPresented = false
         }
     }
 
@@ -77,6 +89,11 @@ struct SettingsPageView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Toggle("退出时清理应用临时播放清单", isOn: $cleanupManagedPlaylistsOnQuit)
+            Text("清理前会停止「音乐」播放；只删除应用创建且未被修改的临时清单，用户修改过的清单会保留。关闭窗口不会触发清理。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -153,6 +170,9 @@ struct SettingsPageView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Button("缓存资源管理…") { isResourceManagementPresented = true }
+                .disabled(model.library == nil || model.isSwitchingStorage)
+                .help("查看本机保存的歌词和译文，选择删除、清理未关联资源或删除全部")
             Button("打开学习歌曲页（歌词库 / 备份 / 导出 LRC）") {
                 NotificationCenter.default.post(name: .shinSelectLibraryPage, object: nil)
             }
@@ -174,13 +194,13 @@ struct SettingsPageView: View {
             Button("更改保存位置…") {
                 chooseStorageDirectory()
             }
-            .disabled(model.isSwitchingStorage)
+            .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
             .help("选择一个文件夹存放歌词数据库；现有数据会自动复制过去并立即生效")
             if override != nil {
                 Button("恢复默认位置") {
                     isRestoreDefaultConfirmVisible = true
                 }
-                .disabled(model.isSwitchingStorage)
+                .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
                 .help("把歌词数据库移回默认位置（Application Support/ShinApple）")
             }
         }

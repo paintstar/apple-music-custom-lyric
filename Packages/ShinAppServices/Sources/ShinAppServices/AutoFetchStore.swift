@@ -241,6 +241,24 @@ public struct AutoFetchStore: Sendable {
         }
     }
 
+    /// 用户删除歌词前放弃这些歌曲已有的获取待办与待确认项。
+    /// 单事务过滤最新状态；保留其他歌曲、删除待办、观察快照及永久忽略设置。
+    public func discardFetchWork(forTrackKeys trackKeys: Set<String>) async throws {
+        guard !trackKeys.isEmpty else { return }
+        try await store.updateSettings { values in
+            let work = try Self.decodeWork(values[Self.workKey]).filter {
+                $0.kind != .fetch || !trackKeys.contains($0.trackKey)
+            }
+            let pending = try values[Self.pendingKey].map {
+                try JSONDecoder().decode([PendingAutoFetchItem].self, from: Data($0.utf8))
+            } ?? []
+            return [
+                Self.workKey: Self.encodeJSON(work),
+                Self.pendingKey: Self.encodeJSON(pending.filter { !trackKeys.contains($0.trackKey) })
+            ]
+        }
+    }
+
     /// 取消监控时同时清该歌单的基准与未完成工作；已获取歌词保持原状。
     public func removeSnapshot(playlistID: String) async {
         try? await store.updateSettings { values in

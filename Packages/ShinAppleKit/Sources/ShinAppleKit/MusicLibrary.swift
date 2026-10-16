@@ -81,8 +81,12 @@ public protocol MusicLibraryBrowsing: AnyObject, Sendable {
     func shuffleTracks(_ trackRefs: [String], in source: MusicLibrarySource) async throws
     /// 仅按需读封面原始图像数据；无封面/不支持返回 nil，不包含音频数据。
     func artworkData(for trackRef: String) async throws -> Data?
+    /// 在已确认的真实来源中读封面，支持未加入主资料库的歌单成员。
+    func artworkData(for trackRef: String, in source: MusicLibrarySource) async throws -> Data?
     /// 用户主动修改喜爱标记，并返回 Music 实际读回值；调用方不可乐观冒充成功。
     func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool
+    /// 在用户点击时的真实来源中定位曲目，支持未加入资料库的歌单成员。
+    func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool
 }
 
 public extension MusicLibraryBrowsing {
@@ -91,7 +95,13 @@ public extension MusicLibraryBrowsing {
     func shuffleTracks(_ trackRefs: [String], in source: MusicLibrarySource) async throws { throw MusicLibraryError.unsupported }
     func currentPlaybackSource() async throws -> MusicLibrarySource? { nil }
     func artworkData(for trackRef: String) async throws -> Data? { nil }
+    func artworkData(for trackRef: String, in source: MusicLibrarySource) async throws -> Data? {
+        try await artworkData(for: trackRef)
+    }
     func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool { throw MusicLibraryError.unsupported }
+    func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool {
+        try await setFavorite(trackRef, value: value)
+    }
 }
 
 public enum MusicLibraryError: Error, Equatable, Sendable, LocalizedError {

@@ -22,16 +22,11 @@ struct PlaybackOptionsTests {
     }
 
     @Test("固定读写模板均可编译；参数不含用户文本且拒绝越界音量")
-    func compilesFixedScriptsWithoutExecuting() throws {
+    func compilesFixedScriptsWithoutExecuting() async throws {
         let commands: [PlaybackOptionsCommand] = [.read, .volume(0), .volume(100), .shuffle(true), .shuffle(false),
                                                   .repeatMode(.off), .repeatMode(.all), .repeatMode(.one)]
         for command in commands {
-            try MusicAppleScriptExecution.withLock {
-                let source = try AppleScriptPlaybackOptionsExecutor.source(for: command)
-                let script = try #require(NSAppleScript(source: source))
-                var errorInfo: NSDictionary?
-                #expect(script.compileAndReturnError(&errorInfo), "固定播放选项模板应通过编译")
-            }
+            try await MusicScriptTestExecution.compile(AppleScriptPlaybackOptionsExecutor.source(for: command))
         }
         #expect(throws: PlaybackOptionsError.invalidVolume) {
             try AppleScriptPlaybackOptionsExecutor.source(for: .volume(-1))
@@ -46,8 +41,10 @@ struct PlaybackOptionsTests {
         let results = try await withThrowingTaskGroup(of: Int32.self) { group in
             for index in 1...32 {
                 group.addTask {
-                    try MusicAppleScriptExecution.withLock {
-                        let script = try #require(NSAppleScript(source: "return \(index) * 7"))
+                    try await MusicScriptTestExecution.run {
+                        guard let script = NSAppleScript(source: "return \(index) * 7") else {
+                            throw MusicScriptTestExecution.Failure.construction
+                        }
                         var errorInfo: NSDictionary?
                         guard script.compileAndReturnError(&errorInfo) else { throw ScriptLifetimeFailure.compile }
                         let result = script.executeAndReturnError(&errorInfo)

@@ -92,6 +92,10 @@ struct ControlCommandTests {
         let executor = FakeMusicScriptExecutor()
         let controller = makeController(executor)
         controller.dispose()
+        await #expect(throws: CancellationError.self) { try await controller.play() }
+        await #expect(throws: CancellationError.self) { try await controller.pause() }
+        await #expect(throws: CancellationError.self) { try await controller.seek(positionMs: 100) }
+        await #expect(throws: CancellationError.self) { try await controller.playTrackRef(Fixtures.refA) }
         await #expect(throws: CancellationError.self) { try await controller.next() }
         await #expect(throws: CancellationError.self) { try await controller.previous() }
         #expect(executor.recordedCommands.isEmpty)
@@ -116,33 +120,38 @@ struct ControlCommandTests {
         }
     }
 
-    @Test("playTrackRef：合法 persistent ID 交给点播执行器；随后读回一次")
+    @Test("playTrackRef复用完整资料库上下文，不调用单曲执行器")
     func playTrackRefDispatches() async throws {
         let executor = FakeMusicScriptExecutor()
-        let locator = FakeMusicScriptExecutor()
-        let controller = makeController(executor, locator: locator)
+        let fixture = ContextFixture()
+        let domain = "ShinMusicScript.legacy-play-test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: domain)!
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let controller = MusicScriptPlaybackController(executor: executor,
+            playbackContext: MusicPlaybackContext(executor: fixture, defaults: defaults),
+            libraryReader: LegacyPlaybackReader(tracks: [
+                MusicLibraryTrack(persistentID: Fixtures.pidB, title: "原创前曲"),
+                MusicLibraryTrack(persistentID: Fixtures.pidA, title: "原创目标")
+            ]))
         try await controller.playTrackRef(Fixtures.refA)
-        #expect(locator.recordedPlayedPersistentIDs == [Fixtures.pidA])
-        #expect(executor.recordedPlayedPersistentIDs.isEmpty) // 主执行器不承担点播
-        #expect(locator.recordedReadCount == 0) // 读回走主执行器
+        #expect(fixture.currentIDs == [Fixtures.pidA, Fixtures.pidB] && fixture.playedID == Fixtures.pidA)
+        #expect(executor.recordedPlayedPersistentIDs.isEmpty)
         #expect(executor.recordedReadCount >= 1)
     }
 
-    @Test("playTrackRef：命名空间/白名单不符或定位不到 → trackUnavailable")
+    @Test("playTrackRef：命名空间、白名单或完整快照中不存在均拒绝")
     func playTrackRefRejections() async {
-        let locator = FakeMusicScriptExecutor()
-        let controller = makeController(FakeMusicScriptExecutor(), locator: locator)
-        await #expect(throws: PlaybackError.trackUnavailable) {
-            try await controller.playTrackRef("apple-music:catalog:us:1")
+        let domain = "ShinMusicScript.legacy-reject-test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: domain)!
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let fixture = ContextFixture()
+        let controller = MusicScriptPlaybackController(executor: FakeMusicScriptExecutor(),
+            playbackContext: MusicPlaybackContext(executor: fixture, defaults: defaults),
+            libraryReader: LegacyPlaybackReader(tracks: []))
+        for ref in ["apple-music:catalog:us:1", "music-script:persistent:NO$T", Fixtures.refA] {
+            await #expect(throws: PlaybackError.trackUnavailable) { try await controller.playTrackRef(ref) }
         }
-        await #expect(throws: PlaybackError.trackUnavailable) {
-            try await controller.playTrackRef("music-script:persistent:NO$T")
-        }
-        locator.failCommand("playPersistentID", with: .trackNotFound)
-        await #expect(throws: PlaybackError.trackUnavailable) {
-            try await controller.playTrackRef(Fixtures.refA)
-        }
-        #expect(locator.recordedPlayedPersistentIDs == [Fixtures.pidA]) // 仅第三次到达执行器
+        #expect(fixture.operations.isEmpty)
     }
 
     @Test("Mock 点播契约：未知 trackRef 如实抛 trackUnavailable")
@@ -205,6 +214,7 @@ struct DisposeAndSubscriptionTests {
         controller.dispose()
         let published = controller.refreshOnce()
         #expect(published == false)
+        #expect(executor.recordedReadCount == 0)
         #expect(counter.notificationCount == 0)
         // 快照读取仍安全（返回最后状态，不再有新采样）。
         _ = controller.snapshot()
@@ -234,5 +244,14 @@ struct DisposeAndSubscriptionTests {
         #expect(controller.snapshot().trackRef == Fixtures.refA)
         #expect(executor.recordedReadCount >= 1)
         controller.dispose()
+    }
+}
+
+private struct LegacyPlaybackReader: MusicLibraryScriptReading {
+    var tracks: [MusicLibraryTrack]
+    func readPlaylists(cancellation: MusicLibraryCancellation) throws -> [MusicLibraryPlaylist] { [] }
+    func readTracks(in source: MusicLibrarySource, cancellation: MusicLibraryCancellation) throws -> [MusicLibraryTrack] {
+        try cancellation.check()
+        return tracks
     }
 }

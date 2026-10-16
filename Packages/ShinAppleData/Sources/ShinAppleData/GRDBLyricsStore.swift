@@ -8,7 +8,7 @@ import ShinAppleKit
 //   未落盘"的半成品状态不可能出现（外键 restrict 另加一层防护）；
 // - revision 乐观并发：更新要求 submittedRevision == storedRevision + 1，
 //   过期提交抛类型化冲突错误，绝不静默覆盖；
-// - 时间同步与本包零耦合：包内没有任何定时器/监听器/播放依赖，
+// - 时间同步与本包零耦合：包内没有播放依赖，变化通知只监视本地存储，
 //   播放侧调用读取接口不会触发写入。
 //
 // 注入失败点（SaveFailurePoint）仅供测试通过 internal 通道使用，

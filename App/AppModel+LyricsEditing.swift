@@ -56,13 +56,30 @@ extension AppModel {
         lyricsPanel?.setAutoScrollSuspended(isImportPresented || isLyricsEditorPresented)
     }
 
-    /// 解除当前曲目的歌词关联（文档保留在库中）。
-    func unlinkCurrentLyrics() {
-        guard let trackKey = currentTrackKey else { return }
-        let epoch = snapshot.trackEpoch
-        Task { [weak self] in
-            guard let self, self.currentTrackKey == trackKey, self.snapshot.trackEpoch == epoch else { return }
-            await self.lyricsPanel?.unlink(trackKey: trackKey, trackEpoch: epoch)
+    /// 固定用户确认的文档与版本；换歌、换库或编辑后的旧确认不会生效。
+    func unlinkCurrentLyrics(_ confirmed: LyricsUnlinkRequest? = nil) {
+        guard let target = confirmed ?? LyricsUnlinkRequest(model: self), target.matches(self),
+              let panel = lyricsPanel else { return }
+        Task { [weak self, weak panel] in
+            guard let self, let panel, target.matches(self), self.lyricsPanel === panel,
+                  let library = self.library, library.beginAssociationDeletion() else { return }
+            defer { library.finishAssociationDeletion() }
+            let autoFetch = self.autoFetch
+            let shouldResume: Bool
+            do {
+                shouldResume = try await autoFetch?.suspendForResourceDeletion(trackKeys: [target.trackKey]) ?? false
+            } catch {
+                if target.matches(self) { self.playbackMessage = "无法清理歌词：\(ErrorText.describe(error))" }
+                return
+            }
+            defer { if self.autoFetch === autoFetch, shouldResume { autoFetch?.resume() } }
+            guard target.matches(self), self.lyricsPanel === panel else { return }
+            let changed = await panel.unlink(
+                trackKey: target.trackKey, trackEpoch: target.trackEpoch,
+                documentId: target.documentId, revision: target.revision
+            )
+            guard changed, self.lyricsPanel === panel else { return }
+            await self.library?.refresh()
         }
     }
 }

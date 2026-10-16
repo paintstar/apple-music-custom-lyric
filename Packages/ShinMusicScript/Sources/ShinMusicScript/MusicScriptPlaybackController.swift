@@ -2,24 +2,17 @@ import Foundation
 import os
 import ShinAppleKit
 
-// MARK: - Music 脚本播放适配器
-
 /// 「音乐」App 脚本适配器：满足现有 PlaybackController 契约。
 ///
 /// 设计要点：
 /// - **采样制**：真实时间只来自脚本采样（`player position`），不用计时器累加
 ///   冒充进度；秒→整数毫秒换算只在适配器边界（MusicScriptMapping.secondsToMs）。
-/// - **快照扩展字段**：seq/sessionEpoch/trackRef/sampledAtMonotonicMs/
-///   requestDurationMs/capabilities 描述采样时机与执行能力；未知值 nil。
-/// - **切歌识别**：persistent ID 变化 → trackEpoch 递增；同批读取前后身份
-///   不一致的快照整批丢弃（不组装 A 歌名 + B 进度的混合快照）。
-/// - **命令不冒充成功**：play/pause/next/previous/seek 发出后立即触发一次
-///   读回，结果以随后的快照为准；失败抛 domain 错误。
-/// - **错误分类**：权限拒绝（-1743）、Music 未启动、无曲目、超时、单字段
-///   不可用、命令不支持分别映射（MusicScriptMapping）。
+/// - 快照携带采样时机、会话与能力信息；未知值 nil。
+/// - persistent ID 变化时递增 trackEpoch；同批身份变化的快照整批丢弃。
+/// - 命令发送后读回，结果以快照为准；错误由 MusicScriptMapping 分类。
 ///
 /// 线程模型：与 MockPlaybackController 相同——状态锁内合并、锁外分发；
-/// 执行器（SBApplication/NSAppleScript 非线程安全）由专用执行锁串行化，
+/// 执行器先进入 OSA 调度门，再获取专用执行锁；独立封面实例有自己的执行锁。
 /// 仅控制命令允许在执行锁内短读 disposed；禁止持状态锁等待执行锁，回调始终在锁外。
 public final class MusicScriptPlaybackController: PlaybackController, @unchecked Sendable {
 
@@ -52,17 +45,16 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     private static let sessionCounter = OSAllocatedUnfairLock(initialState: 0)
 
     private let executor: MusicScriptExecutor
-    /// 点播执行器（按 persistent ID 定位音乐库曲目；AppleScript whose 模板）。
-    private let libraryLocator: MusicScriptExecutor
     /// 执行锁：保证 SBApplication/NSAppleScript 的串行访问（不嵌套状态锁）。
     private let executorLock = NSLock()
-    private let playbackCommandQueue = DispatchQueue(label: "ShinMusicScript.playback-commands", qos: .userInitiated)
-    private let playbackContext = MusicPlaybackContext()
+    private let playbackCommandQueue = MusicPlaybackCommandQueue()
+    private let artworkAccess: MusicCurrentArtworkAccess
+    private var playbackContext = MusicPlaybackContext()
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let samplingIntervalNanos: UInt64
     private let sessionEpoch: Int
     /// 重型资料库读取有自己的串行执行器，不能阻塞播放采样锁。
-    let libraryCache = MusicLibraryCache()
+    private(set) var libraryCache = MusicLibraryCache()
     /// 本适配器实现 Music 词典中的播放、切歌和跳转命令；
     /// 命令能否执行仍受授权、曲目与当前播放器状态约束。
     private let capabilities = PlaybackCapabilities(
@@ -71,17 +63,18 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
 
     /// - Parameters:
     ///   - executor: 主执行器（生产环境为 ScriptingBridgeExecutor）。
-    ///   - libraryLocator: 点播执行器（生产环境为 AppleScriptExecutor；nil 复用主执行器）。
+    ///   - libraryLocator: 保留旧构造参数以兼容调用方；点播统一使用完整播放上下文。
     ///   - samplingIntervalMs: 采样间隔；测试可传极小值并手动调用 refreshOnce。
     ///   - startsSampler: false 时不启动自动采样（单元测试确定性使用）。
     public init(
         executor: MusicScriptExecutor,
         libraryLocator: MusicScriptExecutor? = nil,
+        artworkProvider: (any MusicArtworkProviding)? = nil,
         samplingIntervalMs: Int = MusicScriptPlaybackController.defaultSamplingIntervalMs,
         startsSampler: Bool = true
     ) {
         self.executor = executor
-        self.libraryLocator = libraryLocator ?? executor
+        self.artworkAccess = MusicCurrentArtworkAccess(executor: executor, provider: artworkProvider, executorLock: executorLock)
         self.samplingIntervalNanos = UInt64(max(samplingIntervalMs, 1)) * 1_000_000
         self.sessionEpoch = Self.sessionCounter.withLock { current in
             current += 1
@@ -95,6 +88,14 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         if startsSampler {
             beginSampling()
         }
+    }
+
+    /// 内部测试注入仅替换临时歌单执行器，不向测试发送真实 Music 事件。
+    convenience init(executor: MusicScriptExecutor, playbackContext: MusicPlaybackContext,
+                     libraryReader: (any MusicLibraryScriptReading)? = nil) {
+        self.init(executor: executor, startsSampler: false)
+        self.playbackContext = playbackContext
+        if let libraryReader { self.libraryCache = MusicLibraryCache(reader: libraryReader) }
     }
 
     deinit {
@@ -112,10 +113,7 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
             }
         }
         state.withLock { s in
-            guard !s.disposed else {
-                task.cancel()
-                return
-            }
+            guard !s.disposed else { task.cancel(); return }
             s.samplingTask = task
         }
     }
@@ -124,10 +122,15 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     /// 返回 false 表示已 dispose（采样循环退出条件）。
     @discardableResult
     private func sampleOnce() -> Bool {
+        guard !state.withLock({ $0.disposed }) else { return false }
         let startedAt = DispatchTime.now()
-        let outcome: MusicSnapshotOutcome = executorLock.withLock {
-            executor.readSnapshot()
+        let outcome: MusicSnapshotOutcome? = MusicAppleScriptExecution.withSamplingLock {
+            executorLock.withLock {
+                guard !state.withLock({ $0.disposed }) else { return nil }
+                return executor.readSnapshot()
+            }
         }
+        guard let outcome else { return false }
         let requestDurationMs = Int64(
             DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds
         ) / 1_000_000
@@ -175,11 +178,11 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     }
 
     public func play() async throws {
-        try performCommand { try self.executor.play() }
+        try await performTransportCommand { try self.executor.play() }
     }
 
     public func pause() async throws {
-        try performCommand { try self.executor.pause() }
+        try await performTransportCommand { try self.executor.pause() }
     }
 
     public func seek(positionMs ms: Int64) async throws {
@@ -190,7 +193,7 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
             clampedMs = min(clampedMs, durationMs)
         }
         let seconds = Double(clampedMs) / 1_000
-        try performCommand { try self.executor.seek(toSeconds: seconds) }
+        try await performTransportCommand { try self.executor.seek(toSeconds: seconds) }
     }
 
     public func next() async throws {
@@ -210,57 +213,40 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
             return task
         }
         task?.cancel()
+        playbackCommandQueue.cancelAll()
     }
 
-    /// v2 点播预留（契约要求覆写默认实现）：按
-    /// `music-script:persistent:<persistentID>` 在音乐库定位曲目并播放；
-    /// 命名空间/白名单不符或定位不到抛 trackUnavailable。
-    public func playTrackRef(_ trackRef: String) async throws {
-        guard let persistentID = MusicScriptMapping.persistentID(fromTrackRef: trackRef) else {
-            throw PlaybackError.trackUnavailable
-        }
-        do {
-            try executorLock.withLock {
-                try libraryLocator.playPersistentID(persistentID)
-            }
-        } catch let failure as MusicScriptFailure {
-            throw MusicScriptMapping.playbackError(for: failure)
-        } catch {
-            throw PlaybackError.unknown("music:unknown:\(String(describing: error))")
-        }
-        sampleOnce()
-    }
-
-    /// 仅给已通过白名单的库点播模板使用；短控制命令与采样串行，读库本身不走此锁。
-    func performLibraryPlay(_ script: String) async throws {
+    public func cleanupManagedPlaylistsOnQuit() async throws {
+        // 先关闭新播放入口；清理与已经排队的播放共用串行队列，可在 dispose 后调用。
+        dispose()
         try Task.checkCancellation()
         let cancellation = MusicLibraryCancellation()
-        do {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    playbackCommandQueue.async { [self] in
-                        do {
-                            try cancellation.check()
-                            try executorLock.withLock {
-                                try cancellation.check()
-                                guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
-                                let result = try MusicLibraryScriptExecution.execute(script, cancellation: cancellation)
-                                guard result.stringValue == "ok" else { throw MusicLibraryError.sourceUnavailable }
-                            }
-                            _ = sampleOnce()
-                            continuation.resume()
-                        } catch {
-                            continuation.resume(throwing: error)
-                        }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                playbackCommandQueue.async(cancellation: cancellation, allowsAfterDisposal: true) { [self] in
+                    do {
+                        try playbackContext.cleanupOnQuit { try cancellation.check() }
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
                     }
                 }
-                try Task.checkCancellation()
-            } onCancel: {
-                cancellation.cancel()
             }
-        } catch let failure as MusicScriptFailure {
-            throw MusicScriptMapping.playbackError(for: failure)
+            try Task.checkCancellation()
+        } onCancel: { cancellation.cancel() }
+    }
+
+    /// 兼容单曲入口也先获取完整资料库，再通过统一上下文整单播放。
+    /// 命名空间、白名单不符或完整快照中不存在时抛 trackUnavailable。
+    public func playTrackRef(_ trackRef: String) async throws {
+        guard MusicScriptMapping.persistentID(fromTrackRef: trackRef) != nil else {
+            throw PlaybackError.trackUnavailable
         }
+        try Task.checkCancellation()
+        guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+        let refs = try await libraryCache.playbackTrackRefs(in: .library)
+        guard refs.contains(trackRef) else { throw PlaybackError.trackUnavailable }
+        try await playTracks(refs, startingAt: trackRef, in: .library, shuffleEnabled: nil)
     }
 
     func performContextCommand(
@@ -271,16 +257,19 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         do {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    playbackCommandQueue.async { [self] in
+                    playbackCommandQueue.async(cancellation: cancellation) { [self] in
                         do {
+                            try cancellation.check()
+                            guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
                             try operation(playbackContext) {
                                 try cancellation.check()
                                 guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
                             }
+                            try cancellation.check()
                             _ = sampleOnce()
                             continuation.resume()
                         } catch {
-                            _ = sampleOnce()
+                            if !(error is CancellationError) { _ = sampleOnce() }
                             continuation.resume(throwing: error)
                         }
                     }
@@ -292,20 +281,13 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         }
     }
 
-    // MARK: - 封面
-
-    /// 读当前曲目封面（执行锁内同批读取 persistent ID + 图像，与快照采样
-    /// 串行化，不与 SBApplication 并发）。执行器不具备封面能力
-    /// （Mock / AppleScript 兜底）时返回 nil——调用方走占位渐变，不阻塞。
-    public func fetchCurrentTrackArtwork() -> MusicArtworkResult? {
-        guard let provider = executor as? MusicArtworkProviding else { return nil }
-        return executorLock.withLock {
-            provider.readCurrentTrackArtwork()
+    /// 独立 SB 实例同批校验身份；排队期间取消或 dispose 的旧封面不再发送事件。
+    public func fetchCurrentTrackArtwork(shouldCancel: () -> Bool = { false }) -> MusicArtworkResult? {
+        artworkAccess.fetch {
+            shouldCancel() || state.withLock({ $0.disposed })
         }
     }
 }
-
-// MARK: - 命令发出与读回
 
 extension MusicScriptPlaybackController {
 
@@ -317,12 +299,15 @@ extension MusicScriptPlaybackController {
         do {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    playbackCommandQueue.async { [self] in
+                    playbackCommandQueue.async(cancellation: cancellation) { [self] in
                         do {
-                            try executorLock.withLock {
-                                try cancellation.check()
-                                guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
-                                try body()
+                            try cancellation.check()
+                            try MusicAppleScriptExecution.withCancellableLock {
+                                try executorLock.withLock {
+                                    try cancellation.check()
+                                    guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+                                    try body()
+                                }
                             }
                             try cancellation.check()
                             guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
@@ -344,20 +329,6 @@ extension MusicScriptPlaybackController {
         } catch {
             throw PlaybackError.unknown("music:unknown:\(String(describing: error))")
         }
-    }
-
-    /// 命令发出（执行锁内）→ 立即读回一次快照（命令发出不冒充成功）。
-    private func performCommand(_ body: @escaping () throws -> Void) throws {
-        do {
-            try executorLock.withLock {
-                try body()
-            }
-        } catch let failure as MusicScriptFailure {
-            throw MusicScriptMapping.playbackError(for: failure)
-        } catch {
-            throw PlaybackError.unknown("music:unknown:\(String(describing: error))")
-        }
-        sampleOnce()
     }
 }
 

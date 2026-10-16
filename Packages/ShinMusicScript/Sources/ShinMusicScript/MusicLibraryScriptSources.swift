@@ -17,6 +17,13 @@ enum MusicLibraryScriptSources {
         case dateAdded = "date added"
     }
 
+    /// Music.sdef 的公开 eSpK 枚举值。没有公开的“喜爱歌曲”类型，不按名称或私有值猜测。
+    enum PlaylistKind: UInt32 {
+        case folder = 0x6B53_7046 // kSpF
+        case library = 0x6B53_704C // kSpL
+        case music = 0x6B53_705A // kSpZ
+    }
+
     enum PlaylistColumn: String {
         case persistentID = "persistent ID"
         case name
@@ -56,23 +63,19 @@ enum MusicLibraryScriptSources {
         """)
     }
 
-    static func play(persistentID: String, in source: MusicLibrarySource) throws -> String {
+    static func artwork(persistentID: String, in source: MusicLibrarySource = .library) throws -> String {
         guard SongBinding.isValidPersistentID(persistentID) else { throw MusicLibraryError.invalidRequest }
-        return try wrap("""
-        \(selection(source))
-        set matchedTracks to (tracks of targetPlaylist whose persistent ID is "\(persistentID)")
-        if (count of matchedTracks) is 0 then error number -1728
-        play (item 1 of matchedTracks)
-        return "ok"
-        """)
-    }
-
-    static func artwork(persistentID: String) throws -> String {
-        try wrap("""
-        \(trackSelection(persistentID))
-        if (count of artworks of targetTrack) is 0 then return missing value
+        let playlist: String
+        switch source {
+        case .library: playlist = "library playlist 1"
+        case let .playlist(id):
+            guard SongBinding.isValidPersistentID(id) else { throw MusicLibraryError.invalidRequest }
+            playlist = "(first user playlist whose persistent ID is \"\(id)\")"
+        }
+        // 完整限定的引用只发一次 raw data 查询，不先 get 曲目或计数，减少在途阻塞。
+        return wrap("""
         try
-            return raw data of artwork 1 of targetTrack
+            return raw data of artwork 1 of (first track of \(playlist) whose persistent ID is "\(persistentID)")
         on error number errorNumber
             if errorNumber is -1728 then return missing value
             error number errorNumber
@@ -80,18 +83,29 @@ enum MusicLibraryScriptSources {
         """)
     }
 
-    static func favorite(persistentID: String, value: Bool) throws -> String {
+    static func favorite(persistentID: String, value: Bool, in source: MusicLibrarySource = .library) throws -> String {
         try wrap("""
-        \(trackSelection(persistentID))
+        \(trackSelection(persistentID, in: source))
+        set targetDatabaseID to database ID of targetTrack
+        set stableTracks to (tracks whose database ID is targetDatabaseID)
+        if (count of stableTracks) is 0 then error number -1728
+        set targetTrack to item 1 of stableTracks
+        if (persistent ID of targetTrack) is not "\(persistentID)" then error number -1728
         set favorited of targetTrack to \(value ? "true" : "false")
-        return favorited of targetTrack
+        -- 取消喜爱可能使原歌单成员立即消失；重新从 application 的公开 track 集合定位。
+        set stableTracks to (tracks whose database ID is targetDatabaseID)
+        if (count of stableTracks) is 0 then error number -1728
+        set confirmedTrack to item 1 of stableTracks
+        if (persistent ID of confirmedTrack) is not "\(persistentID)" then error number -1728
+        return favorited of confirmedTrack
         """)
     }
 
-    private static func trackSelection(_ id: String) throws -> String {
+    private static func trackSelection(_ id: String, in source: MusicLibrarySource = .library) throws -> String {
         guard SongBinding.isValidPersistentID(id) else { throw MusicLibraryError.invalidRequest }
         return """
-        set matchedTracks to (tracks of library playlist 1 whose persistent ID is "\(id)")
+        \(try selection(source))
+        set matchedTracks to (tracks of targetPlaylist whose persistent ID is "\(id)")
         if (count of matchedTracks) is 0 then error number -1728
         set targetTrack to item 1 of matchedTracks
         """
@@ -127,7 +141,7 @@ enum MusicLibraryScriptSources {
 enum MusicLibraryScriptExecution {
     static func execute(_ source: String, cancellation: MusicLibraryCancellation? = nil,
                         checkCancellation: () throws -> Void = {}) throws -> NSAppleEventDescriptor {
-        try MusicAppleScriptExecution.withLock {
+        try MusicAppleScriptExecution.withCancellableLock {
             // 请求可能在等其它服务释放 OSA 时取消；获锁后必须重新检查才可发出事件。
             try cancellation?.check()
             try checkCancellation()

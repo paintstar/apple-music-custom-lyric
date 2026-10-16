@@ -126,18 +126,8 @@ struct MusicLibraryBrowserView: View {
     private func libraryHeader(width: CGFloat) -> some View {
         let side = min(220, max(96, width * 0.25))
         return HStack(alignment: .bottom, spacing: width < 500 ? 18 : 30) {
-            Group {
-                if browser.destination == .favorites {
-                    Color.white.opacity(0.90).overlay {
-                        Image(systemName: "star.fill").resizable().scaledToFit()
-                            .frame(width: side * 0.48, height: side * 0.48)
-                            .foregroundStyle(Color.appleMusicPink)
-                    }
-                } else {
-                    MusicLibraryArtworkView(browser: browser, trackRef: browser.displayedTracks.first?.trackRef,
-                                            symbol: browser.destination.symbol)
-                }
-            }
+            MusicLibraryArtworkView(browser: browser, trackRef: browser.displayedTracks.first?.trackRef,
+                                    symbol: browser.destination.symbol)
                 .frame(width: side, height: side)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .shadow(color: .black.opacity(0.10), radius: 12, x: 0, y: 5)
@@ -150,6 +140,9 @@ struct MusicLibraryBrowserView: View {
                 Text(browser.isFolder ? "播放列表文件夹" : "\(browser.displayedTracks.count) 首歌曲")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                if case .playlist = browser.destination, !browser.isFolder {
+                    playlistSortMenu
+                }
                 if browser.destination == .search {
                     Text("搜索已同步的歌曲、艺人和专辑。")
                         .font(.caption).foregroundStyle(.secondary)
@@ -193,6 +186,40 @@ struct MusicLibraryBrowserView: View {
         .padding(.bottom, 32)
     }
 
+    private var playlistSortMenu: some View {
+        let sort = browser.playlistSort
+        let original = sort.field == .returnedOrder
+        let ascendingTitle = original ? "正向" : "升序"
+        let descendingTitle = original ? "反向" : "降序"
+        return Menu {
+            Picker("排序依据", selection: Binding(get: { browser.playlistSort.field }, set: { field in
+                browser.setPlaylistSort(MusicLibraryPlaylistSort(field: field, ascending: field != .dateAdded))
+            })) {
+                ForEach(MusicLibraryPlaylistSort.Field.allCases, id: \.self) { field in
+                    Text(field.title).tag(field)
+                }
+            }
+            Picker("排列方向", selection: Binding(get: { browser.playlistSort.ascending }, set: { ascending in
+                browser.setPlaylistSort(MusicLibraryPlaylistSort(field: browser.playlistSort.field, ascending: ascending))
+            })) {
+                Text(ascendingTitle).tag(true)
+                Text(descendingTitle).tag(false)
+            }
+            Divider()
+            Text("排序仅作用于本应用，按歌单分别记住。")
+            Text("不会自动同步官方界面当前的排序。")
+            if sort.field == .dateAdded { Text("Music 提供的添加时间，不保证与官方最近添加显示或收藏时间一致。") }
+        } label: {
+            Label("\(sort.field.title) · \(sort.ascending ? ascendingTitle : descendingTitle)",
+                  systemImage: "arrow.up.arrow.down")
+                .font(.callout)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("播放列表排序")
+        .help("默认保留脚本返回的歌单顺序；添加时间由 Music 提供，不保证与官方最近添加显示或收藏时间一致。")
+    }
+
     private var tableHeader: some View {
         HStack(spacing: 12) {
             Text("歌曲").frame(maxWidth: .infinity, alignment: .leading)
@@ -208,7 +235,7 @@ struct MusicLibraryBrowserView: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(browser.lacksFavoriteMetadata ? "当前资料库没有提供喜爱标记。" : "这里还没有歌曲。")
+            Text("这里还没有歌曲。")
                 .font(.headline)
             Text(emptyExplanation).foregroundStyle(.secondary)
                 .font(.callout)
@@ -220,7 +247,6 @@ struct MusicLibraryBrowserView: View {
 
     private var emptyExplanation: String {
         if !browser.searchText.isEmpty { return "没有找到匹配内容。可以换一个关键词，或继续同步资料库中的其他歌曲。" }
-        if browser.destination == .favorites { return "在「音乐」App 中标记喜爱后，刷新这里即可查看。" }
         if browser.isPartial { return "当前分类中暂无已同步歌曲，继续同步可读取更多内容。" }
         return "在「音乐」App 中添加歌曲或播放列表后，点击右上角刷新。"
     }

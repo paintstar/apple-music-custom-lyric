@@ -38,5 +38,6 @@ done
     "${APP_SOURCES[@]}" \
     "$ROOT/scripts/player-ui-check.swift" "$ROOT/scripts/lyrics-motion-ui-check.swift" \
     "$ROOT/scripts/playback-progress-ui-check.swift" "$ROOT/scripts/playback-options-ui-check.swift" "${OBJECTS[@]}" \
+    "$ROOT/scripts/artwork-ui-check.swift" \
     -framework ScriptingBridge -lsqlite3 -o "$CHECK_DIR/player-ui-check"
 "$CHECK_DIR/player-ui-check" "$@"

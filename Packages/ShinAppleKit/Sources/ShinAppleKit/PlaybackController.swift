@@ -44,6 +44,10 @@ public protocol PlaybackController: AnyObject, Sendable {
     /// 释放全部监听与内部任务；调用后控制器不再发出任何通知。
     func dispose()
 
+    /// 退出清理：真实适配器先停止 Music 播放，只删除重新验证属于本应用且未修改的临时清单。
+    /// 可以在 dispose() 后调用；失败保留本机记录，以便下次重试。
+    func cleanupManagedPlaylistsOnQuit() async throws
+
     /// 通过项目内 trackRef 点播歌曲：
     /// （`music-script:persistent:<persistentID>`）在音乐库定位曲目并从其
     /// 开始播放。这是「从学习列表点播」的预留能力；默认实现如实抛
@@ -54,6 +58,9 @@ public protocol PlaybackController: AnyObject, Sendable {
 
 /// playTrackRef 的默认实现（无点播能力的适配器自动获得）。
 public extension PlaybackController {
+    /// 无 Music 临时清单的适配器无需操作官方播放器。
+    func cleanupManagedPlaylistsOnQuit() async throws {}
+
     func playTrackRef(_ trackRef: String) async throws {
         throw PlaybackError.trackUnavailable
     }

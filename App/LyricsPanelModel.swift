@@ -10,8 +10,7 @@ import ShinAppServices
 // - 浏览模式 FOLLOW/MANUAL：每次交互按设置重置等待，停止浏览后恢复跟随；
 //   编辑与视图消失会取消等待，旧任务不能影响新歌曲/新文档。
 // - 查询失败进入 unavailable 静态错误态并保留中文说明；
-//   唯一恢复入口是界面上用户显式点击的「重试」（LyricsPanelView），
-//   本模型没有任何定时/事件驱动的自动重试。
+//   用户可重试，宿主也可在本地库实际变更后刷新；不按播放采样循环重试。
 
 @MainActor
 final class LyricsPanelModel: ObservableObject {
@@ -214,20 +213,28 @@ final class LyricsPanelModel: ObservableObject {
         }
     }
 
-    /// 解除当前曲目的关联（文档保留）。解除后回到可导入空态。
-    func unlink(trackKey: String, trackEpoch: Int) async {
+    /// 只解除已确认的关联；最后一个引用解除时一并删除歌词和译文。
+    /// 事务重验文档版本，旧请求不能删除后来导入或编辑的内容。
+    @discardableResult
+    func unlink(trackKey: String, trackEpoch: Int, documentId: UUID, revision: Int) async -> Bool {
+        guard displayedTrackKey == trackKey, displayedTrackEpoch == trackEpoch,
+              currentDocumentId == documentId, currentDocument?.revision == revision,
+              let service else { return false }
         sequence += 1
         let currentSequence = sequence
-        guard let service else { return }
         do {
-            try await service.deleteBinding(forTrackKey: trackKey)
+            try await service.deleteAssociation(
+                forTrackKey: trackKey, expectedDocumentId: documentId, expectedRevision: revision
+            )
         } catch {
-            guard currentSequence == sequence else { return }
+            guard currentSequence == sequence else { return false }
             state = .unavailable(ErrorText.describe(error))
-            return
+            return false
         }
-        guard currentSequence == sequence else { return }
-        await refresh(trackKey: trackKey, trackEpoch: trackEpoch)
+        if currentSequence == sequence {
+            await refresh(trackKey: trackKey, trackEpoch: trackEpoch)
+        }
+        return true
     }
 
     // MARK: - 同步显示
@@ -391,12 +398,12 @@ final class LyricsPanelModel: ObservableObject {
     /// 当前展示的歌词文档 id（ready / untimedOnly 状态下非空）。
     /// 编辑器打开入口使用（编辑对象在打开时固定为该文档）。
     /// 过渡期间为 nil：置灰展示的旧文档不作为编辑/解除关联目标。
-    var currentDocumentId: UUID? {
+    var currentDocumentId: UUID? { currentDocument?.id }
+
+    var currentDocument: LyricDocument? {
         switch state {
-        case let .ready(document):
-            return document.id
-        case let .untimedOnly(document):
-            return document.id
+        case let .ready(document), let .untimedOnly(document):
+            return document
         case .unavailable, .noTrack, .loading, .unbound, .transitioning:
             return nil
         }

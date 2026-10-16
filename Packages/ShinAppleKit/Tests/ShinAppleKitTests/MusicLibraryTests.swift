@@ -25,9 +25,10 @@ struct MusicLibraryTests {
     @Test("可见喜爱列表建立真实上下文，下一首/上一首和结束续播都不扩展到全库")
     func filteredPlaybackContext() async throws {
         let player = MockPlaybackController()
-        let favorites = MockMusicLibrary.tracks.filter { $0.isFavorite == true }
+        let nativeSource = MusicLibrarySource.playlist(id: "B000000000000005")
+        let favorites = try await player.loadTracks(in: nativeSource, offset: 0, limit: 200).tracks
         let refs = favorites.map(\.trackRef)
-        try await player.playTracks(refs, startingAt: refs[0], in: .library, shuffleEnabled: true)
+        try await player.playTracks(refs, startingAt: refs[0], in: nativeSource, shuffleEnabled: true)
         let source = try #require(try await player.currentPlaybackSource())
         #expect(source != .library)
         #expect(try await player.readOptions().shuffleEnabled == true)
@@ -96,6 +97,11 @@ struct MusicLibraryTests {
         let page = try await player.loadTracks(in: .library, offset: 0, limit: 200)
         #expect(page.tracks[0].isFavorite == false)
         #expect(page.tracks[2].isFavorite == true)
+        let source = MusicLibrarySource.playlist(id: "B000000000000005")
+        let favorites = try await player.loadTracks(in: source, offset: 0, limit: 200).tracks
+        #expect(favorites.map(\.trackRef) == [MockMusicLibrary.tracks[2].trackRef])
+        #expect(try await player.setFavorite(favorites[0].trackRef, value: false, in: source) == false)
+        #expect(try await player.loadTracks(in: source, offset: 0, limit: 200).tracks.isEmpty)
         #expect(try await player.artworkData(for: target) == nil)
         await #expect(throws: MusicLibraryError.sourceUnavailable) {
             try await player.setFavorite("untrusted-input", value: true)

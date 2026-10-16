@@ -5,6 +5,32 @@ import ShinAppleKit
 @testable import ShinMusicScript
 
 struct MusicLibraryDescriptorTests {
+    @Test("侧栏仅排除公开Library/Music容器，普通、folder和未知特殊歌单保留")
+    func playlistContainerKinds() {
+        #expect(!MusicLibraryDescriptorParser.isVisiblePlaylistKind(NSAppleEventDescriptor(enumCode: 0x6B53_704C)))
+        #expect(!MusicLibraryDescriptorParser.isVisiblePlaylistKind(NSAppleEventDescriptor(enumCode: 0x6B53_705A)))
+        for code: UInt32 in [0x6B4E_6F6E, 0x6B53_7046, 0x6B53_7047, 0x6B53_704D, 0x756E_6B6E] {
+            #expect(MusicLibraryDescriptorParser.isVisiblePlaylistKind(NSAppleEventDescriptor(enumCode: code)))
+        }
+    }
+
+    @Test("点星模板使用真实来源，再从application按database ID读回，编译不执行事件")
+    func playlistFavoriteScriptCompiles() async throws {
+        for value in [true, false] {
+            let source = try MusicLibraryScriptSources.favorite(persistentID: Fixtures.pidA, value: value,
+                                                               in: .playlist(id: Fixtures.pidB))
+            #expect(source.contains("user playlists whose persistent ID"))
+            #expect(!source.contains("library playlist 1"))
+            #expect(source.components(separatedBy: "tracks whose database ID is targetDatabaseID").count == 3)
+            #expect(source.contains("return favorited of confirmedTrack"))
+            try await MusicScriptTestExecution.compile(source)
+        }
+        #expect(throws: MusicLibraryError.invalidRequest) {
+            try MusicLibraryScriptSources.favorite(persistentID: Fixtures.pidA, value: true,
+                                                   in: .playlist(id: "invalid-id"))
+        }
+    }
+
     @Test("当前播放来源只识别公开资料库/歌单类型，缺失为未知，异常不可猜测")
     func parsesCurrentPlaybackSource() throws {
         func sourceList(_ texts: [String]) -> NSAppleEventDescriptor {
@@ -28,11 +54,8 @@ struct MusicLibraryDescriptorTests {
     }
 
     @Test("当前播放列表固定模板通过本机公开词典编译，不执行 Music 事件")
-    func currentPlaybackSourceScriptCompiles() throws {
-        let script = try #require(NSAppleScript(source: MusicLibraryScriptSources.currentPlaybackSource))
-        var error: NSDictionary?
-        #expect(script.compileAndReturnError(&error))
-        #expect(error == nil)
+    func currentPlaybackSourceScriptCompiles() async throws {
+        try await MusicScriptTestExecution.compile(MusicLibraryScriptSources.currentPlaybackSource)
     }
 
     private func columns() -> [MusicLibraryScriptSources.TrackColumn: [NSAppleEventDescriptor]] {
@@ -86,20 +109,33 @@ struct MusicLibraryDescriptorTests {
             try MusicLibraryScriptSources.trackColumn(.title, in: .playlist(id: attack))
         }
         #expect(throws: MusicLibraryError.invalidRequest) {
-            try MusicLibraryScriptSources.play(persistentID: attack, in: .library)
+            try MusicPlaybackContextScripts.playSource(.library, expectedIDs: [attack], at: attack)
         }
         #expect(throws: MusicLibraryError.invalidRequest) {
             try MusicLibraryScriptSources.favorite(persistentID: attack, value: true)
         }
-        let source = try MusicLibraryScriptSources.play(persistentID: Fixtures.pidA, in: .playlist(id: Fixtures.pidB))
+        let source = try MusicPlaybackContextScripts.playSource(.playlist(id: Fixtures.pidB),
+                                                                expectedIDs: [Fixtures.pidA], at: Fixtures.pidA)
         #expect(source.contains("user playlists whose persistent ID"))
-        #expect(source.contains("tracks of targetPlaylist whose persistent ID"))
+        #expect(source.contains("play targetPlaylist without once"))
         #expect(source.contains("with timeout of 4 seconds"))
         #expect(!source.contains("activate"))
     }
 }
 
 struct MusicLibraryCacheTests {
+    @Test("单曲兼容入口读取完整新快照，不能覆盖浏览页正在使用的分页快照")
+    func standalonePlaybackReadPreservesPagingSnapshot() async throws {
+        let reader = LibraryReaderFixture()
+        let cache = MusicLibraryCache(reader: reader)
+        let first = try await cache.loadTracks(in: .library, offset: 0, limit: 2)
+        let refs = try await cache.playbackTrackRefs(in: .playlist(id: Fixtures.pidB))
+        let second = try await cache.loadTracks(in: .library, offset: 2, limit: 2)
+        #expect(refs == MockMusicLibrary.tracks.map(\.trackRef))
+        #expect(first.tracks + second.tracks == MockMusicLibrary.tracks)
+        #expect(reader.reads == 2)
+    }
+
     @Test("内存分页复用单次一致快照，换源时旧后续页必须拒绝")
     func pagesUseOneSnapshot() async throws {
         let reader = LibraryReaderFixture()
@@ -159,10 +195,11 @@ struct MusicLibraryCacheTests {
         #expect(reader.artworkReads == 0)
     }
 
-    @Test("无封面也缓存，喜爱设置以后端读回为准并修正当前分页缓存")
+    @Test("短期缺失封面合并查询，喜爱设置以后端读回为准并修正当前分页缓存")
     func artworkAndFavoriteReadback() async throws {
         let reader = LibraryReaderFixture()
-        let cache = MusicLibraryCache(reader: reader)
+        let now = ContinuousClock.now
+        let cache = MusicLibraryCache(reader: reader, artworkNow: { now })
         let target = MockMusicLibrary.tracks[2].trackRef
         _ = try await cache.loadTracks(in: .library, offset: 0, limit: 2)
         #expect(try await cache.artworkData(for: target) == nil)
@@ -175,12 +212,22 @@ struct MusicLibraryCacheTests {
         #expect(reader.favoriteWrites == 1)
     }
 
+    @Test("点星传递真实歌单来源给脚本读取器，不回退全库")
+    func favoriteSourceIsPreserved() async throws {
+        let reader = LibraryReaderFixture()
+        let cache = MusicLibraryCache(reader: reader)
+        let source = MusicLibrarySource.playlist(id: Fixtures.pidB)
+        #expect(try await cache.setFavorite(MockMusicLibrary.tracks[0].trackRef, value: true, in: source) == false)
+        #expect(reader.favoriteSources == [source])
+    }
+
     @Test("dispose 后库点播任务不得执行脚本")
     func disposedPlaybackDoesNotExecuteScript() async {
         let controller = MusicScriptPlaybackController(executor: FakeMusicScriptExecutor(), startsSampler: false)
         controller.dispose()
         await #expect(throws: CancellationError.self) {
-            try await controller.performLibraryPlay("故意不可编译；必须在执行前取消")
+            try await controller.playTracks([Fixtures.refA], startingAt: Fixtures.refA,
+                                            in: .library, shuffleEnabled: nil)
         }
     }
 
@@ -199,12 +246,14 @@ private final class LibraryReaderFixture: MusicLibraryScriptReading, @unchecked 
     private var readCount = 0
     private var artworkReadCount = 0
     private var favoriteWriteCount = 0
+    private var writtenSources: [MusicLibrarySource] = []
     private let delayLibrary: Bool
 
     init(delayLibrary: Bool = false) { self.delayLibrary = delayLibrary }
     var reads: Int { lock.withLock { readCount } }
     var artworkReads: Int { lock.withLock { artworkReadCount } }
     var favoriteWrites: Int { lock.withLock { favoriteWriteCount } }
+    var favoriteSources: [MusicLibrarySource] { lock.withLock { writtenSources } }
     func release() { lock.withLock { released = true } }
     func readPlaylists(cancellation: MusicLibraryCancellation) throws -> [MusicLibraryPlaylist] { MockMusicLibrary.playlists }
 
@@ -227,5 +276,11 @@ private final class LibraryReaderFixture: MusicLibraryScriptReading, @unchecked 
     func setFavorite(persistentID: String, value: Bool, cancellation: MusicLibraryCancellation) throws -> Bool {
         lock.withLock { favoriteWriteCount += 1 }
         return false // 故意模拟后端拒绝保持喜爱，验证调用方以读回值为准。
+    }
+
+    func setFavorite(persistentID: String, value: Bool, in source: MusicLibrarySource,
+                     cancellation: MusicLibraryCancellation) throws -> Bool {
+        lock.withLock { writtenSources.append(source) }
+        return try setFavorite(persistentID: persistentID, value: value, cancellation: cancellation)
     }
 }

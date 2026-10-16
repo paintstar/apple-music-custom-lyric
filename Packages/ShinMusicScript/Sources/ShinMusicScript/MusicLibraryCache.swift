@@ -10,12 +10,12 @@ actor MusicLibraryCache {
     private var source: MusicLibrarySource?
     private var tracks: [MusicLibraryTrack] = []
     private var generation = 0
-    private let artworkCache = NSCache<NSString, CachedArtwork>()
+    private let artworkCache: LibraryArtworkCache
 
-    init(reader: any MusicLibraryScriptReading = AppleScriptMusicLibraryReader()) {
+    init(reader: any MusicLibraryScriptReading = AppleScriptMusicLibraryReader(),
+         artworkNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now }) {
         self.reader = reader
-        artworkCache.countLimit = 24
-        artworkCache.totalCostLimit = 32 * 1_024 * 1_024
+        artworkCache = LibraryArtworkCache(now: artworkNow)
     }
 
     func loadPlaylists() async throws -> [MusicLibraryPlaylist] {
@@ -26,6 +26,14 @@ actor MusicLibraryCache {
     func currentPlaybackSource() async throws -> MusicLibrarySource? {
         let reader = reader
         return try await runCancellable { try reader.currentPlaybackSource(cancellation: $0) }
+    }
+
+    /// 兼容单曲入口也必须取得真实来源的完整新快照；独立读取，不破坏浏览分页的缓存与代序号。
+    func playbackTrackRefs(in requestedSource: MusicLibrarySource) async throws -> [String] {
+        let reader = reader
+        return try await runCancellable {
+            try reader.readTracks(in: requestedSource, cancellation: $0).map(\.trackRef)
+        }
     }
 
     func loadTracks(in requestedSource: MusicLibrarySource, offset: Int, limit: Int) async throws -> MusicLibraryTrackPage {
@@ -56,20 +64,35 @@ actor MusicLibraryCache {
                                      nextOffset: end < tracks.count ? end : nil)
     }
 
-    func artworkData(for trackRef: String) async throws -> Data? {
+    func artworkData(for trackRef: String, in source: MusicLibrarySource = .library) async throws -> Data? {
         guard let id = MusicScriptMapping.persistentID(fromTrackRef: trackRef) else { throw MusicLibraryError.invalidRequest }
         try Task.checkCancellation()
-        if let existing = artworkCache.object(forKey: trackRef as NSString) { return existing.data }
+        let key: String
+        switch source {
+        case .library: key = "library|\(trackRef)"
+        case let .playlist(id): key = "playlist:\(id)|\(trackRef)"
+        }
+        let cache = artworkCache
         let reader = reader
-        let data = try await runCancellable { try reader.artworkData(persistentID: id, cancellation: $0) }
-        artworkCache.setObject(CachedArtwork(data), forKey: trackRef as NSString, cost: data?.count ?? 1)
-        return data
+        return try await runCancellable { cancellation in
+            // 在串行读取队列中复查，合并同一行与分组封面的同时请求。
+            if let existing = cache.value(for: key) { return existing.data }
+            let raw = try reader.artworkData(persistentID: id, in: source, cancellation: cancellation)
+            try cancellation.check()
+            // 不能把无法解码的字节当作成功封面永久缓存。
+            let data = raw.flatMap { NSImage(data: $0)?.isValid == true ? $0 : nil }
+            try cancellation.check()
+            cache.store(data, for: key)
+            return data
+        }
     }
 
-    func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool {
+    func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource = .library) async throws -> Bool {
         guard let id = MusicScriptMapping.persistentID(fromTrackRef: trackRef) else { throw MusicLibraryError.invalidRequest }
         let reader = reader
-        let confirmed = try await runCancellable { try reader.setFavorite(persistentID: id, value: value, cancellation: $0) }
+        let confirmed = try await runCancellable {
+            try reader.setFavorite(persistentID: id, value: value, in: source, cancellation: $0)
+        }
         for index in tracks.indices where tracks[index].trackRef == trackRef { tracks[index].isFavorite = confirmed }
         return confirmed
     }
@@ -105,18 +128,68 @@ actor MusicLibraryCache {
 final class MusicLibraryCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var isCancelled = false
+    private var cancellationHandlers: [@Sendable () -> Void] = []
 
-    func cancel() { lock.withLock { isCancelled = true } }
+    func onCancel(_ handler: @escaping @Sendable () -> Void) {
+        let alreadyCancelled = lock.withLock {
+            if isCancelled { return true }
+            cancellationHandlers.append(handler)
+            return false
+        }
+        if alreadyCancelled { handler() }
+    }
+
+    func cancel() {
+        let handlers: [@Sendable () -> Void] = lock.withLock {
+            guard !isCancelled else { return [] }
+            isCancelled = true
+            let handlers = cancellationHandlers
+            cancellationHandlers.removeAll()
+            return handlers
+        }
+        // 回调可释放其他锁或再次检查取消，不在本对象的锁内调用。
+        handlers.forEach { $0() }
+    }
 
     func check() throws {
         if lock.withLock({ isCancelled }) { throw CancellationError() }
     }
 }
 
-/// 连缺失封面也缓存，避免无封面的可见行在布局变化时反复发送查询。
-private final class CachedArtwork: NSObject {
+/// NSCache 自身保证线程安全，读取队列内复查与写入能合并重复视图请求。
+private final class LibraryArtworkCache: @unchecked Sendable {
+    private let entries = NSCache<NSString, CachedArtwork>()
+    private let now: @Sendable () -> ContinuousClock.Instant
+
+    init(now: @escaping @Sendable () -> ContinuousClock.Instant) {
+        self.now = now
+        entries.countLimit = 24
+        entries.totalCostLimit = 32 * 1_024 * 1_024
+    }
+
+    func value(for key: String) -> CachedArtwork? {
+        guard let entry = entries.object(forKey: key as NSString), entry.isFresh(at: now()) else { return nil }
+        return entry
+    }
+
+    func store(_ data: Data?, for key: String) {
+        entries.setObject(CachedArtwork(data, now: now()), forKey: key as NSString, cost: data?.count ?? 1)
+    }
+}
+
+/// 短暂合并缺失结果，不能把 Music 尚未准备好的云端封面永久当作无封面。
+private final class CachedArtwork: NSObject, @unchecked Sendable {
     let data: Data?
-    init(_ data: Data?) { self.data = data }
+    private let retryAfter: ContinuousClock.Instant?
+    // 小于界面首次重试间隔（1 秒），抑制重复视图查询而不吞掉主动重试。
+    private static let missingLifetime: Duration = .milliseconds(500)
+
+    init(_ data: Data?, now: ContinuousClock.Instant) {
+        self.data = data
+        retryAfter = data == nil ? now.advanced(by: Self.missingLifetime) : nil
+    }
+
+    func isFresh(at now: ContinuousClock.Instant) -> Bool { retryAfter.map { now < $0 } ?? true }
 }
 
 /// 官方 NSWorkspace 打开方式：仅当 Music 尚未运行时启动，不激活窗口，不发播放命令。
@@ -168,10 +241,12 @@ extension MusicScriptPlaybackController: MusicLibraryBrowsing {
     }
 
     public func playTrack(_ trackRef: String, in source: MusicLibrarySource) async throws {
-        guard let persistentID = MusicScriptMapping.persistentID(fromTrackRef: trackRef) else {
+        guard MusicScriptMapping.persistentID(fromTrackRef: trackRef) != nil else {
             throw MusicLibraryError.invalidRequest
         }
-        try await performLibraryPlay(MusicLibraryScriptSources.play(persistentID: persistentID, in: source))
+        let trackRefs = try await libraryCache.playbackTrackRefs(in: source)
+        try Task.checkCancellation()
+        try await playTracks(trackRefs, startingAt: trackRef, in: source, shuffleEnabled: nil)
     }
 
     public func playTracks(_ trackRefs: [String], startingAt trackRef: String, in source: MusicLibrarySource,
@@ -207,16 +282,24 @@ extension MusicScriptPlaybackController: MusicLibraryBrowsing {
     }
 
     public func artworkData(for trackRef: String) async throws -> Data? {
+        try await artworkData(for: trackRef, in: .library)
+    }
+
+    public func artworkData(for trackRef: String, in source: MusicLibrarySource) async throws -> Data? {
         do {
-            return try await libraryCache.artworkData(for: trackRef)
+            return try await libraryCache.artworkData(for: trackRef, in: source)
         } catch let failure as MusicScriptFailure {
             throw MusicScriptMapping.playbackError(for: failure)
         }
     }
 
     public func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool {
+        try await setFavorite(trackRef, value: value, in: .library)
+    }
+
+    public func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool {
         do {
-            return try await libraryCache.setFavorite(trackRef, value: value)
+            return try await libraryCache.setFavorite(trackRef, value: value, in: source)
         } catch let failure as MusicScriptFailure {
             throw MusicScriptMapping.playbackError(for: failure)
         }

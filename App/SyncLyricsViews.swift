@@ -122,24 +122,30 @@ struct LyricsUnlinkRequest {
     let trackKey: String
     let trackEpoch: Int
     let documentId: UUID
+    let revision: Int
+    private let panelIdentity: ObjectIdentifier
 
     init?(model: AppModel) {
         guard let trackKey = model.currentTrackKey, let panel = model.lyricsPanel,
               panel.displayedTrackKey == trackKey, panel.displayedTrackEpoch == model.snapshot.trackEpoch,
-              let documentId = panel.currentDocumentId else { return nil }
+              let document = panel.currentDocument, !model.isSwitchingStorage else { return nil }
         self.trackKey = trackKey
         trackEpoch = model.snapshot.trackEpoch
-        self.documentId = documentId
+        documentId = document.id
+        revision = document.revision
+        panelIdentity = ObjectIdentifier(panel)
     }
 
     func matches(_ model: AppModel) -> Bool {
-        model.currentTrackKey == trackKey && model.snapshot.trackEpoch == trackEpoch
-            && model.lyricsPanel?.displayedTrackKey == trackKey && model.lyricsPanel?.displayedTrackEpoch == trackEpoch
-            && model.lyricsPanel?.currentDocumentId == documentId
+        guard let panel = model.lyricsPanel else { return false }
+        return !model.isSwitchingStorage && ObjectIdentifier(panel) == panelIdentity
+            && model.currentTrackKey == trackKey && model.snapshot.trackEpoch == trackEpoch
+            && panel.displayedTrackKey == trackKey && panel.displayedTrackEpoch == trackEpoch
+            && panel.currentDocumentId == documentId && panel.currentDocument?.revision == revision
     }
 }
 
-/// 侧栏和播放器顶栏沿用同一破坏性确认；只解除歌曲绑定，文档保留。
+/// 侧栏和播放器顶栏沿用同一破坏性确认，说明共享文档的保留条件。
 struct LyricsUnlinkConfirmation: ViewModifier {
     @EnvironmentObject private var model: AppModel
     @Binding var request: LyricsUnlinkRequest?
@@ -150,12 +156,12 @@ struct LyricsUnlinkConfirmation: ViewModifier {
             isPresented: Binding(get: { request != nil }, set: { if !$0 { request = nil } }),
             titleVisibility: .visible, presenting: request
         ) { target in
-            Button("解除关联（歌词文档保留在本机）", role: .destructive) {
-                if target.matches(model) { model.unlinkCurrentLyrics() }
+            Button("解除关联并清理歌词", role: .destructive) {
+                if target.matches(model) { model.unlinkCurrentLyrics(target) }
             }
             Button("取消", role: .cancel) {}
         } message: { _ in
-            Text("解除后该曲目将回到「无本地歌词」状态；已保存的歌词文档不会被删除。")
+            Text("解除后该曲目将没有本地歌词。若没有其他歌曲使用这份歌词，将同时删除歌词和人工译文，且无法恢复；仍被其他歌曲使用时只解除当前关联。")
         }
     }
 }

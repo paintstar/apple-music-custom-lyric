@@ -6,16 +6,10 @@ struct PlaybackListView: View {
     @ObservedObject var browser: MusicLibraryBrowserModel
     @StateObject private var list: PlaybackListModel
 
-    private struct PlaybackIdentity: Equatable {
-        let trackKey: String?
-        let trackEpoch: Int
-        let sessionEpoch: Int
-        let contextVersion: Int
-    }
-    private var playbackIdentity: PlaybackIdentity {
-        PlaybackIdentity(trackKey: model.snapshot.trackKey, trackEpoch: model.snapshot.trackEpoch,
-                         sessionEpoch: model.snapshot.sessionEpoch,
-                         contextVersion: browser.confirmedPlaybackContextVersion)
+    private var playbackIdentity: PlaybackListModel.PlaybackIdentity {
+        PlaybackListModel.PlaybackIdentity(trackKey: model.snapshot.trackKey, trackEpoch: model.snapshot.trackEpoch,
+                                          sessionEpoch: model.snapshot.sessionEpoch,
+                                          contextVersion: browser.confirmedPlaybackContextVersion)
     }
 
     init(browser: MusicLibraryBrowserModel) {
@@ -71,8 +65,8 @@ struct PlaybackListView: View {
         }
         .padding(16)
         .frame(width: 340, height: 440)
-        .onAppear(perform: reload)
-        .onChange(of: playbackIdentity) { _, _ in reload() }
+        .onAppear { list.synchronize(with: playbackIdentity) }
+        .onChange(of: playbackIdentity) { _, identity in list.synchronize(with: identity) }
         .onDisappear { list.cancel() }
     }
 
@@ -80,7 +74,7 @@ struct PlaybackListView: View {
         let isCurrent = track.trackRef == model.snapshot.trackKey
         return Button { list.play(track) } label: {
             HStack(spacing: 10) {
-                MusicLibraryArtworkView(browser: browser, trackRef: track.trackRef)
+                MusicLibraryArtworkView(browser: browser, trackRef: track.trackRef, source: list.artworkSource)
                     .frame(width: 36, height: 36).clipShape(RoundedRectangle(cornerRadius: 5))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(track.title).font(.callout.weight(.medium)).lineLimit(1)

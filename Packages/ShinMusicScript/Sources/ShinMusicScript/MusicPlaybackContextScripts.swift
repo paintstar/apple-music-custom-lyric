@@ -33,25 +33,51 @@ enum MusicPlaybackContextScripts {
         return try wrap("""
         \(selection(ownership))
         \(sourceSelection)
-        repeat with selectedID in \(selectedIDs)
-            set contextStage to "select"
-            set matchedTracks to (tracks of sourcePlaylist whose persistent ID is (contents of selectedID))
-            if (count of matchedTracks) is 0 then error number -1728
-            set contextStage to "append"
-            duplicate (item 1 of matchedTracks) to targetPlaylist
-        end repeat
+        set contextStage to "readback"
+        \(orderedMembersCheck(ownership.trackIDs, mismatch: "error number -1728"))
+        set sourceIDs to get persistent ID of every track of sourcePlaylist
+        set selectedIDs to \(selectedIDs)
+        \(copySelectedReferences)
         set contextStage to "readback"
         return get persistent ID of every track of targetPlaylist
         """, stage: .select)
     }
 
-    static func start(_ ownership: MusicPlaybackContextOwnership, at id: String, shuffleEnabled: Bool?) throws -> String {
+    static func start(_ ownership: MusicPlaybackContextOwnership, at id: String, shuffleEnabled: Bool?,
+                      reuse: Bool = false) throws -> String {
         try validate(id)
         guard ownership.trackIDs.first == id else { throw MusicLibraryError.invalidRequest }
+        let mismatch = reuse ? "return \"different\"" : "error number -1728"
         return try wrap("""
-        \(selection(ownership))
+        \(selection(ownership, mismatch: mismatch))
         set contextStage to "readback"
-        if (get persistent ID of every track of targetPlaylist) is not \(list(ownership.trackIDs)) then error number -1728
+        \(orderedMembersCheck(ownership.trackIDs, mismatch: mismatch))
+        \(prepareSelectedPlayback(at: id, mismatch: mismatch))
+        return {"ok", previousShuffle}
+        """, stage: .select)
+    }
+
+    static func playSource(_ source: MusicLibrarySource, expectedIDs: [String], at id: String) throws -> String {
+        try validate(id)
+        guard expectedIDs.first == id else { throw MusicLibraryError.invalidRequest }
+        let target: String
+        switch source {
+        case .library: target = "set targetPlaylist to library playlist 1"
+        case let .playlist(id): target = try playlistSelection(id)
+        }
+        return try wrap("""
+        \(target)
+        if (special kind of targetPlaylist) is folder then return "different"
+        set contextStage to "readback"
+        \(orderedMembersCheck(expectedIDs, mismatch: "return \"different\""))
+        set playbackPlaylistID to persistent ID of targetPlaylist
+        \(prepareSelectedPlayback(at: id, mismatch: "return \"different\""))
+        return {"ok", previousShuffle, playbackPlaylistID}
+        """, stage: .select)
+    }
+
+    static func prepareSelectedPlayback(at id: String, mismatch: String) -> String {
+        """
         set contextStage to "shuffle"
         set previousShuffle to "unknown"
         try
@@ -64,14 +90,44 @@ enum MusicPlaybackContextScripts {
             if preparationError is not -1728 then error number preparationError
         end try
         try
-            set shuffle enabled to false
+            try
+                set shuffle enabled to false
+            on error number preparationError
+                if preparationError is not -1728 then error number preparationError
+            end try
+            set contextStage to "select"
+            if (persistent ID of track 1 of targetPlaylist) is not "\(id)" then
+                \(restorePreviousShuffle)
+                \(mismatch)
+            end if
         on error number preparationError
-            if preparationError is not -1728 then error number preparationError
+            try
+                \(restorePreviousShuffle)
+            end try
+            error number preparationError
         end try
         set contextStage to "start"
-        play targetPlaylist
-        return {"ok", previousShuffle}
-        """, stage: .select)
+        try
+            play targetPlaylist without once
+        on error number startError
+            try
+                \(restorePreviousShuffle)
+            end try
+            error number startError
+        end try
+        """
+    }
+
+    private static var restorePreviousShuffle: String {
+        """
+        if previousShuffle is "true" then set shuffle enabled to true
+        if previousShuffle is "false" then set shuffle enabled to false
+        """
+    }
+
+    /// 确认失败或取消后仍在同一命令队列恢复此前已知偏好，不等待新上下文可读。
+    static func restoreShuffle(_ enabled: Bool) -> String {
+        wrap("set shuffle enabled to \(enabled ? "true" : "false")\nreturn \"ok\"", stage: .shuffle)
     }
 
     static func shuffleSource(_ source: MusicLibrarySource, expectedIDs: [String]) throws -> String {
@@ -86,7 +142,7 @@ enum MusicPlaybackContextScripts {
         set contextStage to "readback"
         \(membersCheck(expectedIDs, mismatch: "return \"different\""))
         \(prepareRandomPlayback)
-        return {"ok", preparedShuffle, (persistent ID of targetPlaylist)}
+        return {"ok", preparedShuffle, playbackPlaylistID}
         """, stage: .select)
     }
 
@@ -94,14 +150,15 @@ enum MusicPlaybackContextScripts {
         try wrap("""
         \(selection(ownership))
         set contextStage to "readback"
-        if (get persistent ID of every track of targetPlaylist) is not \(list(ownership.trackIDs)) then return "different"
+        \(orderedMembersCheck(ownership.trackIDs, mismatch: "return \"different\""))
         \(prepareRandomPlayback)
-        return {"ok", preparedShuffle, (persistent ID of targetPlaylist)}
+        return {"ok", preparedShuffle, playbackPlaylistID}
         """, stage: .select)
     }
 
     private static var prepareRandomPlayback: String {
         """
+        set playbackPlaylistID to persistent ID of targetPlaylist
         set contextStage to "shuffle"
         set preparedShuffle to false
         try
@@ -112,11 +169,12 @@ enum MusicPlaybackContextScripts {
             if preparationError is not -1728 then error number preparationError
         end try
         set contextStage to "start"
-        play targetPlaylist
+        play targetPlaylist without once
         """
     }
 
-    static func setSourceShuffle(_ id: String, expectedIDs: [String]) throws -> String {
+    static func setSourceShuffle(_ id: String, expectedIDs: [String], enabled: Bool = true,
+                                 orderedMembers: Bool = false) throws -> String {
         try validate(id)
         return try wrap("""
         set contextStage to "currentPlaylist"
@@ -124,10 +182,12 @@ enum MusicPlaybackContextScripts {
         if (persistent ID of current playlist) is not "\(id)" then error number -1728
         set targetPlaylist to current playlist
         set contextStage to "readback"
-        \(membersCheck(expectedIDs, mismatch: "error number -1728"))
+        \(orderedMembers
+          ? orderedMembersCheck(expectedIDs, mismatch: "error number -1728")
+          : membersCheck(expectedIDs, mismatch: "error number -1728"))
         set contextStage to "shuffle"
-        set shuffle mode to songs
-        set shuffle enabled to true
+        \(enabled ? "set shuffle mode to songs" : "")
+        set shuffle enabled to \(enabled ? "true" : "false")
         return "ok"
         """, stage: .shuffle)
     }
@@ -146,7 +206,7 @@ enum MusicPlaybackContextScripts {
         set shuffle mode to songs
         set shuffle enabled to true
         set contextStage to "start"
-        play targetPlaylist
+        play targetPlaylist without once
         return "ok"
         """, stage: .start)
     }
@@ -164,21 +224,23 @@ enum MusicPlaybackContextScripts {
         """, stage: .shuffle)
     }
 
-    static func confirm(_ ownership: MusicPlaybackContextOwnership, selectedID: String?, shuffleEnabled: Bool?) throws -> String {
+    static func confirm(_ ownership: MusicPlaybackContextOwnership, selectedID: String?, shuffleEnabled: Bool?,
+                        orderedMembers: Bool = false) throws -> String {
         try wrap("""
         \(selection(ownership))
         \(confirmationBody(playlistID: ownership.playlistID, expectedIDs: ownership.trackIDs,
-                           selectedID: selectedID, shuffleEnabled: shuffleEnabled))
+                           selectedID: selectedID, shuffleEnabled: shuffleEnabled, orderedMembers: orderedMembers))
         """, stage: .currentPlaylist)
     }
 
-    static func confirm(playlistID: String, expectedIDs: [String], selectedID: String?, shuffleEnabled: Bool?) throws -> String {
-        try wrap(confirmationBody(playlistID: playlistID, expectedIDs: expectedIDs,
-                                  selectedID: selectedID, shuffleEnabled: shuffleEnabled), stage: .currentPlaylist)
+    static func confirm(playlistID: String, expectedIDs: [String], selectedID: String?, shuffleEnabled: Bool?,
+                        orderedMembers: Bool = false) throws -> String {
+        try wrap(confirmationBody(playlistID: playlistID, expectedIDs: expectedIDs, selectedID: selectedID,
+                                  shuffleEnabled: shuffleEnabled, orderedMembers: orderedMembers), stage: .currentPlaylist)
     }
 
-    private static func confirmationBody(playlistID: String, expectedIDs: [String],
-                                         selectedID: String?, shuffleEnabled: Bool?) throws -> String {
+    static func confirmationBody(playlistID: String, expectedIDs: [String],
+                                 selectedID: String?, shuffleEnabled: Bool?, orderedMembers: Bool) throws -> String {
         try validate(playlistID)
         let trackCheck: String
         if let selectedID {
@@ -188,6 +250,13 @@ enum MusicPlaybackContextScripts {
         let shuffleCheck = shuffleEnabled.map {
             "if (shuffle enabled) is not \($0 ? "true" : "false") then return \"pending-shuffle\""
         } ?? ""
+        // 完整列表比较已包含长度；本机 AppleScript 在相邻 count 比较后会误接受同长度重排。
+        let memberCheck = orderedMembers ? "if actualIDs is not expectedIDs then return \"mismatch\"" : """
+        if (count of actualIDs) is not (count of expectedIDs) then return "mismatch"
+        repeat with expectedID in expectedIDs
+            if actualIDs does not contain (contents of expectedID) then return "mismatch"
+        end repeat
+        """
         return try """
         set contextStage to "currentPlaylist"
         if not (exists current playlist) then return "pending"
@@ -196,23 +265,21 @@ enum MusicPlaybackContextScripts {
         set contextStage to "readback"
         set actualIDs to get persistent ID of every track of current playlist
         set expectedIDs to \(list(expectedIDs))
-        if (count of actualIDs) is not (count of expectedIDs) then return "mismatch"
-        repeat with expectedID in expectedIDs
-            if actualIDs does not contain (contents of expectedID) then return "mismatch"
-        end repeat
+        \(memberCheck)
         if expectedIDs does not contain (persistent ID of current track) then return "pending-track"
         \(trackCheck)
         \(shuffleCheck)
+        if player state is not playing then return "pending-playback"
         return "ok"
         """
     }
 
-    static func remove(_ ownership: MusicPlaybackContextOwnership) throws -> String {
+    static func remove(_ ownership: MusicPlaybackContextOwnership, allowStoppedCurrent: Bool = false) throws -> String {
         try validate(ownership.playlistID)
-        let plannedIDs = try list(ownership.trackIDs)
-        return wrap("""
+        return try wrap("""
         set matches to (user playlists whose persistent ID is "\(ownership.playlistID)")
         if (count of matches) is 0 then return "released"
+        if (count of matches) is not 1 then error number -1728
         set targetPlaylist to item 1 of matches
         considering case
             if (name of targetPlaylist) is not "\(expectedName(for: ownership))" then return "released"
@@ -220,29 +287,42 @@ enum MusicPlaybackContextScripts {
         end considering
         if (smart of targetPlaylist) then return "released"
         if (special kind of targetPlaylist) is folder then return "released"
-        if (exists current playlist) then
-            if (persistent ID of current playlist) is "\(ownership.playlistID)" then return "playing"
-        end if
-        set actualIDs to get persistent ID of every track of targetPlaylist
-        if actualIDs is not \(plannedIDs) then return "released"
+        \(deletionPlaybackCheck(ownership, allowStoppedCurrent: allowStoppedCurrent))
+        \(orderedMembersCheck(ownership.trackIDs, mismatch: "return \"released\""))
+        \(deletionPlaybackCheck(ownership, allowStoppedCurrent: allowStoppedCurrent))
         delete targetPlaylist
         return "removed"
         """, stage: .cleanup)
     }
 
-    private static func selection(_ ownership: MusicPlaybackContextOwnership) throws -> String {
+    private static func deletionPlaybackCheck(_ ownership: MusicPlaybackContextOwnership, allowStoppedCurrent: Bool) -> String {
+        let stoppedCheck = allowStoppedCurrent
+            ? "\(cleanupStoppedState)\nif not cleanupStopped then return \"playing\"" : ""
+        return """
+        \(stoppedCheck)
+        if (exists current playlist) then
+            if (persistent ID of current playlist) is "\(ownership.playlistID)" then
+                \(allowStoppedCurrent ? stoppedCheck : "return \"playing\"")
+            end if
+        end if
+        \(stoppedCheck)
+        """
+    }
+
+    private static func selection(_ ownership: MusicPlaybackContextOwnership,
+                                  mismatch: String = "error number -1728") throws -> String {
         try validate(ownership.playlistID)
         return """
         set contextStage to "select"
         set matches to (user playlists whose persistent ID is "\(ownership.playlistID)")
-        if (count of matches) is 0 then error number -1728
+        if (count of matches) is not 1 then \(mismatch)
         set targetPlaylist to item 1 of matches
         considering case
-            if (name of targetPlaylist) is not "\(expectedName(for: ownership))" then error number -1728
-            if (description of targetPlaylist) is not "\(marker(ownership.token))" then error number -1728
+            if (name of targetPlaylist) is not "\(expectedName(for: ownership))" then \(mismatch)
+            if (description of targetPlaylist) is not "\(marker(ownership.token))" then \(mismatch)
         end considering
-        if (smart of targetPlaylist) then error number -1728
-        if (special kind of targetPlaylist) is folder then error number -1728
+        if (smart of targetPlaylist) then \(mismatch)
+        if (special kind of targetPlaylist) is folder then \(mismatch)
         """
     }
 
@@ -268,7 +348,7 @@ enum MusicPlaybackContextScripts {
         """
     }
 
-    private static func list(_ ids: [String]) throws -> String {
+    static func list(_ ids: [String]) throws -> String {
         try ids.forEach(validate)
         return "{" + ids.map { "\"\($0)\"" }.joined(separator: ", ") + "}"
     }
@@ -279,7 +359,7 @@ enum MusicPlaybackContextScripts {
 
     private static func marker(_ token: UUID) -> String { "ShinApple playback context \(token.uuidString)" }
 
-    private static func wrap(_ body: String, stage: MusicPlaybackContextError.Stage) -> String {
+    static func wrap(_ body: String, stage: MusicPlaybackContextError.Stage) -> String {
         """
         set contextStage to "\(stage.rawValue)"
         with timeout of \(MusicLibraryScriptSources.eventTimeoutSeconds) seconds

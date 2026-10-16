@@ -25,9 +25,20 @@ final class LyricsLibraryModel: ObservableObject {
 
     /// 删除确认数据：目标文档 + 受影响绑定清单。
     struct DeletionPreview: Equatable {
+        let id = UUID()
         let documentId: UUID
         let displayName: String
         let bindings: [SongBinding]
+        let item: LyricsLibraryOverviewItem
+    }
+
+    /// 缓存资源删除预览固定文档版本和全部歌曲关联，确认后由事务再次校验。
+    struct ResourceDeletionPreview: Equatable {
+        let id = UUID()
+        let items: [LyricsLibraryOverviewItem]
+        var documentCount: Int { items.count }
+        var bindingCount: Int { items.reduce(0) { $0 + $1.bindingCount } }
+        var trackHints: [String] { items.flatMap(\.trackHints) }
     }
 
     /// LRC 导出对话框状态。
@@ -47,6 +58,12 @@ final class LyricsLibraryModel: ObservableObject {
     /// 备份导出内容就绪后置位（视图据此呈现 fileExporter）。
     @Published private(set) var pendingBackupExport: Data?
     @Published private(set) var lrcExport: LRCExportState?
+    @Published private(set) var resourceDeletionPreview: ResourceDeletionPreview?
+    @Published private(set) var isDeletingResources = false
+
+    /// 宿主失效在途自动获取；删除许可同时绑定当前模型与保存位置切换状态。
+    var onWillDeleteResources: ((Set<String>) async throws -> (() -> Void)?)?
+    var canDeleteResources: (() -> Bool)?
 
     /// 库发生变化后的回调（宿主刷新歌词面板）。
     var onLibraryChanged: (() -> Void)?
@@ -54,6 +71,11 @@ final class LyricsLibraryModel: ObservableObject {
     private let service: LyricsLibraryService
     /// 代序号：关闭确认弹窗/新操作使旧异步结果失效。
     private var generation = 0
+    private var refreshGeneration = 0
+    private var resourcesAreActive = true
+
+    var associatedResourceCount: Int { items.filter { $0.bindingCount > 0 }.count }
+    var unassociatedResourceCount: Int { items.count - associatedResourceCount }
 
     init(store: GRDBLyricsStore) {
         service = LyricsLibraryService(store: store)
@@ -62,54 +84,145 @@ final class LyricsLibraryModel: ObservableObject {
     // MARK: - 概览
 
     func refresh() async {
+        refreshGeneration += 1
+        let currentRefresh = refreshGeneration
         isLoading = true
-        defer { isLoading = false }
+        defer { if currentRefresh == refreshGeneration { isLoading = false } }
         do {
-            items = try await service.libraryOverview()
+            let overview = try await service.libraryOverview()
+            guard currentRefresh == refreshGeneration, resourcesAreActive, !Task.isCancelled else { return }
+            items = overview
         } catch {
+            guard currentRefresh == refreshGeneration, resourcesAreActive, !Task.isCancelled else { return }
             alertMessage = ErrorText.describe(error)
         }
     }
 
     // MARK: - 删除（预览受影响绑定 → 确认 → 原子删除）
 
-    func requestDeletion(_ item: LyricsLibraryOverviewItem) async {
+    @discardableResult
+    func requestDeletion(_ item: LyricsLibraryOverviewItem) async -> DeletionPreview? {
+        guard resourcesAreActive, !isDeletingResources else { return nil }
         generation += 1
         let currentGeneration = generation
         do {
-            let bindings = try await service.affectedBindings(forDeletionOf: item.documentId)
-            guard currentGeneration == generation else { return }
+            let overview = try await service.libraryOverview()
+            guard let target = overview.first(where: { $0.documentId == item.documentId }) else { return nil }
+            let bindings = try await service.affectedBindings(forDeletionOf: target.documentId)
+            guard currentGeneration == generation, resourcesAreActive, !isDeletingResources else { return nil }
             deletionPreview = DeletionPreview(
-                documentId: item.documentId,
-                displayName: Self.displayName(for: item),
-                bindings: bindings
+                documentId: target.documentId,
+                displayName: Self.displayName(for: target),
+                bindings: bindings,
+                item: target
             )
+            return deletionPreview
         } catch {
+            guard currentGeneration == generation, resourcesAreActive else { return nil }
             alertMessage = ErrorText.describe(error)
+            return nil
         }
     }
 
     /// 取消删除：只清空确认状态，不触碰库。
-    func cancelDeletion() {
+    func cancelDeletion(_ expected: DeletionPreview? = nil) {
+        if let expected, deletionPreview?.id != expected.id { return }
         generation += 1
         deletionPreview = nil
     }
 
-    func confirmDeletion() async {
+    @discardableResult
+    func beginDeletion(_ confirmed: DeletionPreview? = nil) -> Task<Void, Never>? {
+        guard let preview = confirmed ?? deletionPreview, deletionPreview?.id == preview.id else { return nil }
+        let resourcePreview = ResourceDeletionPreview(items: [preview.item])
+        resourceDeletionPreview = resourcePreview
+        return beginResourceDeletion(resourcePreview)
+    }
+
+    func confirmDeletion(_ confirmed: DeletionPreview? = nil) async { await beginDeletion(confirmed)?.value }
+
+    // MARK: - 缓存资源管理
+
+    func resources(matching searchText: String) -> [LyricsLibraryOverviewItem] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return items }
+        return items.filter { item in
+            ([Self.displayName(for: item), item.originalFilename ?? ""] + item.trackHints)
+                .contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+    }
+
+    /// 仅准备预览；取消时不写库，也不停止自动获取。
+    @discardableResult
+    func requestResourceDeletion(_ targets: [LyricsLibraryOverviewItem]) -> ResourceDeletionPreview? {
+        guard resourcesAreActive, !isDeletingResources, !targets.isEmpty else { return nil }
+        resourceDeletionPreview = ResourceDeletionPreview(items: targets)
+        return resourceDeletionPreview
+    }
+
+    func cancelResourceDeletion(_ expected: ResourceDeletionPreview? = nil) {
+        if let expected, resourceDeletionPreview?.id != expected.id { return }
+        resourceDeletionPreview = nil
+    }
+
+    /// 换库时让旧弹窗与尚未返回的概览失效，旧模型不能继续删除原库。
+    func deactivateResources() {
+        resourcesAreActive = false
+        refreshGeneration += 1
+        resourceDeletionPreview = nil
+        deletionPreview = nil
         generation += 1
-        let currentGeneration = generation
-        guard let preview = deletionPreview else { return }
+        isLoading = false
+    }
+
+    /// 当前歌曲解绑与批量删除共用提交锁，避免多窗口交错恢复自动获取。
+    func beginAssociationDeletion() -> Bool {
+        guard resourcesAreActive, !isDeletingResources, canDeleteResources?() ?? true else { return false }
+        generation += 1
+        deletionPreview = nil
+        resourceDeletionPreview = nil
+        isDeletingResources = true
+        return true
+    }
+
+    func finishAssociationDeletion() { isDeletingResources = false }
+
+    /// 同步锁定确认目标后再启动任务，避免弹窗收起先清空预览或连点重复提交。
+    @discardableResult
+    func beginResourceDeletion(_ confirmed: ResourceDeletionPreview? = nil) -> Task<Void, Never>? {
+        guard resourcesAreActive, !isDeletingResources,
+              canDeleteResources?() ?? true, let preview = confirmed ?? resourceDeletionPreview,
+              resourceDeletionPreview?.id == preview.id else { return nil }
+        generation += 1
+        deletionPreview = nil
+        resourceDeletionPreview = nil
+        isDeletingResources = true
+        return Task { await performResourceDeletion(preview) }
+    }
+
+    func confirmResourceDeletion(_ confirmed: ResourceDeletionPreview? = nil) async {
+        await beginResourceDeletion(confirmed)?.value
+    }
+
+    private func performResourceDeletion(_ preview: ResourceDeletionPreview) async {
+        var resumeAutoFetch: (() -> Void)?
+        defer {
+            resumeAutoFetch?()
+            isDeletingResources = false
+        }
         do {
-            let deleted = try await service.deleteDocument(id: preview.documentId)
-            guard currentGeneration == generation else { return }
-            deletionPreview = nil
-            alertMessage = "已删除「\(preview.displayName)」并解除 \(deleted.count) 个歌曲关联。"
-            await refresh()
+            let trackKeys = Set(preview.items.flatMap { $0.bindings.map(\.trackKey) })
+            resumeAutoFetch = try await onWillDeleteResources?(trackKeys)
+            guard resourcesAreActive, canDeleteResources?() ?? true else { return }
+            let deletedBindings = try await service.deleteDocuments(preview.items)
+            guard resourcesAreActive else { return }
+            alertMessage = "已删除 \(preview.documentCount) 份歌词及其译文，解除 \(deletedBindings.count) 个歌曲关联。"
             onLibraryChanged?()
+            await refresh()
         } catch {
-            guard currentGeneration == generation else { return }
-            deletionPreview = nil
-            alertMessage = ErrorText.describe(error)
+            guard resourcesAreActive else { return }
+            alertMessage = "未删除资源：\(ErrorText.describe(error)) 请刷新后重新选择。"
+            await refresh()
         }
     }
 
@@ -229,7 +342,22 @@ final class LyricsLibraryModel: ObservableObject {
     // MARK: - 展示辅助
 
     static func displayName(for item: LyricsLibraryOverviewItem) -> String {
-        item.titleHint ?? item.originalFilename ?? "未命名歌词"
+        for value in [item.titleHint, item.originalFilename] {
+            if let name = value?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return name
+            }
+        }
+        let names = associatedTrackNames(for: item)
+        return names.isEmpty ? "未命名歌词" : names.joined(separator: "、")
+    }
+
+    /// 关联列表已有稳定顺序；这里只整理展示文本，不改变文档或歌曲关联。
+    static func associatedTrackNames(for item: LyricsLibraryOverviewItem) -> [String] {
+        var seen = Set<String>()
+        return item.trackHints.compactMap { value in
+            let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !name.isEmpty && seen.insert(name).inserted ? name : nil
+        }
     }
 
     private static func readData(_ url: URL) async throws -> Data {

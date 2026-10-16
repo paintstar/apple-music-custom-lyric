@@ -428,3 +428,29 @@ final class AutoFetchModel: ObservableObject {
         actionMessage = "《\(item.title)》已标记为不再自动获取。"
     }
 }
+
+@MainActor
+extension AutoFetchModel {
+    /// 显式删除前停止当前与已排队刷新，持久清除目标歌曲尚未消费的获取工作。
+    /// 不加入永久忽略清单；后续真正移出再加入歌单仍可按成员变化重新获取。
+    /// 返回 true 时调用方须在实际删除完成或失败后恢复，已有暂停状态保持不变。
+    func suspendForResourceDeletion(trackKeys: Set<String>) async throws -> Bool {
+        let shouldResume = !isSuspended
+        isSuspended = true
+        refreshRequested = false
+        invalidateCurrentRun()
+        let previousTask = refreshTask
+        previousTask?.cancel()
+        await previousTask?.value
+        do {
+            try await store.waitForPendingWrites()
+            try Task.checkCancellation()
+            try await repository.discardFetchWork(forTrackKeys: trackKeys)
+            pendingItems.removeAll { trackKeys.contains($0.trackKey) }
+            return shouldResume
+        } catch {
+            isSuspended = !shouldResume
+            throw error
+        }
+    }
+}

@@ -77,7 +77,7 @@ final class NeteaseLyricsFetchModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
-    /// 搜索词（预填当前曲目标题，可改）。
+    /// 搜索词（预填去除末尾括号附注的当前曲目标题，可改）。
     @Published var queryTitle = ""
     @Published var queryArtist = ""
     /// 可恢复错误说明（中文）；nil = 无错误。
@@ -100,8 +100,38 @@ final class NeteaseLyricsFetchModel: ObservableObject {
         self.service = service
         self.matchQuery = matchQuery
         self.target = target
-        queryTitle = matchQuery.title
+        queryTitle = Self.prefilledTitle(matchQuery.title)
         queryArtist = matchQuery.artist ?? ""
+    }
+
+    /// 仅在打开弹窗时清理附注；原始目标及用户后续输入保持原样。
+    private static func prefilledTitle(_ title: String) -> String {
+        let original = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        var result = original
+        while let annotationStart = trailingAnnotationStart(in: result) {
+            result = String(result[..<annotationStart]).trimmingCharacters(in: .whitespacesAndNewlines)
+            // 只有括号的标题仍可由用户直接搜索，不能回填成空白。
+            if result.isEmpty { return original }
+        }
+        return result
+    }
+
+    // 标题附注的标点配对规则，不依赖歌名或版本关键词。
+    private static let annotationBrackets: [Character: Character] = [")": "(", "]": "[", "）": "（", "］": "［"]
+
+    private static func trailingAnnotationStart(in title: String) -> String.Index? {
+        guard let last = title.last, annotationBrackets[last] != nil else { return nil }
+        var expectedOpenings: [Character] = []
+        for index in title.indices.reversed() {
+            let character = title[index]
+            if let opening = annotationBrackets[character] {
+                expectedOpenings.append(opening)
+            } else if annotationBrackets.values.contains(character) {
+                guard expectedOpenings.popLast() == character else { return nil }
+                if expectedOpenings.isEmpty { return index }
+            }
+        }
+        return nil
     }
 
     // MARK: - 搜索

@@ -33,7 +33,7 @@ bash scripts/package-release.sh
 
 脚本默认构建 Apple Silicon 的未签名 Release App，再对分发副本签名，生成 DMG、ZIP 和发布说明，输出位于 `.build/release/`。DMG 中提供拖到 Applications 的安装入口；ZIP 中只有 App。包名从 App 的版本号及实际 Mach-O 架构生成，构建缓存位于 `.build/release-xcode/`。安装包包含项目及第三方许可证，不包含源码、构建日志、本机数据库或签名材料。
 
-签名默认优先使用本机 `APPLE_SIGNING_IDENTITY`；没有配置时使用 ad-hoc 签名，不启用 Hardened Runtime。可通过 `--signing ad-hoc` 明确选择该模式。0.1.1 已构建 arm64 安装包；Intel 尚未提供，`--arch x86_64` 和 `--arch universal` 仅是其他架构的构建入口，需另行验收。
+签名默认优先使用本机 `APPLE_SIGNING_IDENTITY`；没有配置时使用 ad-hoc 签名，不启用 Hardened Runtime。可通过 `--signing ad-hoc` 明确选择该模式。0.1.2 提供 arm64 安装包；Intel 尚未提供，`--arch x86_64` 和 `--arch universal` 仅是其他架构的构建入口，需另行验收。
 
 已有 Developer ID Application 证书的开发者，可在本机配置 `APPLE_SIGNING_IDENTITY` 后执行 `bash scripts/package-release.sh --signing developer-id`。脚本不导入证书，也不输出该配置值；此模式为临时分发副本启用 Hardened Runtime，并添加 `com.apple.security.automation.apple-events` entitlement，保留系统自动化授权。签名身份不是 Developer ID Application 时停止打包。
 
@@ -54,19 +54,26 @@ open -n .build/xcode/Build/Products/Debug/ShinApple.app --args --mock
 bash scripts/ci-local.sh
 ```
 
-Mock 使用原创虚构数据和每次新建的临时数据库，不播放音频、不控制 Music、不访问网络。`ci-local.sh` 执行六包测试、App typecheck、SwiftLint、密钥检查、出站审计、工程生成与未签名 Release 构建。
+Mock 使用原创虚构数据和每次新建的临时数据库，不播放音频、不控制 Music、不访问网络。`ci-local.sh` 执行六包测试、纯播放脚本分支检查、App typecheck、SwiftLint、密钥检查、出站审计、工程生成与未签名 Release 构建。
 
 界面改动按范围运行以下检查。GUI 检查应串行执行，避免窗口焦点冲突；首次执行省略 `--skip-build`，之后可复用已构建的依赖，包装脚本仍会编译检查程序：
 
 ```bash
 bash scripts/library-ui-check.sh
+bash scripts/library-sort-check.sh
 bash scripts/player-ui-check.sh
 bash scripts/floating-lyrics-ui-check.sh
 bash scripts/library-scroll-ui-check.sh
 bash scripts/auto-fetch-check.sh
+bash scripts/local-resources-check.sh
+bash scripts/app-termination-check.sh
 ```
 
 其他界面检查入口位于 `scripts/`，执行前阅读脚本的用法与范围。真实 Music 授权、实际播放和真实在线接口联测需要人工操作，不属于默认无人值守测试。仅安装 Command Line Tools 无法完成 App 构建，请使用完整 Xcode。
+
+`app-termination-check.sh` 只编译退出设置与 AppKit 接线，使用隔离偏好和虚构清理闭包，检查默认值、关闭及 Mock、取消顺序、重复退出、完成、失败、超时和迟到结果；不操作真实 Music，也不退出正在运行的 App。实际 App 退出清理需要另行验证自动化授权、停止播放及清单保护行为。
+
+`local-resources-check.sh` 使用临时歌词库、原创歌词和静默播放控制器，验证资源统计、取消与确认删除、共享歌词解除关联、旧版本及关联变化拒绝、切歌和换库保护，以及当前歌词面板刷新；不访问真实 Music 或在线接口。可设置 `SHIN_LOCAL_RESOURCES_CAPTURE_DIR` 保存资源管理界面的离屏布局截图。
 
 ## 数据安全
 

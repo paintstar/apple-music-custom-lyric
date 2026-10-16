@@ -55,6 +55,7 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
 
     /// SBApplication 非 Sendable，靠「调用方串行化」约定满足 @unchecked Sendable。
     private let application: SBApplication?
+    private let bundleIdentifier: String
 
     /// SB 初始化失败时为 false：readSnapshot 返回 failed(unknown)，控制命令抛错。
     public var isAvailable: Bool { application != nil }
@@ -69,8 +70,18 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
         commandExecutor: MusicScriptExecutor? = nil
     ) {
         // SBApplication(bundleIdentifier:) 只创建对象，不拉起目标应用。
+        self.bundleIdentifier = bundleIdentifier
         self.application = SBApplication(bundleIdentifier: bundleIdentifier)
+        // SB 的 timeout 使用 1/60 秒单位；与脚本事件共用上限，避免默认约一分钟等待。
+        self.application?.timeout = MusicLibraryScriptSources.eventTimeoutSeconds * 60
         self.commandExecutor = commandExecutor ?? AppleScriptExecutor()
+    }
+
+    /// 显式初始化独立 SBApplication；若系统返回共享实例则放弃封面，不能并发使用它。
+    func makeArtworkProvider() -> (any MusicArtworkProviding)? {
+        let provider = ScriptingBridgeExecutor(bundleIdentifier: bundleIdentifier)
+        guard provider.application !== application else { return nil }
+        return provider
     }
 
     // MARK: MusicScriptExecutor
@@ -159,7 +170,7 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
     }
 
     /// SB 侧不做 whose 查询（需要生成头文件，收益低）：点播统一走
-    /// AppleScript 执行器（见 MusicScriptPlaybackController.playTrackRef）。
+    /// 单曲底层入口不支持；控制器通过完整上下文保留连续播放范围。
     public func playPersistentID(_ persistentID: String) throws {
         throw MusicScriptFailure.commandUnsupported("playPersistentID")
     }
