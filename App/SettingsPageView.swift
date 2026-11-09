@@ -4,9 +4,8 @@ import SwiftUI
 // - 播放来源与授权状态（含「打开自动化权限设置」出口，语义同原状态区）；
 // - 显示偏好：「显示译文」与歌词面板互通，悬浮字号和字距与浮窗设置互通；
 // - 减少动态效果：跟随系统辅助功能设置（动效实现处均已遵守），只读呈现；
-// - 本地数据：歌词库位置说明与备份提示；真实模式提供「更改保存位置」
-//   （选目录 → 在线备份搬数据 → 立即生效，不要求重启）；
-// - 开发者调试：原始快照（DisclosureGroup 默认收起，不再是常驻元素）。
+// - 本地数据：保存位置、歌词资源和备份与导出；
+// - 播放诊断：默认收起的只读播放快照。
 
 struct SettingsPageView: View {
     @EnvironmentObject private var model: AppModel
@@ -25,7 +24,7 @@ struct SettingsPageView: View {
     @AppStorage(FloatingLyricsSettings.characterSpacingPreferenceKey)
     private var floatingLyricsCharacterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isDebugExpanded = false
+    @State private var isDiagnosticsExpanded = false
     @State private var isResourceManagementPresented = false
     /// 待确认切换的目标目录（NSOpenPanel 结果；nil = 无待确认操作）。
     @State private var pendingSwitchDirectory: URL?
@@ -38,7 +37,7 @@ struct SettingsPageView: View {
                 autoFetchSection
                 displaySection
                 dataSection
-                debugSection
+                diagnosticsSection
             }
             .padding(24)
             .frame(maxWidth: 640, alignment: .leading)
@@ -159,70 +158,38 @@ struct SettingsPageView: View {
     // MARK: - 本地数据（含保存位置切换）
 
     private var dataSection: some View {
-        section(title: "本地数据") {
-            Text("歌词库位置：\(model.lyricsDatabaseNote)")
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if !model.isMock {
-                storageLocationControls
-            }
-            Text("学习资料只保存在本机；JSON 备份是本地文件导出，不上传。数据目录在应用外的普通文件夹中，删除 App 不会自动删除数据，请定期导出完整备份。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("缓存资源管理…") { isResourceManagementPresented = true }
-                .disabled(model.library == nil || model.isSwitchingStorage)
-                .help("查看本机保存的歌词和译文，选择删除、清理未关联资源或删除全部")
-            Button("打开学习歌曲页（歌词库 / 备份 / 导出 LRC）") {
-                NotificationCenter.default.post(name: .shinSelectLibraryPage, object: nil)
-            }
-            .help("歌词库管理：编辑、重新关联、删除、备份与 LRC 导出")
-        }
-    }
-
-    /// 保存位置控件：位置对照、更改/恢复入口、切换进度与结果（真实模式）。
-    @ViewBuilder
-    private var storageLocationControls: some View {
-        let override = LyricsDatabase.storedOverrideDirectory()
-        if override != nil {
-            Text("默认位置：\(Self.defaultDirectoryText)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        HStack(spacing: 12) {
-            Button("更改保存位置…") {
-                chooseStorageDirectory()
-            }
-            .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
-            .help("选择一个文件夹存放歌词数据库；现有数据会自动复制过去并立即生效")
-            if override != nil {
-                Button("恢复默认位置") {
-                    isRestoreDefaultConfirmVisible = true
+        let usesCustomLocation = !model.isMock && LyricsDatabase.storedOverrideDirectory() != nil
+        return section(title: "本地数据") {
+            VStack(alignment: .leading, spacing: 12) {
+                dataRow("保存位置", symbol: "folder") {
+                    storageLocationDetails(usesCustomLocation: usesCustomLocation)
+                } actions: {
+                    if !model.isMock {
+                        storageLocationControls(usesCustomLocation: usesCustomLocation)
+                    }
                 }
-                .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
-                .help("把歌词数据库移回默认位置（Application Support/ShinApple）")
+                Divider()
+                dataRow("本地歌词资源", symbol: "tray.full") {
+                    Text("查看或清理本机保存的歌词与译文。")
+                } actions: {
+                    Button("管理资源…") { isResourceManagementPresented = true }
+                        .disabled(model.library == nil || model.isSwitchingStorage)
+                }
+                Divider()
+                dataRow("备份与导出", symbol: "archivebox") {
+                    Text("导入或导出完整 JSON 备份，也可导出 LRC 歌词。")
+                } actions: {
+                    Button("打开学习歌曲") {
+                        NotificationCenter.default.post(name: .shinSelectLibraryPage, object: nil)
+                    }
+                }
             }
-        }
-        if model.isSwitchingStorage {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("正在切换保存位置……")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        if let message = model.storageSwitchMessage {
-            Text(message)
-                .font(.callout)
+            Text("学习资料与备份都保存在本机。卸载 App 后，数据文件仍保留。")
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
+                .padding(.top, 4)
         }
-        Text("切换立即生效（不需要重启）：数据会以一致性快照复制到新位置，旧位置文件保留作安全副本；切换会关闭未完成的导入/编辑窗口。")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        // 切换确认（两处共用一套文案语义：搬运数据 + 关闭未完成窗口）。
         .alert("切换保存位置", isPresented: Binding(
             get: { pendingSwitchDirectory != nil },
             set: { if !$0 { pendingSwitchDirectory = nil } }
@@ -237,7 +204,7 @@ struct SettingsPageView: View {
                 pendingSwitchDirectory = nil
             }
         } message: {
-            Text("将把歌词数据库复制到所选文件夹并立即启用。进行中的导入/编辑窗口会被关闭（未保存的草稿会丢失）；旧位置的数据文件会保留作安全副本。")
+            Text(Self.storageSwitchExplanation)
         }
         .alert("恢复默认位置", isPresented: $isRestoreDefaultConfirmVisible) {
             Button("恢复", role: .destructive) {
@@ -245,13 +212,92 @@ struct SettingsPageView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将把歌词数据库复制回默认位置（Application Support/ShinApple）并立即启用；当前自定义位置的数据文件会保留作安全副本。")
+            Text(Self.storageSwitchExplanation)
         }
     }
 
-    /// 默认目录的展示文案（读取失败时给出可读说明，不伪装成功）。
-    private static var defaultDirectoryText: String {
-        (try? LyricsDatabase.defaultRealDirectory())?.path ?? "（默认目录不可用）"
+    private func dataRow<Details: View, Actions: View>(
+        _ title: String,
+        symbol: String,
+        @ViewBuilder details: () -> Details,
+        @ViewBuilder actions: () -> Actions
+    ) -> some View {
+        let heading = Text(title).font(.callout.weight(.semibold))
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+                .padding(.top, 3)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        heading
+                        Spacer(minLength: 0)
+                        actions().fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        heading
+                        actions()
+                    }
+                }
+                details()
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private static let storageSwitchExplanation =
+        "目标位置没有歌词库时会复制当前资料。已有歌词库时会直接打开该库，两个库各自保留。"
+        + "切换立即生效，原位置的数据保留。打开的导入和编辑窗口会关闭，未保存的内容将丢失。"
+
+    private func storageLocationControls(usesCustomLocation: Bool) -> some View {
+        HStack(spacing: 8) {
+            Button("更改位置…", action: chooseStorageDirectory)
+                .help("选择要使用的歌词库文件夹")
+            if usesCustomLocation {
+                Button("恢复默认位置") { isRestoreDefaultConfirmVisible = true }
+            }
+        }
+        .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
+    }
+
+    @ViewBuilder
+    private func storageLocationDetails(usesCustomLocation: Bool) -> some View {
+        if let directory = model.lyricsDatabaseDirectory {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(model.isMock ? "模拟模式 · 临时目录" : usesCustomLocation ? "自定义位置" : "默认位置")
+                Text((directory.path as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .help(directory.path)
+                    .contextMenu {
+                        Button("复制完整路径") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(directory.path, forType: .string)
+                        }
+                    }
+            }
+        } else {
+            Text(model.lyricsDatabaseNote)
+                .textSelection(.enabled)
+        }
+        if !model.isMock {
+            if model.isSwitchingStorage {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在切换保存位置……")
+                }
+            }
+            if let message = model.storageSwitchMessage {
+                Text(message)
+                    .textSelection(.enabled)
+            }
+        }
     }
 
     /// 打开系统目录选择面板（AppKit NSOpenPanel；项目允许局部增强）。
@@ -266,15 +312,20 @@ struct SettingsPageView: View {
         pendingSwitchDirectory = url
     }
 
-    // MARK: - 开发者调试（默认收起）
+    // MARK: - 播放诊断（默认收起）
 
-    private var debugSection: some View {
-        section(title: "开发者调试") {
-            DisclosureGroup("原始播放快照", isExpanded: $isDebugExpanded) {
+    private var diagnosticsSection: some View {
+        section(title: "播放诊断") {
+            Text("用于排查播放异常和歌词不同步，查看「音乐」上报的播放状态、进度和错误码。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup("查看原始播放快照", isExpanded: $isDiagnosticsExpanded) {
                 Text(model.rawSnapshotDescription)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 4)
             }

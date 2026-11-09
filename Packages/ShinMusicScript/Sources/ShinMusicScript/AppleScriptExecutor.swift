@@ -50,6 +50,10 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
         try runSource(Self.commandSource("pause"), name: "pause")
     }
 
+    public func stop() throws {
+        try runSource(Self.commandSource("stop"), name: "stop")
+    }
+
     public func nextTrack() throws {
         try runSource(Self.commandSource("next track"), name: "nextTrack")
     }

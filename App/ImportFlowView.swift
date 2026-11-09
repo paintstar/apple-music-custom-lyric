@@ -285,7 +285,7 @@ struct ImportFlowView: View {
                     Task { await flow.confirm() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(!preview.isImportable)
+                .disabled(!preview.isImportable || flow.isRecomputingBilingual)
             case .idle:
                 EmptyView()
             case .loadingPreview, .saving, .succeeded:

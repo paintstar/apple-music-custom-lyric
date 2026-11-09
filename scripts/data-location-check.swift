@@ -114,6 +114,7 @@ private struct DataLocationCheck {
         let flowB = model.importFlow
         precondition(flowB != nil)
         let trackKeyB = "music-script:persistent:BEEF0002"
+        model.isImportPresented = true
         await flowB?.openSession(target: ImportSessionTarget(
             trackKey: trackKeyB, titleHint: "切换后新导入", artistHint: "测试歌手", durationHintMs: 20_000
         ))
@@ -123,8 +124,8 @@ private struct DataLocationCheck {
             preconditionFailure("切换后粘贴导入应可解析：\(flowB?.alertMessage ?? "?")")
         }
         await flowB?.confirm()
-        guard case .succeeded = flowB?.phase else {
-            preconditionFailure("切换后确认导入应成功：\(flowB?.alertMessage ?? "?")")
+        guard case .idle = flowB?.phase, flowB?.alertMessage == nil, !model.isImportPresented else {
+            preconditionFailure("切换后应成功完成导入并收起窗口：\(flowB?.alertMessage ?? "?")")
         }
         let bindingAtB = try await storeB.binding(forTrackKey: trackKeyB)
         precondition(bindingAtB != nil, "新导入应写入新位置")

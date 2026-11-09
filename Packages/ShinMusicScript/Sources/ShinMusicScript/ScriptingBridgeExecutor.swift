@@ -153,6 +153,10 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
         }
     }
 
+    public func stop() throws {
+        try commandExecutor.stop()
+    }
+
     public func nextTrack() throws {
         // 词典命令本身正确，但 optional 消息不提供执行确认；固定 AppleScript
         // 模板会检查运行状态，并把权限、超时等失败传回调用方。

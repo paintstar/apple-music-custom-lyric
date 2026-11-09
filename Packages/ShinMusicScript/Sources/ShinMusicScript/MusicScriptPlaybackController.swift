@@ -55,10 +55,10 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     private let sessionEpoch: Int
     /// 重型资料库读取有自己的串行执行器，不能阻塞播放采样锁。
     private(set) var libraryCache = MusicLibraryCache()
-    /// 本适配器实现 Music 词典中的播放、切歌和跳转命令；
+    /// 本适配器实现 Music 词典中的播放、停止、切歌和跳转命令；
     /// 命令能否执行仍受授权、曲目与当前播放器状态约束。
     private let capabilities = PlaybackCapabilities(
-        playPause: true, next: true, previous: true, seek: true
+        playPause: true, next: true, previous: true, seek: true, stop: true
     )
 
     /// - Parameters:
@@ -183,6 +183,10 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
 
     public func pause() async throws {
         try await performTransportCommand { try self.executor.pause() }
+    }
+
+    public func stop() async throws {
+        try await performTransportCommand { try self.executor.stop() }
     }
 
     public func seek(positionMs ms: Int64) async throws {

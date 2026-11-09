@@ -20,6 +20,11 @@ struct ImportBilingualSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let statusLabel = fetchedTranslationStatusLabel {
+                Label(statusLabel, systemImage: "text.bubble")
+                    .font(.callout.weight(.medium))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack(spacing: 10) {
                 Toggle("包含译文", isOn: translationIncludedBinding)
                 if flow.isRecomputingBilingual {
@@ -39,6 +44,19 @@ struct ImportBilingualSection: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.accentColor.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var fetchedTranslationStatusLabel: String? {
+        switch flow.fetchedTranslationStatus {
+        case .unavailable:
+            return "来源未提供译文"
+        case .unmatched:
+            return "收到译文，但未能配对"
+        case .matched(let count):
+            return preview.isImportable ? "已配对 \(count) 行译文" : "收到译文，当前歌词有解析错误"
+        case nil:
+            return nil
+        }
     }
 
     // MARK: - 模式选择

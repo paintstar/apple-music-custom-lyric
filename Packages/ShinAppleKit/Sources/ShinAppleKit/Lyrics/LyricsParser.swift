@@ -54,6 +54,14 @@ public enum LyricsParser {
         return LyricParseResult(document: document, diagnostics: context.diagnostics)
     }
 
+    /// 按导入的时间戳语法解析方括号内的内容。用于需要精确配对的场景，小数秒需能完整表示为毫秒。
+    public static func exactTimestampMilliseconds(inTagContent content: String) -> Int64? {
+        guard case let .timestamp(timestamp) = LRCTagScanner.classifyBracket(content),
+              case let .success(value) = LRCTagScanner.timestampValue(timestamp),
+              !value.fractionTruncated else { return nil }
+        return value.ms
+    }
+
     // MARK: - 解析上下文
 
     /// 单行收集结果（order 为收集顺序，供稳定排序使用）。

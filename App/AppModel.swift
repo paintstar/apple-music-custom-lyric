@@ -25,8 +25,8 @@ final class AppModel: ObservableObject {
             ?? (isMock ? MockPlaybackOptionsController() : MusicScriptPlaybackOptionsService())
         return PlaybackOptionsModel(service: service)
     }()
-    /// 目录搜索服务仅 Mock 模式提供：真实模式播放来自「音乐」App 本身，
-    /// 不提供官方目录搜索。
+    lazy var playbackMenuState = PlaybackMenuState(model: self)
+    /// 仅 Mock 模式提供目录搜索，真实模式播放来自「音乐」App。
     private let searchService: CatalogSearchService?
 
     @Published private(set) var setup: SetupState = .loading
@@ -471,7 +471,7 @@ extension AppModel {
     }
 
     /// 仅持有既有独立命令的任务句柄，完成即释放，退出时统一取消。
-    private func launchPlaybackTask(_ operation: @escaping @MainActor () async -> Void) {
+    func launchPlaybackTask(_ operation: @escaping @MainActor () async -> Void) {
         guard !isTerminating else { return }
         let id = UUID()
         playbackTasks[id] = Task { [weak self] in

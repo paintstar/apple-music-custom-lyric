@@ -33,6 +33,30 @@ struct LyricTimestampParsingTests {
         #expect(result.document.lines.map(\.startMs) == [1_005])
     }
 
+    @Test("双冒号时间戳按两位百分秒解析，可与点号混用，仍校验格式和秒范围")
+    func colonCentiseconds() throws {
+        let valid = try LyricFixture.parse("""
+        [00:00:79]第一句测试文本
+        [00:04:46][00:29:15]重复测试文本
+        [00:59.999]最后一句测试文本
+        """)
+        #expect(valid.isImportable)
+        #expect(valid.diagnostics.isEmpty)
+        #expect(valid.document.lines.map(\.startMs) == [790, 4_460, 29_150, 59_999])
+
+        let invalid = try LyricFixture.parse("""
+        [00:04:6]单数字测试文本
+        [00:04:460]三数字测试文本
+        [00:04:4.6]多分隔符测试文本
+        [00:60:00]秒越界测试文本
+        """)
+        #expect(!invalid.isImportable)
+        #expect(invalid.document.lines.isEmpty)
+        #expect(invalid.diagnostics.map(\.code) == [
+            .timestampFormatInvalid, .timestampFormatInvalid, .timestampFormatInvalid, .secondsOutOfRange
+        ])
+    }
+
     @Test("[61:02.300] → 3662300ms（分钟可超 59）")
     func minutesBeyond59() throws {
         let result = try LyricFixture.parse("[61:02.300]第一句测试文本\n")

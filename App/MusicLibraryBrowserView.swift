@@ -1,12 +1,22 @@
 import SwiftUI
 import ShinAppleKit
 
+struct MusicLibraryTrackReveal {
+    let id = UUID()
+    let destination: MusicLibraryDestination
+    let trackKey: String
+}
+
 /// 同步自官方「音乐」App 的资料库浏览；所有行都来自公开脚本读取的记录。
 struct MusicLibraryBrowserView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var browser: MusicLibraryBrowserModel
     @Binding var page: SidebarPage
     var bottomContentInset: CGFloat = 24
+    var searchFocusRequest: Binding<UUID?>?
+    var trackRevealRequest: Binding<MusicLibraryTrackReveal?>?
+    @FocusState private var isSearchFocused: Bool
+
     var body: some View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
@@ -26,6 +36,11 @@ struct MusicLibraryBrowserView: View {
         }
         .background(Color(nsColor: .underPageBackgroundColor))
         .task { browser.startIfNeeded() }
+        .onChange(of: searchFocusRequest?.wrappedValue, initial: true) { _, request in
+            guard request != nil else { return }
+            isSearchFocused = true
+            searchFocusRequest?.wrappedValue = nil
+        }
     }
 
     private func toolbar(width: CGFloat) -> some View {
@@ -63,6 +78,7 @@ struct MusicLibraryBrowserView: View {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
             TextField(browser.destination == .search ? "搜索资料库" : "在当前列表中查找", text: $browser.searchText)
                 .textFieldStyle(.plain)
+                .focused($isSearchFocused)
                 .accessibilityLabel("搜索已同步音乐资料库")
             if !browser.searchText.isEmpty {
                 Button { browser.searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
@@ -88,6 +104,12 @@ struct MusicLibraryBrowserView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
+            scrollContent(width: width)
+        }
+    }
+
+    private func scrollContent(width: CGFloat) -> some View {
+        ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     libraryHeader(width: width)
@@ -120,6 +142,13 @@ struct MusicLibraryBrowserView: View {
                 .padding(.horizontal, width < 500 ? 16 : 28)
                 .padding(.bottom, bottomContentInset)
             }
+            .onChange(of: trackRevealRequest?.wrappedValue?.id, initial: true) { _, _ in
+                guard let request = trackRevealRequest?.wrappedValue, request.destination == browser.destination,
+                      request.trackKey == model.snapshot.trackKey, browser.hasTrackRow(request.trackKey) else { return }
+                browser.selectedTrackID = request.trackKey
+                scroll.scrollTo(request.trackKey, anchor: .center)
+                trackRevealRequest?.wrappedValue = nil
+            }
         }
     }
 
@@ -140,8 +169,9 @@ struct MusicLibraryBrowserView: View {
                 Text(browser.isFolder ? "播放列表文件夹" : "\(browser.displayedTracks.count) 首歌曲")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                if case .playlist = browser.destination, !browser.isFolder {
-                    playlistSortMenu
+                if case let .playlist(id) = browser.destination, !browser.isFolder {
+                    MusicLibraryPlaylistSortMenu(browser: browser, playlistID: id, sort: browser.playlistSort)
+                        .equatable()
                 }
                 if browser.destination == .search {
                     Text("搜索已同步的歌曲、艺人和专辑。")
@@ -184,40 +214,6 @@ struct MusicLibraryBrowserView: View {
         }
         .padding(.top, 24)
         .padding(.bottom, 32)
-    }
-
-    private var playlistSortMenu: some View {
-        let sort = browser.playlistSort
-        let original = sort.field == .returnedOrder
-        let ascendingTitle = original ? "正向" : "升序"
-        let descendingTitle = original ? "反向" : "降序"
-        return Menu {
-            Picker("排序依据", selection: Binding(get: { browser.playlistSort.field }, set: { field in
-                browser.setPlaylistSort(MusicLibraryPlaylistSort(field: field, ascending: field != .dateAdded))
-            })) {
-                ForEach(MusicLibraryPlaylistSort.Field.allCases, id: \.self) { field in
-                    Text(field.title).tag(field)
-                }
-            }
-            Picker("排列方向", selection: Binding(get: { browser.playlistSort.ascending }, set: { ascending in
-                browser.setPlaylistSort(MusicLibraryPlaylistSort(field: browser.playlistSort.field, ascending: ascending))
-            })) {
-                Text(ascendingTitle).tag(true)
-                Text(descendingTitle).tag(false)
-            }
-            Divider()
-            Text("排序仅作用于本应用，按歌单分别记住。")
-            Text("不会自动同步官方界面当前的排序。")
-            if sort.field == .dateAdded { Text("Music 提供的添加时间，不保证与官方最近添加显示或收藏时间一致。") }
-        } label: {
-            Label("\(sort.field.title) · \(sort.ascending ? ascendingTitle : descendingTitle)",
-                  systemImage: "arrow.up.arrow.down")
-                .font(.callout)
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .accessibilityLabel("播放列表排序")
-        .help("默认保留脚本返回的歌单顺序；添加时间由 Music 提供，不保证与官方最近添加显示或收藏时间一致。")
     }
 
     private var tableHeader: some View {
@@ -318,5 +314,79 @@ struct MusicLibraryBrowserView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .background(.orange.opacity(0.10))
+    }
+}
+
+struct MusicLibraryStatusBar: View {
+    @ObservedObject var browser: MusicLibraryBrowserModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(.bar)
+        }
+    }
+
+    private var status: String {
+        if browser.isFolder { return "\(browser.childPlaylists.count) 个播放列表" }
+        if browser.isLoading && browser.isPartial {
+            return "已同步 \(browser.tracks.count) / \(browser.totalCount) 首歌曲"
+        }
+        return "\(browser.displayedTracks.count) 首歌曲"
+    }
+}
+
+/// 播放快照会刷新上层视图。仅在当前歌单或排序变化时更新原生菜单内容。
+private struct MusicLibraryPlaylistSortMenu: View, Equatable {
+    let browser: MusicLibraryBrowserModel
+    let playlistID: String
+    let sort: MusicLibraryPlaylistSort
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.browser === rhs.browser && lhs.playlistID == rhs.playlistID && lhs.sort == rhs.sort
+    }
+
+    var body: some View {
+        let original = sort.field == .returnedOrder
+        let ascendingTitle = original ? "正向" : "升序"
+        let descendingTitle = original ? "反向" : "降序"
+        Menu {
+            Picker("排序依据", selection: Binding(get: { sort.field }, set: { field in
+                setSort(MusicLibraryPlaylistSort(field: field, ascending: field != .dateAdded))
+            })) {
+                ForEach(MusicLibraryPlaylistSort.Field.allCases, id: \.self) { field in
+                    Text(field.title).tag(field)
+                }
+            }
+            Picker("排列方向", selection: Binding(get: { sort.ascending }, set: { ascending in
+                setSort(MusicLibraryPlaylistSort(field: sort.field, ascending: ascending))
+            })) {
+                Text(ascendingTitle).tag(true)
+                Text(descendingTitle).tag(false)
+            }
+            Divider()
+            Text("排序仅作用于本应用，按歌单分别记住。")
+            Text("不会自动同步官方界面当前的排序。")
+            if sort.field == .dateAdded { Text("Music 提供的添加时间，不保证与官方最近添加显示或收藏时间一致。") }
+        } label: {
+            Label("\(sort.field.title) · \(sort.ascending ? ascendingTitle : descendingTitle)",
+                  systemImage: "arrow.up.arrow.down")
+                .font(.callout)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("播放列表排序")
+        .help("默认保留脚本返回的歌单顺序；添加时间由 Music 提供，不保证与官方最近添加显示或收藏时间一致。")
+    }
+
+    private func setSort(_ newSort: MusicLibraryPlaylistSort) {
+        guard browser.destination == .playlist(playlistID) else { return }
+        browser.setPlaylistSort(newSort)
     }
 }

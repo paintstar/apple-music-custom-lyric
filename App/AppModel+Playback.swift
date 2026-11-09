@@ -5,6 +5,27 @@ extension AppModel {
     func playNext() { changeTrack(forward: true) }
     func playPrevious() { changeTrack(forward: false) }
 
+    func stopPlayback() {
+        guard case .ready = setup, !isChangingTrack, snapshot.capabilities?.stop == true else { return }
+        let expected = controller.snapshot()
+        playbackMessage = nil
+        launchPlaybackTask { [weak self] in
+            guard let self, self.isCurrentTrack(expected) else { return }
+            do {
+                try await self.controller.stop()
+                guard !Task.isCancelled, !self.isTerminating else { return }
+                self.applySnapshot(self.controller.snapshot())
+            } catch is CancellationError {
+            } catch let error as PlaybackError {
+                guard !Task.isCancelled, !self.isTerminating, self.isCurrentTrack(expected) else { return }
+                self.handlePlaybackError(error)
+            } catch {
+                guard !Task.isCancelled, !self.isTerminating, self.isCurrentTrack(expected) else { return }
+                self.playbackMessage = "停止播放失败：\(String(describing: error))"
+            }
+        }
+    }
+
     private func changeTrack(forward: Bool) {
         guard !isChangingTrack else { return }
         transportSequence += 1

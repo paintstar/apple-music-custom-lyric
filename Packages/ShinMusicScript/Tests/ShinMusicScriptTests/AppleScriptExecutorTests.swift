@@ -125,13 +125,14 @@ struct AppleScriptExecutorParsingTests {
 
 struct ExecutorConstructionTests {
 
-    @Test("切歌通过注入的公开脚本执行器发送，失败不能静默吞掉")
+    @Test("停止和切歌通过注入的公开脚本执行器发送，失败不能静默吞掉")
     func transportUsesCommandExecutor() throws {
         let commands = FakeMusicScriptExecutor()
         let executor = ScriptingBridgeExecutor(commandExecutor: commands)
+        try executor.stop()
         try executor.nextTrack()
         try executor.previousTrack()
-        #expect(commands.recordedCommands == ["nextTrack", "previousTrack"])
+        #expect(commands.recordedCommands == ["stop", "nextTrack", "previousTrack"])
         commands.failCommand("nextTrack", with: .permissionDenied)
         #expect(throws: MusicScriptFailure.permissionDenied) { try executor.nextTrack() }
         commands.failCommand("previousTrack", with: .timeout)

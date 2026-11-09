@@ -18,6 +18,7 @@ struct PlayerBarView: View {
     var showsLyrics = false
     var floatingLyricsControl: AnyView?
     var trailingMenu: AnyView?
+    var playbackListVisibility: Binding<Bool>?
     @State private var isArtworkHovered = false
     @State private var showsPlaybackList = false
 
@@ -105,17 +106,18 @@ struct PlayerBarView: View {
     }
 
     private var playbackListButton: some View {
-        Button { showsPlaybackList.toggle() } label: {
+        let visibility = playbackListVisibility ?? $showsPlaybackList
+        return Button { visibility.wrappedValue.toggle() } label: {
             Image(systemName: "list.bullet")
                 .font(.system(size: PlaybackControlSizing.iconSize, weight: .medium))
-                .foregroundStyle(showsPlaybackList ? Color.appleMusicPink : .secondary)
+                .foregroundStyle(visibility.wrappedValue ? Color.appleMusicPink : .secondary)
                 .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(PlaybackButtonStyle(isSelected: showsPlaybackList))
+        .buttonStyle(PlaybackButtonStyle(isSelected: visibility.wrappedValue))
         .accessibilityLabel("当前播放列表")
         .help("显示当前播放列表")
-        .popover(isPresented: $showsPlaybackList) {
+        .popover(isPresented: visibility) {
             PlaybackListView(browser: model.musicLibraryBrowser).environmentObject(model)
         }
     }

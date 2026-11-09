@@ -160,21 +160,39 @@ struct PlayerWindowAccessor: NSViewRepresentable {
     let controller: PlayerWindowController
     var initiallyCompact = false
     var needsExpandedWindow = false
+    var menuRouter: MusicWindowMenuRouter?
+    var menuActions: MusicWindowMenuActions?
 
     func makeNSView(context: Context) -> WindowProbe {
-        WindowProbe(controller: controller, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
+        let probe = WindowProbe(controller: controller, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
+        probe.configureMenu(router: menuRouter, actions: menuActions)
+        return probe
     }
 
     func updateNSView(_ nsView: WindowProbe, context: Context) {
         nsView.initiallyCompact = initiallyCompact
         nsView.needsExpandedWindow = needsExpandedWindow
         controller.attach(nsView.window, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
+        nsView.configureMenu(router: menuRouter, actions: menuActions)
+    }
+
+    static func dismantleNSView(_ nsView: WindowProbe, coordinator: ()) {
+        nsView.configureMenu(router: nil, actions: nil)
     }
 
     final class WindowProbe: NSView {
+        private static let menuStateNotifications = [
+            NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+            NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification
+        ]
+
         let controller: PlayerWindowController
         var initiallyCompact: Bool
         var needsExpandedWindow: Bool
+        private weak var menuRouter: MusicWindowMenuRouter?
+        private weak var menuWindow: NSWindow?
+        private var menuActions: MusicWindowMenuActions?
+        private var menuUpdateScheduled = false
 
         init(controller: PlayerWindowController, initiallyCompact: Bool, needsExpandedWindow: Bool) {
             self.controller = controller
@@ -188,11 +206,58 @@ struct PlayerWindowAccessor: NSViewRepresentable {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             controller.attach(window, initiallyCompact: initiallyCompact, needsExpandedWindow: needsExpandedWindow)
+            observeMenuWindow(menuRouter == nil ? nil : window)
         }
 
         override func layout() {
             super.layout()
             controller.refreshWindowButtons()
+        }
+
+        func configureMenu(router: MusicWindowMenuRouter?, actions: MusicWindowMenuActions?) {
+            let routerChanged = menuRouter !== router
+            guard routerChanged || menuActions != actions else { return }
+            if routerChanged, let previous = menuRouter {
+                let owner = ObjectIdentifier(self)
+                DispatchQueue.main.async { [weak previous] in previous?.clear(from: owner) }
+            }
+            menuRouter = router
+            menuActions = actions
+            observeMenuWindow(router == nil ? nil : window)
+            scheduleMenuUpdate()
+        }
+
+        private func observeMenuWindow(_ window: NSWindow?) {
+            guard menuWindow !== window else { return }
+            let center = NotificationCenter.default
+            if let previous = menuWindow {
+                for name in Self.menuStateNotifications {
+                    center.removeObserver(self, name: name, object: previous)
+                }
+                center.removeObserver(self, name: NSWindow.willCloseNotification, object: previous)
+            }
+            menuWindow = window
+            if let window {
+                for name in Self.menuStateNotifications {
+                    center.addObserver(self, selector: #selector(menuFocusChanged), name: name, object: window)
+                }
+                center.addObserver(self, selector: #selector(menuWindowWillClose), name: NSWindow.willCloseNotification, object: window)
+            }
+            scheduleMenuUpdate()
+        }
+
+        @objc private func menuFocusChanged(_ notification: Notification) { scheduleMenuUpdate() }
+
+        @objc private func menuWindowWillClose(_ notification: Notification) { observeMenuWindow(nil) }
+
+        private func scheduleMenuUpdate() {
+            guard !menuUpdateScheduled, menuRouter != nil else { return }
+            menuUpdateScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.menuUpdateScheduled = false
+                self.menuRouter?.publish(self.menuActions, from: ObjectIdentifier(self), window: self.menuWindow)
+            }
         }
     }
 }

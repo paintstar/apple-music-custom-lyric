@@ -123,6 +123,7 @@ public protocol MusicScriptExecutor: AnyObject, Sendable {
 
     func play() throws
     func pause() throws
+    func stop() throws
     func nextTrack() throws
     func previousTrack() throws
 
@@ -131,6 +132,12 @@ public protocol MusicScriptExecutor: AnyObject, Sendable {
 
     /// 按 persistent ID 在音乐库定位曲目并播放（v2 点播预留）。
     func playPersistentID(_ persistentID: String) throws
+}
+
+public extension MusicScriptExecutor {
+    func stop() throws {
+        throw MusicScriptFailure.commandUnsupported("stop")
+    }
 }
 
 /// Apple Event / 脚本错误码 → 执行器层失败的统一映射。

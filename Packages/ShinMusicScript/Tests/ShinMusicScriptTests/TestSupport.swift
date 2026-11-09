@@ -194,6 +194,10 @@ final class FakeMusicScriptExecutor: MusicScriptExecutor, @unchecked Sendable {
         try record("pause")
     }
 
+    func stop() throws {
+        try record("stop")
+    }
+
     func nextTrack() throws {
         try record("nextTrack")
     }

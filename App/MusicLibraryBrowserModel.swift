@@ -424,16 +424,18 @@ final class MusicLibraryBrowserModel: ObservableObject {
 }
 
 extension MusicLibraryBrowserModel {
+    func waitForTrackRows() async {
+        await loadTask?.value
+        await filterTask?.value
+    }
     func artworkData(for trackRef: String, in source: MusicLibrarySource? = nil) async -> Data? {
         guard !isTerminating, !Task.isCancelled, let service else { return nil }
         let data = try? await service.artworkData(for: trackRef, in: source ?? destination.source)
         guard !isTerminating, !Task.isCancelled else { return nil }
         return data
     }
-}
 
-private extension MusicLibraryBrowserModel {
-    func updateFavorite(_ trackRef: String, value: Bool) {
+    private func updateFavorite(_ trackRef: String, value: Bool) {
         for key in Array(cache.keys) {
             guard var page = cache[key] else { continue }
             for index in page.tracks.indices where page.tracks[index].trackRef == trackRef {
@@ -447,22 +449,20 @@ private extension MusicLibraryBrowserModel {
         scheduleFilter()
     }
 
-    func invalidateFavoriteMembership(changedIn source: MusicLibrarySource) {
+    private func invalidateFavoriteMembership(changedIn source: MusicLibrarySource) {
         refreshPlaylists()
         for key in Array(cache.keys) {
             if case .playlist = key { cache[key] = nil }
         }
-        // Music 可配置为把新喜爱的歌单曲目加入资料库，因此跨来源写入也使全库缓存失效。
         if source != .library { cache[.library] = nil }
         if case .playlist = destination.source {
             loadPage(reset: true, includePlaylists: false)
         } else if isLoading || source != .library {
             loadPage(reset: true, includePlaylists: false)
         }
-        // 保留 selectedTrackID、搜索和滚动位置；实际成员仍由 Music 重新读取。
     }
 
-    func preparePlaylistRefresh(if requested: Bool) -> Int {
+    private func preparePlaylistRefresh(if requested: Bool) -> Int {
         if requested {
             playlistSequence += 1
             playlistTask?.cancel()
@@ -470,12 +470,12 @@ private extension MusicLibraryBrowserModel {
         return playlistSequence
     }
 
-    func applyPlaylists(_ playlists: [MusicLibraryPlaylist], sequence: Int) {
+    private func applyPlaylists(_ playlists: [MusicLibraryPlaylist], sequence: Int) {
         guard sequence == playlistSequence else { return }
         self.playlists = playlists
     }
 
-    func refreshPlaylists() {
+    private func refreshPlaylists() {
         guard !isTerminating, let service else { return }
         playlistSequence += 1
         let sequence = playlistSequence

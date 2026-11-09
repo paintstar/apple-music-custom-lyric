@@ -3,6 +3,7 @@ import Foundation
 import ShinAppleKit
 import ShinAppleData
 import ShinAppServices
+import ShinLyricsProvider
 
 // 粘贴导入回归（2026-09-24）：直接驱动 ImportFlowModel，覆盖
 // 空白拒绝 / 单语 LRC 与纯文本解析 / 双语成对模式 / 重新输入保留文本 /
@@ -96,6 +97,53 @@ private struct ImportPasteCheck {
         print("PASS 导入自动关闭与跟随：暂停定位、未知位置、纯文本、切歌与同歌曲重开保护")
     }
 
+    @MainActor private static func checkFetchedTranslation(store: GRDBLyricsStore) async throws {
+        let model = AppModel(isMock: true, controller: MockPlaybackController(), searchService: nil)
+        model.installLyricsServiceGraph(store: store, note: "原创测试临时歌词库")
+        let flow = model.importFlow!
+        let target = ImportSessionTarget(trackKey: "music-script:persistent:FACE0A16", titleHint: "原创纸船")
+        let provenance = FetchProvenance(provider: "netease", externalRef: "netease:song:4101",
+                                         matchKind: .userConfirmed, queryTitle: "原创纸船")
+        let original = "[00:04:46]雨滴落上纸船"
+        let duplicateTime = "\(original)\n[00:04:46]纸船漂过浅湾"
+        let cases: [(NeteaseLyrics, BilingualLRCTranslationStatus)] = [
+            (NeteaseLyrics(songId: 4101, originalLRC: original, translatedLRC: "[00:04.460]雨落在折好的纸船上"),
+             .matched(lineCount: 1)),
+            (NeteaseLyrics(songId: 4101, originalLRC: duplicateTime, translatedLRC: "[00:04.461]晚风吹过浅湾"),
+             .unmatched),
+            (NeteaseLyrics(songId: 4101, originalLRC: duplicateTime, translatedLRC: nil), .unavailable)
+        ]
+        for (lyrics, status) in cases {
+            model.handleFetchedLyrics(lyrics, provenance: provenance, target: target)
+            try await eventually("在线取词后应进入预览") {
+                if case .ready = flow.phase { return true }
+                return false
+            }
+            guard case let .ready(preview, _) = flow.phase else { preconditionFailure("在线预览应已就绪") }
+            precondition(flow.fetchedTranslationStatus == status, "在线译文状态与合成结果不一致")
+            if case .matched = status {
+                precondition(flow.translationIncluded && preview.bilingual?.translatedLineCount == 1,
+                             "在线预览就绪时应完成双冒号译文配对")
+                await flow.confirm()
+                let saved = try await store.document(id: preview.documentId)
+                let line = saved?.lines.first
+                precondition(saved?.lines.count == 1 && line?.startMs == 4_460 && line?.text == "雨滴落上纸船"
+                             && line?.translations[BilingualImportMapper.translationLanguageKey]?.text == "雨落在折好的纸船上",
+                             "确认后应保存该时间点的原文与配对译文")
+            } else {
+                precondition(preview.pairedTimestampsAvailable && !flow.translationIncluded && preview.bilingual == nil,
+                             "只有原文的同时间戳行组不得自动当成双语")
+                flow.resetToIdle()
+                flow.pastedText = original
+                await flow.ingestPastedText()
+                guard case .ready = flow.phase else { preconditionFailure("重新输入后应能手动导入") }
+                precondition(flow.fetchedTranslationStatus == nil, "手动导入不得显示上次在线译文状态")
+                await flow.cancel()
+            }
+        }
+        print("PASS 在线导入：双冒号译文保存、译文缺失与未配对区分、切回手动输入清理状态")
+    }
+
     @MainActor private static func runChecks() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("shin-import-paste-check-\(UUID())")
@@ -186,6 +234,7 @@ private struct ImportPasteCheck {
 
         print("PASS 粘贴导入：空白拒绝/LRC 与纯文本解析/双语成对/重新输入保留/超限拒绝/确认落库/取消与会话清理")
         try await checkAutomaticReturn(store: store)
+        try await checkFetchedTranslation(store: store)
     }
 
     static func main() {

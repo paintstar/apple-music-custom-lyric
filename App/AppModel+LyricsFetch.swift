@@ -87,15 +87,14 @@ extension AppModel {
         target: ImportSessionTarget
     ) {
         guard let flow = importFlow else { return }
-        let merged = BilingualLRCSynthesizer.synthesize(
+        let merged = BilingualLRCSynthesizer.synthesizeWithStatus(
             originalLRC: lyrics.originalLRC,
             translatedLRC: lyrics.translatedLRC
         )
         isLyricsFetchPresented = false
         isImportPresented = true
         Task {
-            await flow.openSession(target: target, provenance: provenance)
-            await flow.ingestFetchedText(merged)
+            await flow.openSession(target: target, provenance: provenance, fetchedLyrics: merged)
         }
     }
 }

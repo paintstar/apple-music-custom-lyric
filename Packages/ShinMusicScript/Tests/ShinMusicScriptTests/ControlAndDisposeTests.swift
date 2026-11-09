@@ -19,7 +19,7 @@ struct ControlCommandTests {
         )
     }
 
-    @Test("play/pause/next/previous：命令分发 + 立即读回（readSnapshot 再执行一次）")
+    @Test("play/pause/stop/next/previous：命令分发 + 立即读回（readSnapshot 再执行一次）")
     func commandsDispatchAndRefresh() async throws {
         // seek 用的基线（含时长）
         let executor = FakeMusicScriptExecutor(outcomes: [
@@ -35,6 +35,13 @@ struct ControlCommandTests {
 
         try await controller.pause()
         #expect(executor.recordedCommands.contains("pause"))
+        executor.enqueue(Fixtures.snapshot(state: MusicScriptPlayerState.stopped, position: nil))
+        let readsBeforeStop = executor.recordedReadCount
+        try await controller.stop()
+        #expect(executor.recordedCommands.last == "stop")
+        #expect(executor.recordedReadCount == readsBeforeStop + 1)
+        #expect(controller.snapshot().status == .idle)
+        #expect(controller.snapshot().positionMs == nil)
         try await controller.next()
         #expect(executor.recordedCommands.contains("nextTrack"))
         try await controller.previous()
@@ -85,6 +92,8 @@ struct ControlCommandTests {
         await #expect(throws: PlaybackError.unauthorized) { try await controller.next() }
         executor.failCommand("previousTrack", with: .timeout)
         await #expect(throws: PlaybackError.unknown("music:timeout")) { try await controller.previous() }
+        executor.failCommand("stop", with: .permissionDenied)
+        await #expect(throws: PlaybackError.unauthorized) { try await controller.stop() }
     }
 
     @Test("dispose 后切歌任务取消，执行器和采样不得继续调用")
@@ -94,6 +103,7 @@ struct ControlCommandTests {
         controller.dispose()
         await #expect(throws: CancellationError.self) { try await controller.play() }
         await #expect(throws: CancellationError.self) { try await controller.pause() }
+        await #expect(throws: CancellationError.self) { try await controller.stop() }
         await #expect(throws: CancellationError.self) { try await controller.seek(positionMs: 100) }
         await #expect(throws: CancellationError.self) { try await controller.playTrackRef(Fixtures.refA) }
         await #expect(throws: CancellationError.self) { try await controller.next() }

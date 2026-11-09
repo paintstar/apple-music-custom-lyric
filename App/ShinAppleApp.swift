@@ -6,13 +6,16 @@ import SwiftUI
 @main
 struct ShinAppleApp: App {
     @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var terminationDelegate
-    @StateObject private var model: AppModel
+    @State private var model: AppModel
+    @StateObject private var playbackMenu: PlaybackMenuState
     @StateObject private var floatingLyricsWindow = FloatingLyricsWindowController()
+    @StateObject private var menuRouter = MusicWindowMenuRouter()
 
     init() {
         let isMock = ProcessInfo.processInfo.arguments.contains("--mock")
         let appModel = isMock ? AppModel.makeMock() : AppModel.makeReal()
-        _model = StateObject(wrappedValue: appModel)
+        _model = State(initialValue: appModel)
+        _playbackMenu = StateObject(wrappedValue: appModel.playbackMenuState)
         terminationDelegate.configure(
             prepare: { appModel.prepareForTermination() },
             shouldCleanup: { PlaybackCleanupSettings.shouldCleanup(isMock: appModel.isMock) },
@@ -21,10 +24,12 @@ struct ShinAppleApp: App {
     }
 
     var body: some Scene {
+        let windowMenuActions = menuRouter.actions
+        let playbackState = playbackMenu.state
         WindowGroup(id: PlayerWindowController.mainWindowGroupID) {
-            ContentView(floatingLyricsWindow: floatingLyricsWindow)
+            ContentView(floatingLyricsWindow: floatingLyricsWindow, menuRouter: menuRouter)
                 .environmentObject(model)
-                .disabled(model.isTerminating)
+                .disabled(playbackState.isTerminating)
                 .frame(minWidth: PlayerWindowController.minimumSize.width,
                        minHeight: PlayerWindowController.minimumSize.height)
                 .task { await model.start() }
@@ -32,6 +37,8 @@ struct ShinAppleApp: App {
         .defaultSize(width: 1180, height: 780)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            SystemViewCommands(window: windowMenuActions)
+            SystemPlaybackCommands(model: model, menuRouter: menuRouter, playback: playbackState, window: windowMenuActions)
             CommandMenu("悬浮歌词") {
                 Button(floatingLyricsWindow.isPresented ? "关闭悬浮歌词" : "显示悬浮歌词") {
                     floatingLyricsWindow.toggle(model: model)

@@ -45,12 +45,14 @@ public struct PlaybackCapabilities: Equatable, Sendable {
     public var next: Bool
     public var previous: Bool
     public var seek: Bool
+    public var stop: Bool
 
-    public init(playPause: Bool, next: Bool, previous: Bool, seek: Bool) {
+    public init(playPause: Bool, next: Bool, previous: Bool, seek: Bool, stop: Bool = false) {
         self.playPause = playPause
         self.next = next
         self.previous = previous
         self.seek = seek
+        self.stop = stop
     }
 }
 

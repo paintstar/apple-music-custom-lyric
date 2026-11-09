@@ -5,6 +5,9 @@ import ShinMusicScript
 /// 所有窗口/按钮共用一份选项；按需读取，不创建常驻轮询器。
 @MainActor
 final class PlaybackOptionsModel: ObservableObject {
+    private static let volumeRange = 0...100
+    private static let keyboardVolumeStep = 5
+
     @Published private(set) var snapshot = PlaybackOptionsSnapshot()
     /// 滑块松手后保留用户目标，直到 Music 读回；不写入权威快照。
     @Published private(set) var pendingVolume: Int?
@@ -41,22 +44,37 @@ final class PlaybackOptionsModel: ObservableObject {
 
     func refresh() { run(.read) }
 
-    func toggleShuffle() {
+    func toggleShuffle() { requestShuffle(nil) }
+
+    func setShuffleEnabled(_ enabled: Bool) { requestShuffle(enabled) }
+
+    private func requestShuffle(_ enabled: Bool?) {
         guard !pendingShuffleChange else { return }
         shuffleErrorMessage = nil
         pendingShuffleChange = true
-        enqueue(.shuffle)
+        enqueue(.shuffle(enabled))
     }
 
-    func cycleRepeat() {
+    func cycleRepeat() { requestRepeatMode(nil) }
+
+    func setRepeatMode(_ mode: PlaybackRepeatMode) { requestRepeatMode(mode) }
+
+    private func requestRepeatMode(_ mode: PlaybackRepeatMode?) {
         guard !pendingRepeatChange else { return }
         repeatErrorMessage = nil
         pendingRepeatChange = true
-        enqueue(.repeatMode)
+        enqueue(.repeatMode(mode))
+    }
+
+    func adjustVolume(increasing: Bool) {
+        guard let current = displayedVolume else { return }
+        let step = increasing ? Self.keyboardVolumeStep : -Self.keyboardVolumeStep
+        let target = min(max(current + step, Self.volumeRange.lowerBound), Self.volumeRange.upperBound)
+        if target != current { setVolume(target) }
     }
 
     func setVolume(_ volume: Int) {
-        guard (0...100).contains(volume) else {
+        guard Self.volumeRange.contains(volume) else {
             errorMessage = PlaybackOptionsError.invalidVolume.localizedDescription
             return
         }
@@ -113,11 +131,15 @@ final class PlaybackOptionsModel: ObservableObject {
     }
 
     private enum ModeAction {
-        case shuffle, repeatMode
+        case shuffle(Bool?), repeatMode(PlaybackRepeatMode?)
+
         func command(for snapshot: PlaybackOptionsSnapshot) -> Command? {
             switch self {
-            case .shuffle: return snapshot.shuffleEnabled.map { .shuffle(!$0) }
-            case .repeatMode:
+            case let .shuffle(enabled):
+                if let enabled { return .shuffle(enabled) }
+                return snapshot.shuffleEnabled.map { .shuffle(!$0) }
+            case let .repeatMode(mode):
+                if let mode { return .repeatMode(mode) }
                 return snapshot.repeatMode.map {
                     switch $0 {
                     case .off: .repeatMode(.all)

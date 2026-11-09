@@ -11,9 +11,14 @@ let package = Package(
     products: [
         .library(name: "ShinLyricsProvider", targets: ["ShinLyricsProvider"])
     ],
-    dependencies: [],
+    dependencies: [
+        .package(path: "../ShinAppleKit")
+    ],
     targets: [
-        .target(name: "ShinLyricsProvider"),
+        .target(
+            name: "ShinLyricsProvider",
+            dependencies: [.product(name: "ShinAppleKit", package: "ShinAppleKit")]
+        ),
         .testTarget(name: "ShinLyricsProviderTests", dependencies: ["ShinLyricsProvider"])
     ]
 )

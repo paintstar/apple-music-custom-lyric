@@ -1,4 +1,5 @@
 import Foundation
+import ShinAppleKit
 
 // 双语 LRC 合成。纯文本处理：把网易云分开返回的
 // 原文 LRC 与翻译 LRC 合并成「同时间戳原文/译文相邻」的成对 LRC 文本，
@@ -14,31 +15,50 @@ import Foundation
 /// 双语 LRC 合成器。纯函数。
 public enum BilingualLRCSynthesizer {
 
+    /// 保留在线配对原有的十小时时间戳上限。
+    private static let pairingTimestampLimitMs: Int64 = 600 * 60_000
+
     /// 合并原文与翻译 LRC 文本。
     /// - Parameters:
     ///   - originalLRC: 原文 LRC 文本（网易云 `lrc.lyric`）。
     ///   - translatedLRC: 翻译 LRC 文本；nil 时原样返回原文文本。
     /// - Returns: 合成后的文本。无时间戳行（纯文本歌词）不参与配对，按原文原样输出。
     public static func synthesize(originalLRC: String, translatedLRC: String?) -> String {
+        synthesizeWithStatus(originalLRC: originalLRC, translatedLRC: translatedLRC).text
+    }
+
+    /// 合并原文与译文，并报告译文可用性和实际配对行数。
+    public static func synthesizeWithStatus(originalLRC: String, translatedLRC: String?) -> BilingualLRCSynthesis {
         guard let translatedLRC,
               !translatedLRC.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return originalLRC }
+        else { return BilingualLRCSynthesis(text: originalLRC, translationStatus: .unavailable) }
 
-        let translationsByMs = parseTimestampedLines(translatedLRC)
-        guard !translationsByMs.isEmpty else { return originalLRC }
+        var translationsByMs = parseTimestampedLines(translatedLRC)
+        guard !translationsByMs.isEmpty else {
+            return BilingualLRCSynthesis(text: originalLRC, translationStatus: .unmatched)
+        }
 
         var output: [String] = []
+        var matchedLineCount = 0
         for line in originalLRC.split(separator: "\n", omittingEmptySubsequences: false) {
             let text = String(line)
             output.append(text)
             // 仅当该行是「单时间戳 + 有正文」的原文行才尝试配对；
             // 元信息行（[ti:]…）、无正文行（[01:23.45]）不配。
-            guard let entry = parseSingleTimestampLine(text), !entry.body.isEmpty else { continue }
-            if let translation = translationsByMs[entry.startMs] {
+            guard let entry = parseSingleTimestampLine(text),
+                  !entry.body.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            if let translation = translationsByMs.removeValue(forKey: entry.startMs) {
                 output.append("[\(formatTimestamp(entry.startMs))]\(translation)")
+                matchedLineCount += 1
             }
         }
-        return output.joined(separator: "\n")
+        guard matchedLineCount > 0 else {
+            return BilingualLRCSynthesis(text: originalLRC, translationStatus: .unmatched)
+        }
+        return BilingualLRCSynthesis(
+            text: output.joined(separator: "\n"),
+            translationStatus: .matched(lineCount: matchedLineCount)
+        )
     }
 
     // MARK: - LRC 行解析（仅本层使用的最小子集；权威解析在 ShinAppleKit）
@@ -48,8 +68,7 @@ public enum BilingualLRCSynthesizer {
         let body: String
     }
 
-    /// 解析一行 `[mm:ss.xx(+/-.x)]body`；非单时间戳格式返回 nil。
-    /// 只识别分:秒形式（网易云输出格式），不处理多小时等扩展格式。
+    /// 取行首第一个时间戳及其后的正文。
     static func parseSingleTimestampLine(_ line: String) -> TimestampedLine? {
         guard line.hasPrefix("[") else { return nil }
         guard let close = line.firstIndex(of: "]") else { return nil }
@@ -59,37 +78,11 @@ public enum BilingualLRCSynthesizer {
         return TimestampedLine(startMs: ms, body: body)
     }
 
-    /// `mm:ss(.xx…)` → 毫秒。接受 1–2 位分、1+ 位秒、可选小数。
+    /// 复用导入的时间戳语法，仅为可精确表示为毫秒的值配对。
     static func timestampToMilliseconds(_ value: String) -> Int64? {
-        let parts = value.split(separator: ":", omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              let minutes = Int64(parts[0]),
-              minutes >= 0, minutes < 600
-        else { return nil }
-        let secondPieces = parts[1].split(separator: ".", omittingEmptySubsequences: false)
-        guard let seconds = Int64(secondPieces[0]), seconds >= 0, seconds < 60
-        else { return nil }
-        var milliseconds: Int64 = 0
-        if secondPieces.count == 2 {
-            let fraction = String(secondPieces[1])
-            guard !fraction.isEmpty, fraction.count <= 3,
-                  fraction.allSatisfy(\.isNumber),
-                  let fractionValue = Int64(fraction)
-            else { return nil }
-            milliseconds = fractionValue * Self.fractionScale(fraction.count)
-        } else if secondPieces.count > 2 {
-            return nil
-        }
-        return minutes * 60_000 + seconds * 1_000 + milliseconds
-    }
-
-    /// 小数位数对应的毫秒倍率（"5"→500，"45"→450，"456"→456）。
-    private static func fractionScale(_ digitCount: Int) -> Int64 {
-        switch digitCount {
-        case 1: return 100
-        case 2: return 10
-        default: return 1
-        }
+        guard let ms = LyricsParser.exactTimestampMilliseconds(inTagContent: value),
+              ms < pairingTimestampLimitMs else { return nil }
+        return ms
     }
 
     /// 翻译文本按时间戳建索引；同时间戳多译文取第一条。
@@ -114,4 +107,16 @@ public enum BilingualLRCSynthesizer {
         let milliseconds = ms % 1_000
         return String(format: "%02d:%02d.%03d", minutes, seconds, milliseconds)
     }
+}
+
+/// 在线来源的译文可用性及配对结果。
+public enum BilingualLRCTranslationStatus: Equatable, Sendable {
+    case unavailable
+    case unmatched
+    case matched(lineCount: Int)
+}
+
+public struct BilingualLRCSynthesis: Equatable, Sendable {
+    public let text: String
+    public let translationStatus: BilingualLRCTranslationStatus
 }

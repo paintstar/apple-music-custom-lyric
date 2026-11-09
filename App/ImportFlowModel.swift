@@ -2,6 +2,7 @@ import Foundation
 import ShinAppleKit
 import ShinAppleData
 import ShinAppServices
+import ShinLyricsProvider
 
 // 导入流程状态机：包裹应用服务层的 ImportWorkflowService。
 // - 文件读取与解析都在后台执行（服务为 actor；读文件用 detached Task），
@@ -40,6 +41,8 @@ final class ImportFlowModel: ObservableObject {
     @Published private(set) var bilingualMode: BilingualMode = .off
     /// 双语预览重算进行中（重算在后台执行，界面不冻结）。
     @Published private(set) var isRecomputingBilingual = false
+    /// 在线获取的译文状态，独立于用户是否选择导入译文。
+    @Published private(set) var fetchedTranslationStatus: BilingualLRCTranslationStatus?
     /// 可恢复错误说明（中文）；nil 表示无错误。
     @Published var alertMessage: String?
     /// 粘贴输入的歌词文本（idle 阶段文本框绑定）。「重新输入」保留内容便于修改重试；
@@ -76,16 +79,16 @@ final class ImportFlowModel: ObservableObject {
     // MARK: - 会话
 
     /// 打开导入会话：目标就此固定。导入过程中切歌不会改变该目标。
-    /// - Parameter provenance: 在线获取路径传入来源注记（随确认写库）；
-    ///   手动导入不传（文档不产生获取注记）。
+    /// 在线获取传入来源注记与获取结果，在同一代会话内完成预览。
     func openSession(
         target newTarget: ImportSessionTarget,
-        provenance: FetchProvenance? = nil
+        provenance: FetchProvenance? = nil,
+        fetchedLyrics: BilingualLRCSynthesis? = nil
     ) async {
         generation += 1
         let currentGeneration = generation
         target = newTarget
-        phase = .idle
+        phase = fetchedLyrics == nil ? .idle : .loadingPreview
         alertMessage = nil
         existingForTarget = nil
         lastReady = nil
@@ -94,41 +97,48 @@ final class ImportFlowModel: ObservableObject {
         do {
             try await service.openImportSession(target: newTarget, provenance: provenance)
             guard currentGeneration == generation else { return }
+            if let fetchedLyrics {
+                try await ingestFetchedLyrics(fetchedLyrics, generation: currentGeneration)
+                return
+            }
             // 目标已固定，此处查询结果只反映库中现状（提示卡数据源）。
             let existing = try? await service.existingBindingInfo()
             guard currentGeneration == generation else { return }
             existingForTarget = existing
         } catch {
             guard currentGeneration == generation else { return }
+            phase = .idle
             alertMessage = ErrorText.describe(error)
         }
     }
 
-    /// 在线获取的歌词文本进入既有 ingest → 预览 → 确认链路（与粘贴导入同一
-    /// 语义，文本来自获取管线；filename 记 nil）。存在同时间戳行组时自动
-    /// 启用「成对」双语模式（原文/译文相邻行对），用户仍可在预览里切换或关闭。
-    func ingestFetchedText(_ text: String) async {
-        generation += 1
-        let currentGeneration = generation
-        phase = .loadingPreview
-        alertMessage = nil
-        resetBilingualUIState()
-        do {
-            let preview = try await service.ingest(fileData: Data(text.utf8), filename: nil)
-            guard currentGeneration == generation else { return }
-            let existing = try? await service.existingBindingInfo()
-            guard currentGeneration == generation else { return }
-            lastReady = (preview, existing)
-            phase = .ready(preview, existing: existing)
-            // 有成对行组时自动开启双语预览（后台重算，generation 防旧覆盖）。
+    /// 有已配对的在线译文时，先完成双语映射，再展示可确认的预览。
+    private func ingestFetchedLyrics(_ lyrics: BilingualLRCSynthesis, generation currentGeneration: Int) async throws {
+        var preview = try await service.ingest(fileData: Data(lyrics.text.utf8), filename: nil)
+        guard currentGeneration == generation else { return }
+        let existing = try? await service.existingBindingInfo()
+        guard currentGeneration == generation else { return }
+
+        var status = lyrics.translationStatus
+        if case let .matched(sourceCount) = status, preview.isImportable {
+            status = .unmatched
             if preview.pairedTimestampsAvailable {
-                await setBilingualMode(.pairedTimestamps)
+                let paired = await service.setBilingualMode(.pairedTimestamps)
+                guard currentGeneration == generation else { return }
+                if let paired {
+                    preview = paired
+                    bilingualMode = .pairedTimestamps
+                    lastActiveBilingualMode = .pairedTimestamps
+                    if let count = paired.bilingual?.translatedLineCount, count > 0 {
+                        status = .matched(lineCount: min(sourceCount, count))
+                    }
+                }
             }
-        } catch {
-            guard currentGeneration == generation else { return }
-            phase = .idle
-            alertMessage = ErrorText.describe(error)
         }
+        existingForTarget = existing
+        fetchedTranslationStatus = status
+        lastReady = (preview, existing)
+        phase = .ready(preview, existing: existing)
     }
 
     /// 读取所选文件并解析（重试同一会话内的下一个文件同样走这里）。
@@ -196,6 +206,7 @@ final class ImportFlowModel: ObservableObject {
 
     /// 确认导入（唯一写库提交点）。成功后本会话结束。
     func confirm() async {
+        guard case .ready = phase, !isRecomputingBilingual else { return }
         generation += 1
         let currentGeneration = generation
         phase = .saving
@@ -301,6 +312,7 @@ final class ImportFlowModel: ObservableObject {
     private func resetBilingualUIState() {
         bilingualMode = .off
         isRecomputingBilingual = false
+        fetchedTranslationStatus = nil
     }
 
     // MARK: - 文件读取（后台）

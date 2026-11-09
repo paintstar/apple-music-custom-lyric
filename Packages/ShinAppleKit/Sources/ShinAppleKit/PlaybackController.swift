@@ -34,6 +34,7 @@ public protocol PlaybackController: AnyObject, Sendable {
 
     func play() async throws
     func pause() async throws
+    func stop() async throws
 
     /// 跳转到指定位置（整数毫秒）。越界值由实现裁剪到合法时长范围。
     func seek(positionMs: Int64) async throws
@@ -56,8 +57,12 @@ public protocol PlaybackController: AnyObject, Sendable {
     func playTrackRef(_ trackRef: String) async throws
 }
 
-/// playTrackRef 的默认实现（无点播能力的适配器自动获得）。
+/// 可选能力的默认实现，供未提供对应功能的适配器使用。
 public extension PlaybackController {
+    func stop() async throws {
+        throw PlaybackError.unknown("playback:commandUnsupported:stop")
+    }
+
     /// 无 Music 临时清单的适配器无需操作官方播放器。
     func cleanupManagedPlaylistsOnQuit() async throws {}
 

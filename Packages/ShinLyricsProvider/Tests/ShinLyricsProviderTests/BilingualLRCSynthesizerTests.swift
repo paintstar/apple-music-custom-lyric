@@ -21,6 +21,16 @@ struct BilingualLRCSynthesizerTests {
         #expect(lines[3] == "[00:05.500]虚构译文二")
     }
 
+    @Test("双冒号与等价小数点时间戳互相配对")
+    func pairsColonCentiseconds() {
+        let original = "[00:04:46]虚构原文一\n[00:29.150]虚构原文二"
+        let translated = "[00:04.460]虚构译文一\n[00:29:15]虚构译文二"
+        let result = BilingualLRCSynthesizer.synthesizeWithStatus(originalLRC: original, translatedLRC: translated)
+
+        #expect(result.translationStatus == .matched(lineCount: 2))
+        #expect(result.text == "[00:04:46]虚构原文一\n[00:04.460]虚构译文一\n[00:29.150]虚构原文二\n[00:29.150]虚构译文二")
+    }
+
     @Test("无译文的原文行保持单行")
     func keepsUntranslatedLines() {
         let original = "[00:01.000]有译文\n[00:09.000]没译文"
@@ -52,20 +62,21 @@ struct BilingualLRCSynthesizerTests {
     @Test("翻译为 nil 或空白：原文原样返回")
     func nilTranslationReturnsOriginal() {
         let original = "[00:01.000]原文"
-        #expect(BilingualLRCSynthesizer.synthesize(originalLRC: original, translatedLRC: nil) == original)
-        #expect(
-            BilingualLRCSynthesizer.synthesize(originalLRC: original, translatedLRC: "   ")
-                == original
-        )
+        for translation in [nil, "   "] as [String?] {
+            let result = BilingualLRCSynthesizer.synthesizeWithStatus(originalLRC: original, translatedLRC: translation)
+            #expect(result.text == original)
+            #expect(result.translationStatus == .unavailable)
+        }
     }
 
-    @Test("翻译无时间戳（纯文本）：原文原样返回，不盲目追加")
-    func untimedTranslationIgnored() {
+    @Test("译文无时间戳或相差一毫秒时报告未配对，原文原样返回")
+    func unmatchedTranslationReturnsOriginal() {
         let original = "[00:01.000]原文"
-        #expect(
-            BilingualLRCSynthesizer.synthesize(originalLRC: original, translatedLRC: "没有时间戳的翻译")
-                == original
-        )
+        for translation in ["没有时间戳的翻译", "[00:01.001]虚构译文"] {
+            let result = BilingualLRCSynthesizer.synthesizeWithStatus(originalLRC: original, translatedLRC: translation)
+            #expect(result.text == original)
+            #expect(result.translationStatus == .unmatched)
+        }
     }
 
     @Test("同时间戳多条译文取第一条")

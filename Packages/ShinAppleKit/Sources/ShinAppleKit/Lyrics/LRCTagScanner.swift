@@ -38,7 +38,7 @@ struct TimestampValue {
 enum LRCTagScanner {
 
     /// 分类方括号内容。识别规则（启发式，已文档化）：
-    /// - `数字:数字(.数字)?` → 时间戳；形状不符 → malformedTimestamp（报错）。
+    /// - `数字:数字(.数字)?` 或 `数字:数字:两位数字` → 时间戳；形状不符则报错。
     /// - `键:值`（键非纯数字）→ 元信息；offset 由调用方单独处理。
     /// - 空内容 → empty；其余（如 [Chorus]）→ literal（按正文文本保留）。
     static func classifyBracket(_ raw: String) -> BracketContent {
@@ -54,26 +54,25 @@ enum LRCTagScanner {
         return .metadata(key: key, value: value)
     }
 
-    /// `数字:数字(.数字)?` 形状校验；不符 → malformedTimestamp。
+    /// 点号接受小数秒，第二个冒号仅接受两位百分秒。
     private static func timestampContent(key: String, value: String) -> BracketContent {
-        let (secondPart, fractionPart) = splitFraction(value)
-        let secondValid = !secondPart.isEmpty && isDigits(secondPart)
-        var fractionValid = true
-        if let fraction = fractionPart {
-            fractionValid = !fraction.isEmpty && isDigits(fraction)
+        let secondPart: String
+        let fractionPart: String?
+        if let separator = value.firstIndex(where: { $0 == "." || $0 == ":" }) {
+            secondPart = String(value[..<separator])
+            let fraction = String(value[value.index(after: separator)...])
+            guard isDigits(fraction), value[separator] == "." || fraction.count == 2 else {
+                return .malformedTimestamp
+            }
+            fractionPart = fraction
+        } else {
+            secondPart = value
+            fractionPart = nil
         }
-        if secondValid, fractionValid {
-            return .timestamp(
-                LRCTimestamp(minuteDigits: key, secondDigits: secondPart, fractionDigits: fractionPart)
-            )
-        }
-        return .malformedTimestamp
-    }
-
-    private static func splitFraction(_ value: String) -> (String, String?) {
-        guard let dot = value.firstIndex(of: ".") else { return (value, nil) }
-        let fraction = String(value[value.index(after: dot)...])
-        return (String(value[..<dot]), fraction)
+        guard isDigits(secondPart) else { return .malformedTimestamp }
+        return .timestamp(
+            LRCTimestamp(minuteDigits: key, secondDigits: secondPart, fractionDigits: fractionPart)
+        )
     }
 
     /// 时间戳 → 毫秒。分钟可超 59；秒必须在 0..<60；小数超 3 位截断并标记。

@@ -85,7 +85,7 @@ extension AutoFetchModel {
         let artist = artist(of: track)
         let lyrics = try await fetchService.fetchLyrics(songId: top.candidate.songId)
         try run.check()
-        let merged = BilingualLRCSynthesizer.synthesize(
+        let synthesis = BilingualLRCSynthesizer.synthesizeWithStatus(
             originalLRC: lyrics.originalLRC,
             translatedLRC: lyrics.translatedLRC
         )
@@ -106,10 +106,10 @@ extension AutoFetchModel {
         try await importService.openImportSession(target: target, provenance: provenance)
         try run.check()
         let preview = try await importService.ingest(
-            fileData: Data(merged.utf8), filename: nil
+            fileData: Data(synthesis.text.utf8), filename: nil
         )
         try run.check()
-        if preview.pairedTimestampsAvailable {
+        if case .matched = synthesis.translationStatus, preview.pairedTimestampsAvailable {
             _ = await importService.setBilingualMode(.pairedTimestamps)
         }
         try run.check()

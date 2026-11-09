@@ -72,6 +72,7 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
 
     private let clock: ManualClock
     private let autoAdvanceOnEnd: Bool
+    private static let capabilities = PlaybackCapabilities(playPause: true, next: true, previous: true, seek: true, stop: true)
     /// 契约 setQueue（只有身份、无时长）装载曲目时使用的默认时长；nil 表示未知。
     private let defaultDurationMs: Int64?
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -236,6 +237,16 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
         })
     }
 
+    public func stop() async throws {
+        try dispatchThrowing(state.withLock { s -> Result<MutationOutcome, PlaybackError> in
+            guard s.index != nil else { return .failure(.trackUnavailable) }
+            s.status = .idle
+            s.errorCode = nil
+            s.basePositionMs = 0
+            return .success(finishLocked(&s))
+        })
+    }
+
     public func seek(positionMs ms: Int64) async throws {
         try dispatchThrowing(state.withLock { s -> Result<MutationOutcome, PlaybackError> in
             guard s.index != nil else { return .failure(.trackUnavailable) }
@@ -381,7 +392,8 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
             durationMs: track?.durationMs,
             status: s.status,
             errorCode: s.errorCode,
-            trackRef: track?.trackRef
+            trackRef: track?.trackRef,
+            capabilities: Self.capabilities
         )
     }
 }

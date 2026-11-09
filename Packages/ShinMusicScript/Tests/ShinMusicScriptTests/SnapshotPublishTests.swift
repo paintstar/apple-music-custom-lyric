@@ -26,7 +26,7 @@ struct SnapshotPublishTests {
         #expect(snapshot.title == nil)
         #expect(snapshot.sessionEpoch >= 1)
         #expect(snapshot.capabilities == PlaybackCapabilities(
-            playPause: true, next: true, previous: true, seek: true
+            playPause: true, next: true, previous: true, seek: true, stop: true
         ))
     }
 

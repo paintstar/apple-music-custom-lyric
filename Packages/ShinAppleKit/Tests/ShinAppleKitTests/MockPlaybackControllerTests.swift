@@ -151,6 +151,27 @@ struct MockPlaybackControllerTests {
         #expect(calls.value == 2)
     }
 
+    @Test("停止回到曲首并冻结位置，再播放时从头开始当前曲目")
+    func stopResetsPosition() async throws {
+        let controller = MockPlaybackController()
+        controller.setMockQueue([track("mock-song-1"), track("mock-song-2")])
+        controller.advanceTime(byMs: 1_000)
+        let before = controller.snapshot()
+
+        try await controller.stop()
+        controller.advanceTime(byMs: 5_000)
+        let stopped = controller.snapshot()
+        #expect(stopped.capabilities?.stop == true)
+        #expect(stopped.status == .idle)
+        #expect(stopped.positionMs == 0)
+        #expect(stopped.track == before.track)
+        #expect(stopped.trackEpoch == before.trackEpoch)
+
+        try await controller.play()
+        controller.advanceTime(byMs: 500)
+        #expect(controller.snapshot().positionMs == 500)
+    }
+
     @Test("播放中推进时钟位置前进")
     func playingClockAdvanceMovesPosition() {
         let controller = MockPlaybackController()
