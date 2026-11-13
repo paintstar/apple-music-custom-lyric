@@ -90,7 +90,7 @@
   <img src="assets/audio-link-import.png" width="100%" alt="侧边栏独立主页面：从链接导入音频全宽单列配置界面" />
 </p>
 
-- **独立主页面与依赖检测引导**：通过侧边栏「导入 → 从链接导入音频」、播放器导航菜单或「显示」菜单 `⌘⇧I` 进入全宽单列纵向界面；自动探测本机 `/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin` 及 `PATH` 中的 `yt-dlp` 与 `ffmpeg`，缺失时给出自适应 Homebrew 安装命令及一键复制/打开终端引导。
+- **独立主页面与多来源依赖探测**：通过侧边栏「导入 → 从链接导入音频」、播放器导航菜单或「显示」菜单 `⌘⇧I` 进入全宽单列纵向界面；自动探测本机 `/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin` 及系统 `PATH` 中的 `yt-dlp` 与 `ffmpeg`（无论通过 Homebrew、`pipx`/`pip`、MacPorts/Conda 还是官方独立二进制安装均可自动识别），缺失时在页面内提供自适应安装命令与一键复制/打开终端引导。
 - **链接清洗与平台格式校验**：支持直接粘贴含分享文案的文本，自动提取链接并裁剪 B 站（`/video/BV...`，保留分 P 参数 `p=`）及 YouTube 等追踪参数，对非具体视频页实时给出格式提示。
 - **完整封装与安全落盘**：可选填写歌名、歌手、专辑、流派并一键勾选嵌入视频封面与保留源站标签；支持音频质量档位、首尾时间片段裁剪（`mm:ss` / `hh:mm:ss`）、网络代理、Cookies 透传来源点选（支持 Chrome / Safari / Edge / Firefox / Brave 或选择 `cookies.txt` 文件）以及在本地指定目录同时保留 `.m4a` 副本；写入「音乐」后可直接串联网易云搜歌词或导入本地歌词，若「音乐」未开启“拷贝文件到媒体文件夹”，暂存音频会安全保留在 `~/Library/Application Support/ShinApple/ImportedAudio/` 以防断链。
 
@@ -113,10 +113,20 @@
    - **升级提示**：退出 ShinApple 后用新版替换「应用程序」中的旧版即可，本机学习资料会保留（建议升级前先在设置导出 JSON 备份）。
 
 2. **安装可选依赖（仅使用「从链接导入音频」时需要）**
-   若需通过链接下载并封装 `.m4a` 音频，请在本机通过 Homebrew 安装 `yt-dlp` 与 `ffmpeg`：
-   ```bash
-   brew install yt-dlp ffmpeg
-   ```
+   若需通过链接下载并封装 `.m4a` 音频，需在本机安装 `yt-dlp` 与 `ffmpeg`。应用不限定安装方式，只要可执行文件位于 `/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin` 或系统 `PATH` 中即可自动识别：
+   - **方式一：Homebrew（最省心，一行同时安装）**：
+     ```bash
+     brew install yt-dlp ffmpeg
+     ```
+   - **方式二：`pipx` / `pip`（Python 环境安装 `yt-dlp`，默认可装入 `~/.local/bin`；仍需另行安装 `ffmpeg`）**：
+     ```bash
+     pipx install yt-dlp
+     # 或：python3 -m pip install --user -U yt-dlp
+     ```
+   - **方式三：官方独立二进制文件（无需包管理器）**：
+     从 [yt-dlp Releases](https://github.com/yt-dlp/yt-dlp/releases/latest) 下载 `yt-dlp_macos`（重命名为 `yt-dlp`）、从 [FFmpeg 官方 macOS 构建页](https://ffmpeg.org/download.html#build-mac) 下载 `ffmpeg`，放入 `/usr/local/bin` 或 `~/.local/bin` 并授予执行权限（例如 `chmod +x /usr/local/bin/yt-dlp /usr/local/bin/ffmpeg`）。
+   - **方式四：MacPorts / Conda 等其他包管理器**：
+     例如 `sudo port install yt-dlp ffmpeg` 或 `conda install -c conda-forge yt-dlp ffmpeg`（若独立终端外 GUI 启动未继承相应环境变量，可将二进制软链至 `/usr/local/bin` 或 `~/.local/bin`）。
 
 3. **首次运行与自动化授权**
    先在官方「音乐」App 完成登录并准备好音乐资料库，随后启动 ShinApple，按系统提示（或在「系统设置 → 隐私与安全性 → 自动化」）允许 ShinApple 控制 **Music.app**（用于读取可访问资料库与发送公开播放控制命令）。若暂拒绝授权，本地歌词库管理、备份与编辑器仍可正常使用。
