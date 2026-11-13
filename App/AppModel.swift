@@ -116,7 +116,6 @@ final class AppModel: ObservableObject {
     var lyricsStoreChangesTask: Task<Void, Never>?
     var importTask: Task<Void, Never>?
     let audioLinkImporter: any AudioLinkImporting
-    var pendingAudioLinkSheetAction: (@MainActor () -> Void)?
 
     // MARK: - 构造
 
@@ -420,8 +419,6 @@ final class AppModel: ObservableObject {
     /// 获取流程状态（nil = 未打开；目标在创建时固定）。
     /// setter 为 internal：获取扩展（AppModel+LyricsFetch.swift）装配弹窗时写入。
     @Published var lyricsFetchModel: NeteaseLyricsFetchModel?
-    /// 链接导入音频弹窗呈现开关。
-    @Published var isAudioLinkImportPresented = false
     /// 链接导入音频流程状态。
     @Published var audioLinkImportModel: AudioLinkImportModel?
 
@@ -453,7 +450,6 @@ extension AppModel {
         autoFetch?.invalidateCurrentRun()
         lyricsFetchModel?.cancel()
         audioLinkImportModel?.cancelImport()
-        pendingAudioLinkSheetAction = nil
         lyricsPanel?.setAutoScrollSuspended(true)
         artworkStore.handleTrackChange(PlaybackSnapshot(), controller: controller)
         musicLibraryBrowser.cancelForTermination()

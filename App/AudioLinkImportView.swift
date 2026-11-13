@@ -3,35 +3,35 @@ import SwiftUI
 import ShinAppleKit
 import ShinAppServices
 
-/// 从链接下载音频、写入标签并导入「音乐」资料库的交互弹窗（三段式双栏布局）。
+/// 从链接下载音频、写入标签并导入「音乐」资料库的主界面页面（全宽单列纵向排布）。
 struct AudioLinkImportView: View {
     @ObservedObject var model: AudioLinkImportModel
     var isMock: Bool = false
-    let onClose: () -> Void
+    var bottomContentInset: CGFloat = 100
 
     @State private var showToolsPopover = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header
-            if model.toolAvailability?.isReady != true {
-                AudioToolInstallGuideCard(model: model)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                header
+                if model.toolAvailability?.isReady != true {
+                    AudioToolInstallGuideCard(model: model)
+                }
+                if case let .succeeded(result) = model.phase {
+                    AudioLinkSuccessSection(model: model, result: result)
+                } else {
+                    formSections
+                    AudioLinkRunningOrErrorSection(phase: model.phase)
+                    actionFooter
+                }
             }
-            Divider()
-            if case let .succeeded(result) = model.phase {
-                AudioLinkSuccessSection(model: model, result: result)
-            } else {
-                formContent
-                AudioLinkRunningOrErrorSection(phase: model.phase)
-            }
-            Spacer(minLength: 0)
-            footerButtons
+            .padding(.horizontal, 32)
+            .padding(.top, 28)
+            .padding(.bottom, bottomContentInset)
+            .frame(maxWidth: 860, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 24)
-        .frame(width: 780)
-        .frame(minHeight: 620, idealHeight: 680, maxHeight: 820)
-        .interactiveDismissDisabled(model.isRunning)
         .onAppear { model.startToolCheck() }
     }
 
@@ -39,7 +39,7 @@ struct AudioLinkImportView: View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .leading, spacing: 5) {
                 Text("从链接导入音频")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(.system(size: 22, weight: .bold))
                 Text("通过本机 yt-dlp 与 ffmpeg 转封装为 M4A 后写入「音乐」资料库，全流程仅在本地运行。")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
@@ -94,52 +94,29 @@ struct AudioLinkImportView: View {
         }
     }
 
-    private var formContent: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                AudioLinkURLSection(model: model)
-                HStack(alignment: .top, spacing: 18) {
-                    AudioLinkMetadataColumn(model: model)
-                    AudioLinkOptionsColumn(model: model)
-                }
-                .fixedSize(horizontal: false, vertical: true)
-                AudioLinkCookieSection(model: model)
-            }
-            .padding(.trailing, 2)
+    private var formSections: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            AudioLinkURLSection(model: model)
+            AudioLinkMetadataSection(model: model)
+            AudioLinkOptionsSection(model: model)
+            AudioLinkCookieSection(model: model)
         }
-        .scrollBounceBehavior(.basedOnSize)
         .disabled(model.isRunning)
     }
 
-    private var footerButtons: some View {
+    private var actionFooter: some View {
         HStack {
+            Spacer()
             if model.isRunning {
                 Button(role: .cancel) { model.cancelImport() } label: {
-                    Text("取消导入").padding(.horizontal, 8)
+                    Text("取消导入").padding(.horizontal, 12)
                 }
                 .controlSize(.large)
                 .keyboardShortcut(.cancelAction)
-                Spacer()
-            } else if case .succeeded = model.phase {
-                Button { model.resetForAnotherImport() } label: {
-                    Text("再导一首").padding(.horizontal, 8)
-                }
-                .controlSize(.large)
-                Spacer()
-                Button { onClose() } label: {
-                    Text("完成").padding(.horizontal, 8)
-                }
-                .controlSize(.large)
-                .keyboardShortcut(.defaultAction)
             } else {
-                Button { onClose() } label: {
-                    Text("关闭").padding(.horizontal, 8)
-                }
-                .controlSize(.large)
-                .keyboardShortcut(.cancelAction)
-                Spacer()
                 Button { model.startImport() } label: {
-                    Text("开始下载并导入").padding(.horizontal, 8)
+                    Label("开始下载并导入", systemImage: "arrow.down.circle.fill")
+                        .padding(.horizontal, 10)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -147,5 +124,6 @@ struct AudioLinkImportView: View {
                 .disabled(!model.canStart)
             }
         }
+        .padding(.top, 4)
     }
 }

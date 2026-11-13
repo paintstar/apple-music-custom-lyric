@@ -7,16 +7,14 @@ import ShinAppServices
 // MARK: - 卡片容器与通用标题组件
 
 struct AudioLinkSectionCard<Content: View>: View {
-    var fillHeight: Bool = false
     @ViewBuilder let content: () -> Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             content()
-            if fillHeight { Spacer(minLength: 0) }
         }
-        .frame(maxWidth: .infinity, maxHeight: fillHeight ? .infinity : nil, alignment: .topLeading)
-        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(20)
         .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.08), lineWidth: 1))
     }
@@ -138,15 +136,15 @@ struct AudioLinkURLSection: View {
     }
 }
 
-// MARK: - 第二段：左栏（歌曲标签与封面）与右栏（下载配置与保存）
+// MARK: - 第二段：歌曲标签与封面
 
-struct AudioLinkMetadataColumn: View {
+struct AudioLinkMetadataSection: View {
     @ObservedObject var model: AudioLinkImportModel
 
     var body: some View {
-        AudioLinkSectionCard(fillHeight: true) {
+        AudioLinkSectionCard {
             AudioLinkSectionHeader("歌曲标签与封面", systemImage: "music.note.list", subtitle: "留空保留源信息")
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 12) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 14) {
                 GridRow {
                     AudioLinkFieldColumn(label: "歌名", placeholder: "留空用源标题", text: $model.title)
                     AudioLinkFieldColumn(label: "歌手", placeholder: "留空用源作者", text: $model.artist)
@@ -156,7 +154,7 @@ struct AudioLinkMetadataColumn: View {
                     AudioLinkFieldColumn(label: "流派", placeholder: "可选", text: $model.genre)
                 }
             }
-            HStack(spacing: 18) {
+            HStack(spacing: 22) {
                 Toggle("嵌入视频封面", isOn: $model.embedThumbnail)
                     .toggleStyle(.checkbox)
                     .font(.system(size: 13))
@@ -171,13 +169,15 @@ struct AudioLinkMetadataColumn: View {
     }
 }
 
-struct AudioLinkOptionsColumn: View {
+// MARK: - 第三段：下载配置与保存
+
+struct AudioLinkOptionsSection: View {
     @ObservedObject var model: AudioLinkImportModel
 
     var body: some View {
-        AudioLinkSectionCard(fillHeight: true) {
+        AudioLinkSectionCard {
             AudioLinkSectionHeader("下载配置与保存", systemImage: "slider.horizontal.3", subtitle: "yt-dlp")
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 14) {
                 labeledRow("音频质量") {
                     Picker("音频质量", selection: $model.audioQuality) {
                         ForEach(AudioQualityOption.allCases) { option in
@@ -188,23 +188,23 @@ struct AudioLinkOptionsColumn: View {
                     .labelsHidden()
                     .controlSize(.regular)
                     .font(.system(size: 13))
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: 320, alignment: .leading)
                 }
                 labeledRow("片段裁剪") {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         TextField("00:05", text: $model.trimStart)
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.regular)
                             .font(.system(size: 13))
-                            .frame(width: 72)
+                            .frame(width: 100)
                         Text("→").font(.system(size: 13)).foregroundStyle(.secondary)
                         TextField("03:45", text: $model.trimEnd)
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.regular)
                             .font(.system(size: 13))
-                            .frame(width: 72)
-                        Text("留空不裁")
-                            .font(.system(size: 12))
+                            .frame(width: 100)
+                        Text("留空不裁，支持 mm:ss 或 hh:mm:ss")
+                            .font(.system(size: 12.5))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -213,22 +213,24 @@ struct AudioLinkOptionsColumn: View {
                         .textFieldStyle(.roundedBorder)
                         .controlSize(.regular)
                         .font(.system(size: 13))
+                        .frame(maxWidth: 420)
                 }
                 labeledRow("本地副本") {
-                    HStack(spacing: 8) {
-                        Toggle("保留 .m4a", isOn: $model.keepLocalCopy)
+                    HStack(spacing: 12) {
+                        Toggle("在本地同时保留 .m4a 副本", isOn: $model.keepLocalCopy)
                             .toggleStyle(.checkbox)
                             .font(.system(size: 13))
-                        Spacer(minLength: 4)
-                        Text(model.localCopyDirectory?.lastPathComponent ?? "桌面")
-                            .font(.system(size: 12))
+                            .fixedSize()
+                        Text(model.localCopyDirectory?.path ?? "~/Desktop")
+                            .font(.system(size: 12, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
+                            .truncationMode(.middle)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
                             .background(Color.primary.opacity(0.05), in: Capsule())
                             .opacity(model.keepLocalCopy ? 1 : 0.45)
-                        Button("更改…") { chooseLocalCopyDirectory() }
+                        Button("选择文件夹…") { chooseLocalCopyDirectory() }
                             .controlSize(.regular)
                             .disabled(!model.keepLocalCopy)
                     }
@@ -241,11 +243,11 @@ struct AudioLinkOptionsColumn: View {
         _ title: String,
         @ViewBuilder control: () -> Control
     ) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             Text(title)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 64, alignment: .leading)
+                .frame(width: 84, alignment: .leading)
             control()
         }
     }
@@ -261,7 +263,7 @@ struct AudioLinkOptionsColumn: View {
     }
 }
 
-// MARK: - 第三段：站点访问凭据（固定高度不跳动）
+// MARK: - 第四段：站点访问凭据
 
 struct AudioLinkCookieSection: View {
     @ObservedObject var model: AudioLinkImportModel
@@ -297,14 +299,14 @@ struct AudioLinkCookieSection: View {
     var body: some View {
         AudioLinkSectionCard {
             AudioLinkSectionHeader("站点访问凭据 (Cookies)", systemImage: "key.fill", subtitle: "可选")
-            HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 Picker("Cookies 来源", selection: cookieKindBinding) {
                     ForEach(CookieKind.allCases) { kind in Text(kind.rawValue).tag(kind) }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .controlSize(.regular)
-                .frame(width: 260)
+                .frame(maxWidth: 340, alignment: .leading)
 
                 cookieDetailSlot
             }
@@ -330,14 +332,14 @@ struct AudioLinkCookieSection: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             case .browser(let current):
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     ForEach(AudioCookieBrowser.allCases) { browser in
                         browserPill(browser, isSelected: browser == current)
                     }
                 }
             case .file(let url):
                 HStack(spacing: 10) {
-                    Text(url?.lastPathComponent ?? "未选择 Netscape cookies.txt")
+                    Text(url?.path ?? "未选择 Netscape cookies.txt")
                         .font(.system(size: 12.5))
                         .foregroundStyle(url == nil ? .secondary : .primary)
                         .lineLimit(1)
@@ -348,8 +350,8 @@ struct AudioLinkCookieSection: View {
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, minHeight: 42, maxHeight: 42, alignment: .leading)
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, minHeight: 46, maxHeight: 46, alignment: .leading)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
     }
 

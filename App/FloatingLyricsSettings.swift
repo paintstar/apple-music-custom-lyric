@@ -32,7 +32,6 @@ enum FloatingLyricsActions {
             || model.isLyricsFetchPresented
             || model.isLyricsEditorPresented
             || model.isLibraryPresented
-            || model.isAudioLinkImportPresented
     }
 
     static func fetch(_ model: AppModel, presentMainWindow: () -> Void) {

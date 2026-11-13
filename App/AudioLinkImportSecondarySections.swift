@@ -157,7 +157,7 @@ struct AudioLinkSuccessSection: View {
             .padding(18)
             .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
 
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 12) {
                 Text("继续为这首歌配歌词")
                     .font(.system(size: 14.5, weight: .semibold))
                 HStack(spacing: 12) {
@@ -166,6 +166,9 @@ struct AudioLinkSuccessSection: View {
                         .controlSize(.large)
                     Button("导入本地歌词文件") { model.importManualLyrics() }
                         .buttonStyle(.bordered)
+                        .controlSize(.large)
+                    Spacer()
+                    Button("再导一首") { model.resetForAnotherImport() }
                         .controlSize(.large)
                 }
             }

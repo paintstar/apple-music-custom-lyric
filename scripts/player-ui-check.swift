@@ -1282,8 +1282,8 @@ private struct PlayerUICheck {
         let initialCount = model.musicLibraryBrowser.displayedTracks.count
 
         model.beginAudioLinkImport()
-        precondition(model.isAudioLinkImportPresented, "beginAudioLinkImport 应打开链接导入弹窗")
-        precondition(FloatingLyricsActions.hasPresentedSheet(model), "链接导入弹窗应纳入 sheet 互斥检查")
+        precondition(model.audioLinkImportModel != nil, "beginAudioLinkImport 应初始化链接导入模型")
+        precondition(!FloatingLyricsActions.hasPresentedSheet(model), "链接导入改为主页面后不应占住 sheet 互斥检查")
         let linkModel = model.audioLinkImportModel!
         await linkModel.checkTools()
         precondition(linkModel.toolAvailability?.isReady == true, "Mock 模式依赖工具探测应就绪")
@@ -1325,9 +1325,8 @@ private struct PlayerUICheck {
         }
 
         linkModel.fetchOnlineLyrics()
-        try await eventually("链入在线搜词应切换 sheet 并固定新曲目 trackKey") {
-            !model.isAudioLinkImportPresented
-                && model.isLyricsFetchPresented
+        try await eventually("链入在线搜词应直接打开在线搜词 sheet 并固定新曲目 trackKey") {
+            model.isLyricsFetchPresented
                 && model.lyricsFetchModel?.target.trackKey == importedTrack.trackRef
                 && model.lyricsFetchModel?.target.titleHint == "Crack0day/Caribdis"
         }

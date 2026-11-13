@@ -137,30 +137,37 @@ extension AppModel {
         }
     }
 
-    /// 打开链接导入弹窗：运行中重开保留当前进度；已结束状态重开时清理旧结果。
+    /// 懒创建并复用链接导入模型。
+    @discardableResult
+    func ensureAudioLinkImportModel() -> AudioLinkImportModel {
+        if let existing = audioLinkImportModel {
+            return existing
+        }
+        let created = AudioLinkImportModel(service: audioLinkImporter)
+        created.onImportSucceeded = { [weak self] _ in
+            self?.musicLibraryBrowser.refreshAfterLibraryImport()
+        }
+        created.onFetchOnlineLyrics = { [weak self] track in
+            self?.beginOnlineFetch(for: track)
+        }
+        created.onImportManualLyrics = { [weak self] track in
+            self?.beginManualImport(for: track)
+        }
+        audioLinkImportModel = created
+        return created
+    }
+
+    /// 切到链接导入主页面前准备模型状态：运行中保留当前进度；已结束状态重置旧结果。
+    func prepareAudioLinkImportPage() {
+        guard !isTerminating else { return }
+        ensureAudioLinkImportModel().prepareForReopen()
+    }
+
+    /// 打开链接导入主页面（通过通知通知主窗口切换到侧栏「导入 → 从链接导入音频」）。
     func beginAudioLinkImport() {
         guard !isTerminating else { return }
-        pendingAudioLinkSheetAction = nil
-        let linkModel: AudioLinkImportModel
-        if let existing = audioLinkImportModel {
-            existing.prepareForReopen()
-            linkModel = existing
-        } else {
-            let created = AudioLinkImportModel(service: audioLinkImporter)
-            created.onImportSucceeded = { [weak self] _ in
-                self?.musicLibraryBrowser.refreshAfterLibraryImport()
-            }
-            created.onFetchOnlineLyrics = { [weak self] track in
-                self?.beginOnlineFetch(for: track)
-            }
-            created.onImportManualLyrics = { [weak self] track in
-                self?.beginManualImport(for: track)
-            }
-            audioLinkImportModel = created
-            linkModel = created
-        }
-        if audioLinkImportModel !== linkModel { audioLinkImportModel = linkModel }
-        isAudioLinkImportPresented = true
+        prepareAudioLinkImportPage()
+        NotificationCenter.default.post(name: .shinSelectAudioLinkImportPage, object: nil)
     }
 
     /// 为新入库曲目发起网易云在线搜词（固定该曲目的 trackRef，不随当前播放变化）。
@@ -177,22 +184,13 @@ extension AppModel {
             artist: track.artist,
             durationMs: track.durationMs
         )
-        let openFetch: @MainActor () -> Void = { [weak self] in
-            guard let self, !self.isTerminating else { return }
-            self.presentFetchSheet(
-                target: target,
-                matchQuery: matchQuery,
-                onDelivered: { [weak self] lyrics, provenance, deliveredTarget in
-                    self?.handleFetchedLyrics(lyrics, provenance: provenance, target: deliveredTarget)
-                }
-            )
-        }
-        if isAudioLinkImportPresented {
-            isAudioLinkImportPresented = false
-            schedulePostAudioLinkSheetAction(openFetch)
-        } else {
-            openFetch()
-        }
+        presentFetchSheet(
+            target: target,
+            matchQuery: matchQuery,
+            onDelivered: { [weak self] lyrics, provenance, deliveredTarget in
+                self?.handleFetchedLyrics(lyrics, provenance: provenance, target: deliveredTarget)
+            }
+        )
     }
 
     /// 为新入库曲目打开本地歌词文件/文本导入窗口。
@@ -204,29 +202,10 @@ extension AppModel {
             artistHint: track.artist,
             durationHintMs: track.durationMs
         )
-        let openManual: @MainActor () -> Void = { [weak self] in
-            self?.openManualImportSession(target: target)
-        }
-        if isAudioLinkImportPresented {
-            isAudioLinkImportPresented = false
-            schedulePostAudioLinkSheetAction(openManual)
-        } else {
-            openManual()
-        }
+        openManualImportSession(target: target)
     }
+}
 
-    /// 避免 SwiftUI 同窗同时弹出两个 sheet；优先由 onDismiss 触发，无视图挂载时由短延时兜底。
-    private func schedulePostAudioLinkSheetAction(_ action: @escaping @MainActor () -> Void) {
-        pendingAudioLinkSheetAction = action
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(30))
-            self?.flushPendingAudioLinkSheetAction()
-        }
-    }
-
-    func flushPendingAudioLinkSheetAction() {
-        guard let action = pendingAudioLinkSheetAction else { return }
-        pendingAudioLinkSheetAction = nil
-        action()
-    }
+extension Notification.Name {
+    static let shinSelectAudioLinkImportPage = Notification.Name("shin.selectAudioLinkImportPage")
 }

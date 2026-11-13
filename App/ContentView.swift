@@ -61,7 +61,6 @@ struct ContentView: View {
             || model.isLyricsFetchPresented
             || model.isLyricsEditorPresented
             || model.isLibraryPresented
-            || model.isAudioLinkImportPresented
     }
 
     var body: some View {
@@ -75,7 +74,6 @@ struct ContentView: View {
                     SidebarView(selection: selectionBinding, browser: model.musicLibraryBrowser,
                                 onEditLyrics: { model.beginLyricsEditing() },
                                 onNowPlaying: { showNowPlaying() },
-                                onImportAudioFromLink: { model.beginAudioLinkImport() },
                                 topContentInset: geometry.safeAreaInsets.top)
                 }
                 if usesCompact {
@@ -139,14 +137,6 @@ struct ContentView: View {
                 LyricsEditorView(model: editor) { model.requestCloseLyricsEditor() }
             }
         })
-        .sheet(isPresented: $model.isAudioLinkImportPresented,
-               onDismiss: { model.flushPendingAudioLinkSheetAction() }, content: {
-            if let linkModel = model.audioLinkImportModel {
-                AudioLinkImportView(model: linkModel, isMock: model.isMock) {
-                    model.isAudioLinkImportPresented = false
-                }
-            }
-        })
         .onAppear {
             configureMainWindowPresentation()
             if hasPresentedSheet {
@@ -157,7 +147,6 @@ struct ContentView: View {
         .onChange(of: model.isLyricsFetchPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLibraryPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLyricsEditorPresented) { _, shown in expandForSheet(shown) }
-        .onChange(of: model.isAudioLinkImportPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: presentation) { _, mode in
             preferences.set(mode.rawValue, forKey: "player.presentationMode")
             if mode != .browser { showsPlaybackList = false }
@@ -166,6 +155,9 @@ struct ContentView: View {
             preferences.set(mode.rawValue, forKey: "player.compactReturnMode")
         }
         .onReceive(NotificationCenter.default.publisher(for: .shinSelectLibraryPage)) { _ in openPage(.library) }
+        .onReceive(NotificationCenter.default.publisher(for: .shinSelectAudioLinkImportPage)) { _ in
+            openPage(.audioLinkImport)
+        }
         .onDisappear { cancelTrackReveal() }
     }
 
@@ -240,6 +232,10 @@ struct ContentView: View {
             } else {
                 libraryUnavailable
             }
+        case .audioLinkImport:
+            AudioLinkImportView(model: model.ensureAudioLinkImportModel(),
+                                isMock: model.isMock,
+                                bottomContentInset: bottomInset)
         case .settings:
             SettingsPageView(bottomContentInset: bottomInset)
         }
@@ -319,8 +315,7 @@ struct ContentView: View {
             onSelect: openPage,
             onNowPlaying: showNowPlaying,
             onImport: { expandBeforeAction { model.beginImport() } },
-            onEdit: { expandBeforeAction { model.beginLyricsEditing() } },
-            onImportAudioFromLink: { expandBeforeAction { model.beginAudioLinkImport() } }
+            onEdit: { expandBeforeAction { model.beginLyricsEditing() } }
         )
     }
 
@@ -346,6 +341,7 @@ struct ContentView: View {
         if remember { previousPages.append(selection) }
         searchFocusRequest = nil
         selection = page
+        if page == .audioLinkImport { model.prepareAudioLinkImportPage() }
         if case let .music(destination) = page { model.musicLibraryBrowser.select(destination) }
     }
 
@@ -426,7 +422,7 @@ extension ContentView {
             },
             findInList: find, togglePlaybackList: { togglePlaybackList() }, toggleLyrics: { toggleLyricsFromMenu() },
             toggleStatusBar: status, revealCurrentTrack: reveal, goBack: back,
-            importAudioFromLink: { expandBeforeAction { model.beginAudioLinkImport() } }
+            importAudioFromLink: { openPage(.audioLinkImport) }
         )
     }
 
