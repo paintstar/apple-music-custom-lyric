@@ -4,21 +4,57 @@ import UniformTypeIdentifiers
 import ShinAppleKit
 import ShinAppServices
 
-// MARK: - 卡片容器与字段组件
+// MARK: - 卡片容器与通用标题组件
 
 struct AudioLinkSectionCard<Content: View>: View {
     var fillHeight: Bool = false
     @ViewBuilder let content: () -> Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 14) {
             content()
             if fillHeight { Spacer(minLength: 0) }
         }
         .frame(maxWidth: .infinity, maxHeight: fillHeight ? .infinity : nil, alignment: .topLeading)
-        .padding(14)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+        .padding(18)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+    }
+}
+
+struct AudioLinkSectionHeader<Trailing: View>: View {
+    let title: String
+    let systemImage: String
+    var subtitle: String?
+    @ViewBuilder let trailing: () -> Trailing
+
+    init(
+        _ title: String,
+        systemImage: String,
+        subtitle: String? = nil,
+        @ViewBuilder trailing: @escaping () -> Trailing = { EmptyView() }
+    ) {
+        self.title = title
+        self.systemImage = systemImage
+        self.subtitle = subtitle
+        self.trailing = trailing
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+            Text(title)
+                .font(.system(size: 14.5, weight: .semibold))
+            if let subtitle {
+                Text(subtitle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 6)
+            trailing()
+        }
     }
 }
 
@@ -28,73 +64,16 @@ struct AudioLinkFieldColumn: View {
     @Binding var text: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label).font(.caption2).foregroundStyle(.secondary)
-            TextField(placeholder, text: $text).textFieldStyle(.roundedBorder)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.regular)
+                .font(.system(size: 13))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-// MARK: - 前置工具安装引导卡片
-
-struct AudioToolInstallGuideCard: View {
-    @ObservedObject var model: AudioLinkImportModel
-
-    var body: some View {
-        if model.isCheckingTools && model.toolAvailability == nil {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("正在检测本机 yt-dlp 与 ffmpeg 工具……").font(.callout).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading).padding(12)
-            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08), lineWidth: 1))
-        } else if let tools = model.toolAvailability, !tools.isReady {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Label("需要先安装本机命令行依赖工具", systemImage: "exclamationmark.triangle.fill")
-                        .font(.callout.weight(.semibold)).foregroundStyle(.orange)
-                    Spacer()
-                    Button("安装完成后重新检测") { model.startToolCheck() }
-                        .controlSize(.small).disabled(model.isCheckingTools)
-                }
-                HStack(spacing: 12) {
-                    toolBadge(name: "yt-dlp", role: "解析链接并提取音频", url: tools.ytdlpURL)
-                    toolBadge(name: "ffmpeg", role: "封装 M4A 与写入封面标签", url: tools.ffmpegURL)
-                }
-                if let command = model.installCommand {
-                    HStack(spacing: 8) {
-                        Text(command).font(.caption.monospaced()).textSelection(.enabled)
-                            .padding(.horizontal, 10).padding(.vertical, 6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-                        Button(model.copiedInstallCommand ? "已复制" : "复制命令") { model.copyInstallCommand() }
-                            .controlSize(.small)
-                        Button("打开终端") { model.openTerminalApp() }.controlSize(.small)
-                    }
-                }
-                Text("已扫描路径：/opt/homebrew/bin、/usr/local/bin、~/.local/bin 及环境变量 PATH")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            .padding(14)
-            .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.orange.opacity(0.25), lineWidth: 1))
-        }
-    }
-
-    private func toolBadge(name: String, role: String, url: URL?) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: url != nil ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundStyle(url != nil ? .green : .orange)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(.caption.weight(.semibold))
-                Text(url != nil ? "已就绪" : "未检测到 · \(role)")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading).padding(8)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -106,38 +85,55 @@ struct AudioLinkURLSection: View {
 
     var body: some View {
         AudioLinkSectionCard {
-            HStack(spacing: 8) {
-                Text("音频 / 视频链接").font(.callout.weight(.medium))
+            AudioLinkSectionHeader("音频 / 视频链接", systemImage: "link") {
                 if let inspection = model.urlInspection {
                     Text(inspection.platform.displayName)
-                        .font(.caption2.weight(.medium)).foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 8).padding(.vertical, 2)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
                         .background(Color.accentColor.opacity(0.12), in: Capsule())
                 }
-                Spacer()
-                Button("粘贴链接") { model.pasteAndNormalizeFromClipboard() }.controlSize(.small)
+                Button("粘贴链接") { model.pasteAndNormalizeFromClipboard() }
+                    .controlSize(.regular)
                 if !model.urlString.isEmpty {
-                    Button("清空") { model.clearURLInput() }.controlSize(.small)
+                    Button("清空") { model.clearURLInput() }
+                        .controlSize(.regular)
                 }
             }
+
             TextField("https://www.bilibili.com/video/...", text: $model.urlString)
-                .textFieldStyle(.roundedBorder).focused($isURLFocused)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.large)
+                .font(.system(size: 14))
+                .focused($isURLFocused)
                 .onSubmit { model.applyNormalizedURLIfNeeded() }
                 .onChange(of: isURLFocused) { _, focused in
                     if !focused { model.applyNormalizedURLIfNeeded() }
                 }
+
             if let warning = model.urlInspection?.formatWarning {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    .font(.system(size: 12.5))
+                    .lineSpacing(3)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if let notice = model.autoCleanedNotice {
                 Label(notice, systemImage: "checkmark.circle")
-                    .font(.caption).foregroundStyle(.green).fixedSize(horizontal: false, vertical: true)
+                    .font(.system(size: 12.5))
+                    .lineSpacing(3)
+                    .foregroundStyle(.green)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+
             Text(
                 "支持格式：B 站 https://www.bilibili.com/video/BV...（可带 ?p=1） · "
                     + "YouTube https://www.youtube.com/watch?v=...（粘贴带追踪参数将自动裁剪）"
             )
-            .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            .font(.system(size: 12.5))
+            .lineSpacing(3)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -149,8 +145,8 @@ struct AudioLinkMetadataColumn: View {
 
     var body: some View {
         AudioLinkSectionCard(fillHeight: true) {
-            Text("歌曲标签与封面").font(.callout.weight(.medium))
-            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+            AudioLinkSectionHeader("歌曲标签与封面", systemImage: "music.note.list", subtitle: "留空保留源信息")
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 12) {
                 GridRow {
                     AudioLinkFieldColumn(label: "歌名", placeholder: "留空用源标题", text: $model.title)
                     AudioLinkFieldColumn(label: "歌手", placeholder: "留空用源作者", text: $model.artist)
@@ -160,11 +156,15 @@ struct AudioLinkMetadataColumn: View {
                     AudioLinkFieldColumn(label: "流派", placeholder: "可选", text: $model.genre)
                 }
             }
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle("嵌入视频封面为歌曲封面", isOn: $model.embedThumbnail)
-                    .toggleStyle(.checkbox).font(.caption)
-                Toggle("保留源站默认标签（--add-metadata）", isOn: $model.includeSourceMetadata)
-                    .toggleStyle(.checkbox).font(.caption)
+            HStack(spacing: 18) {
+                Toggle("嵌入视频封面", isOn: $model.embedThumbnail)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 13))
+                    .help("将视频封面嵌入为歌曲封面")
+                Toggle("保留源站标签", isOn: $model.includeSourceMetadata)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 13))
+                    .help("保留源站默认简介与标签（--add-metadata）")
             }
             .padding(.top, 2)
         }
@@ -176,40 +176,61 @@ struct AudioLinkOptionsColumn: View {
 
     var body: some View {
         AudioLinkSectionCard(fillHeight: true) {
-            Text("下载配置与保存（yt-dlp）").font(.callout.weight(.medium))
-            VStack(alignment: .leading, spacing: 8) {
+            AudioLinkSectionHeader("下载配置与保存", systemImage: "slider.horizontal.3", subtitle: "yt-dlp")
+            VStack(alignment: .leading, spacing: 12) {
                 labeledRow("音频质量") {
                     Picker("音频质量", selection: $model.audioQuality) {
                         ForEach(AudioQualityOption.allCases) { option in
                             Text(option.displayName).tag(option)
                         }
                     }
-                    .pickerStyle(.menu).labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .controlSize(.regular)
+                    .font(.system(size: 13))
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 labeledRow("片段裁剪") {
-                    HStack(spacing: 5) {
+                    HStack(spacing: 6) {
                         TextField("00:05", text: $model.trimStart)
-                            .textFieldStyle(.roundedBorder).frame(width: 66)
-                        Text("→").font(.caption).foregroundStyle(.secondary)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.regular)
+                            .font(.system(size: 13))
+                            .frame(width: 72)
+                        Text("→").font(.system(size: 13)).foregroundStyle(.secondary)
                         TextField("03:45", text: $model.trimEnd)
-                            .textFieldStyle(.roundedBorder).frame(width: 66)
-                        Text("留空不裁").font(.caption2).foregroundStyle(.secondary)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.regular)
+                            .font(.system(size: 13))
+                            .frame(width: 72)
+                        Text("留空不裁")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
                     }
                 }
                 labeledRow("网络代理") {
                     TextField("留空直连，如 127.0.0.1:7890", text: $model.proxy)
                         .textFieldStyle(.roundedBorder)
+                        .controlSize(.regular)
+                        .font(.system(size: 13))
                 }
                 labeledRow("本地副本") {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Toggle("保留 .m4a", isOn: $model.keepLocalCopy)
-                            .toggleStyle(.checkbox).font(.caption)
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 13))
                         Spacer(minLength: 4)
                         Text(model.localCopyDirectory?.lastPathComponent ?? "桌面")
-                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.primary.opacity(0.05), in: Capsule())
                             .opacity(model.keepLocalCopy ? 1 : 0.45)
                         Button("更改…") { chooseLocalCopyDirectory() }
-                            .controlSize(.small).disabled(!model.keepLocalCopy)
+                            .controlSize(.regular)
+                            .disabled(!model.keepLocalCopy)
                     }
                 }
             }
@@ -220,8 +241,11 @@ struct AudioLinkOptionsColumn: View {
         _ title: String,
         @ViewBuilder control: () -> Control
     ) -> some View {
-        HStack(spacing: 8) {
-            Text(title).font(.caption).foregroundStyle(.secondary).frame(width: 54, alignment: .leading)
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 64, alignment: .leading)
             control()
         }
     }
@@ -272,17 +296,21 @@ struct AudioLinkCookieSection: View {
 
     var body: some View {
         AudioLinkSectionCard {
-            Text("站点访问凭据 (Cookies)").font(.callout.weight(.medium))
-            HStack(spacing: 12) {
+            AudioLinkSectionHeader("站点访问凭据 (Cookies)", systemImage: "key.fill", subtitle: "可选")
+            HStack(spacing: 14) {
                 Picker("Cookies 来源", selection: cookieKindBinding) {
                     ForEach(CookieKind.allCases) { kind in Text(kind.rawValue).tag(kind) }
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 236)
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.regular)
+                .frame(width: 260)
 
                 cookieDetailSlot
             }
             Text("仅向 yt-dlp 透传来源参数，本应用不读取、展示或持久化 Cookies 内容。")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
         }
         .onAppear {
             switch model.cookieMode {
@@ -298,26 +326,31 @@ struct AudioLinkCookieSection: View {
             switch model.cookieMode {
             case .none:
                 Text("公开内容无需凭据；需大会员音轨或登录可见时请切至浏览器读取")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             case .browser(let current):
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     ForEach(AudioCookieBrowser.allCases) { browser in
                         browserPill(browser, isSelected: browser == current)
                     }
                 }
             case .file(let url):
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Text(url?.lastPathComponent ?? "未选择 Netscape cookies.txt")
-                        .font(.caption).foregroundStyle(url == nil ? .secondary : .primary)
-                        .lineLimit(1).truncationMode(.middle)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(url == nil ? .secondary : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Button("选择文件…") { chooseCookiesFile() }.controlSize(.small)
+                    Button("选择文件…") { chooseCookiesFile() }
+                        .controlSize(.regular)
                 }
             }
         }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36, alignment: .leading)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, minHeight: 42, maxHeight: 42, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func browserPill(_ browser: AudioCookieBrowser, isSelected: Bool) -> some View {
@@ -326,20 +359,20 @@ struct AudioLinkCookieSection: View {
             model.cookieMode = .browser(browser)
         } label: {
             Text(browser.shortName)
-                .font(.caption.weight(isSelected ? .semibold : .regular))
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
                 .foregroundStyle(isSelected ? .white : .primary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(isSelected ? Color.accentColor : Color.clear, in: Capsule())
+                .padding(.horizontal, 13)
+                .padding(.vertical, 6)
+                .background(isSelected ? Color.accentColor : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(
-                    Capsule().stroke(
+                    RoundedRectangle(cornerRadius: 8).stroke(
                         isSelected ? Color.clear : Color.primary.opacity(0.16),
                         lineWidth: 1
                     )
                 )
         }
         .buttonStyle(.plain)
-        .contentShape(Capsule())
+        .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private func chooseCookiesFile() {
@@ -352,81 +385,5 @@ struct AudioLinkCookieSection: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         selectedCookiesFile = url
         model.cookieMode = .file(url)
-    }
-}
-
-// MARK: - 进度、错误与成功反馈
-
-struct AudioLinkRunningOrErrorSection: View {
-    let phase: AudioLinkImportModel.Phase
-
-    var body: some View {
-        switch phase {
-        case .idle, .succeeded:
-            EmptyView()
-        case let .running(stage, logTail):
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(stage.statusTitle).font(.callout.weight(.medium))
-                    Spacer()
-                    if case let .downloading(progress, _) = stage, let progress {
-                        Text("\(Int((progress * 100).rounded()))%")
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    }
-                }
-                if case let .downloading(progress, _) = stage, let progress {
-                    ProgressView(value: progress)
-                } else {
-                    ProgressView()
-                }
-                if let logTail, !logTail.isEmpty {
-                    Text(logTail).font(.caption2.monospaced()).foregroundStyle(.secondary)
-                        .lineLimit(2).truncationMode(.tail)
-                }
-            }
-            .padding(12)
-            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-        case let .failed(message):
-            Label(message, systemImage: "exclamationmark.triangle.fill")
-                .font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-        }
-    }
-}
-
-struct AudioLinkSuccessSection: View {
-    @ObservedObject var model: AudioLinkImportModel
-    let result: AudioLinkImportResult
-
-    var body: some View {
-        let track = result.importedTrack.track
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 6) {
-                Label("已导入「音乐」资料库", systemImage: "checkmark.circle.fill")
-                    .font(.headline).foregroundStyle(.green)
-                Text(track.title).font(.title3.weight(.semibold))
-                if let artist = track.artist, !artist.isEmpty {
-                    Text(artist).font(.callout).foregroundStyle(.secondary)
-                }
-                Divider().padding(.vertical, 4)
-                Text(result.storageSummary)
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                if let copyURL = result.savedCopyURL {
-                    Text("本地副本：\(copyURL.path)").font(.caption.monospaced())
-                        .foregroundStyle(.secondary).textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading).padding(14)
-            .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("继续为这首歌配歌词").font(.callout.weight(.medium))
-                HStack(spacing: 10) {
-                    Button("在线搜歌词（网易云）") { model.fetchOnlineLyrics() }.buttonStyle(.borderedProminent)
-                    Button("导入本地歌词文件") { model.importManualLyrics() }.buttonStyle(.bordered)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
