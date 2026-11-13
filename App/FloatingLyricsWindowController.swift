@@ -12,10 +12,15 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
     var presentMainWindow: (@MainActor () -> Void)?
 
     private let defaults: UserDefaults
+    private let workspaceNotificationCenter: NotificationCenter
     private let visibleFrames: @MainActor () -> [NSRect]
     private let mouseLocation: @MainActor () -> NSPoint
     private let monotonicTime: @MainActor () -> TimeInterval
     private var isAdjustingGeometry = false
+    private var preferredFrame: NSRect?
+    private var lastConstrainedFrame: NSRect?
+    private var lastVisibleFrames: [NSRect] = []
+    private var isScreenSleeping = false
     private weak var hostedModel: AppModel?
     private var hoverTimer: Timer?
     private var unlockHover = FloatingLyricsUnlockHover()
@@ -27,10 +32,12 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
     private static let interactiveBackgroundOpacity: CGFloat = 0.01
 
     init(defaults: UserDefaults = .standard,
+         workspaceNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
          visibleFrames: @escaping @MainActor () -> [NSRect] = { FloatingLyricsWindowController.currentVisibleFrames() },
          mouseLocation: @escaping @MainActor () -> NSPoint = { NSEvent.mouseLocation },
          monotonicTime: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.defaults = defaults
+        self.workspaceNotificationCenter = workspaceNotificationCenter
         self.visibleFrames = visibleFrames
         self.mouseLocation = mouseLocation
         self.monotonicTime = monotonicTime
@@ -39,10 +46,15 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(applicationWillTerminate),
                                                name: NSApplication.willTerminateNotification, object: nil)
+        workspaceNotificationCenter.addObserver(self, selector: #selector(screensDidSleep),
+                                                name: NSWorkspace.screensDidSleepNotification, object: nil)
+        workspaceNotificationCenter.addObserver(self, selector: #selector(screensDidWake),
+                                                name: NSWorkspace.screensDidWakeNotification, object: nil)
     }
 
     isolated deinit {
         NotificationCenter.default.removeObserver(self)
+        workspaceNotificationCenter.removeObserver(self)
         hoverTimer?.invalidate()
         if let unlockWindow { window?.removeChildWindow(unlockWindow) }
         unlockWindow?.orderOut(nil)
@@ -61,7 +73,7 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
         (panel as? FloatingLyricsPanel)?.resetFloatingCursorTracking()
         hostedModel = model
         updateHostedView()
-        updateWindowGeometry()
+        applyWindowGeometry(baseFrame: preferredFrame ?? panel.frame, persistPreferredFrame: true)
         updateInteractionBackground(panel)
         isPresented = true
         // 保持其它 App 的键盘焦点；悬浮窗只调整可见顺序。
@@ -81,7 +93,7 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
         window.isMovable = true
         window.isMovableByWindowBackground = true
         updateInteractionBackground(window)
-        saveFrame(window.frame)
+        saveFrame(preferredFrame ?? window.frame)
         window.orderOut(nil)
         window.contentView = nil
         isPresented = false
@@ -179,14 +191,17 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
     }
 
     func windowWillClose(_ notification: Notification) { close() }
-    func windowDidMove(_ notification: Notification) { updateWindowGeometry() }
-    func windowDidResize(_ notification: Notification) { updateWindowGeometry() }
+    func windowDidMove(_ notification: Notification) { handleWindowGeometryCallback() }
+    func windowDidResize(_ notification: Notification) { handleWindowGeometryCallback() }
 
     private func makeWindow() -> NSPanel {
         let frames = visibleFrames()
         let restored = defaults.string(forKey: Self.framePreferenceKey).map(NSRectFromString)
         let frame = restored.map { FloatingLyricsWindowGeometry.constrained($0, visibleFrames: frames) }
             ?? FloatingLyricsWindowGeometry.initialFrame(visibleFrames: frames)
+        preferredFrame = frame
+        lastConstrainedFrame = frame
+        lastVisibleFrames = frames.filter(FloatingLyricsWindowGeometry.isUsable)
         let panel = FloatingLyricsPanel(contentRect: frame,
                                        styleMask: [.borderless, .nonactivatingPanel, .resizable],
                                        backing: .buffered, defer: false)
@@ -214,22 +229,73 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
         panel.animationBehavior = .none
     }
 
-    private func updateWindowGeometry() {
+    @objc private func screensDidSleep(_ notification: Notification) {
+        isScreenSleeping = true
+    }
+
+    @objc private func screensDidWake(_ notification: Notification) {
+        isScreenSleeping = false
+        handleScreenEnvironmentChange()
+    }
+
+    @objc private func screensChanged(_ notification: Notification) {
+        handleScreenEnvironmentChange()
+    }
+
+    private func handleScreenEnvironmentChange() {
+        guard let window, !isAdjustingGeometry, !isScreenSleeping else { return }
+        let usableFrames = visibleFrames().filter(FloatingLyricsWindowGeometry.isUsable)
+        guard !usableFrames.isEmpty else { return }
+        lastVisibleFrames = usableFrames
+        applyWindowGeometry(baseFrame: preferredFrame ?? window.frame,
+                            visibleFrames: usableFrames,
+                            persistPreferredFrame: false)
+    }
+
+    private func handleWindowGeometryCallback() {
+        guard let window, !isAdjustingGeometry else { return }
+        let isUserInteraction = (window as? FloatingLyricsPanel)?.isUserManipulatingFrame == true
+        let usableFrames = visibleFrames().filter(FloatingLyricsWindowGeometry.isUsable)
+        guard !isScreenSleeping || isUserInteraction, !usableFrames.isEmpty else { return }
+        let isTemporaryConstrained = preferredFrame.map { $0 != lastConstrainedFrame } ?? false
+        if !isUserInteraction && (usableFrames != lastVisibleFrames || isTemporaryConstrained) {
+            lastVisibleFrames = usableFrames
+            applyWindowGeometry(baseFrame: preferredFrame ?? window.frame,
+                                visibleFrames: usableFrames,
+                                persistPreferredFrame: false)
+            return
+        }
+        lastVisibleFrames = usableFrames
+        applyWindowGeometry(baseFrame: window.frame,
+                            visibleFrames: usableFrames,
+                            persistPreferredFrame: true)
+    }
+
+    private func applyWindowGeometry(baseFrame: NSRect,
+                                     visibleFrames frames: [NSRect]? = nil,
+                                     persistPreferredFrame: Bool) {
         guard let window, !isAdjustingGeometry else { return }
         isAdjustingGeometry = true
         defer { isAdjustingGeometry = false }
-        let frames = visibleFrames()
-        let frame = FloatingLyricsWindowGeometry.constrained(window.frame, visibleFrames: frames)
-        if let screen = FloatingLyricsWindowGeometry.visibleFrame(for: frame, visibleFrames: frames) {
+        let resolvedFrames = (frames ?? visibleFrames()).filter(FloatingLyricsWindowGeometry.isUsable)
+        let frame = FloatingLyricsWindowGeometry.constrained(baseFrame, visibleFrames: resolvedFrames)
+        if let screen = FloatingLyricsWindowGeometry.visibleFrame(for: frame, visibleFrames: resolvedFrames) {
             window.contentMinSize = NSSize(width: min(FloatingLyricsWindowGeometry.minimumSize.width, screen.width),
                                           height: min(FloatingLyricsWindowGeometry.minimumSize.height, screen.height))
             window.contentMaxSize = screen.size
         } else {
             window.contentMinSize = FloatingLyricsWindowGeometry.minimumSize
         }
+        lastConstrainedFrame = frame
+        if !resolvedFrames.isEmpty { lastVisibleFrames = resolvedFrames }
         if window.frame != frame { window.setFrame(frame, display: isPresented) }
         if let unlockWindow { positionUnlockWindow(unlockWindow) }
-        saveFrame(frame)
+        if persistPreferredFrame {
+            preferredFrame = frame
+            saveFrame(frame)
+        } else if preferredFrame == nil {
+            preferredFrame = frame
+        }
     }
 
     private func saveFrame(_ frame: NSRect) {
@@ -238,8 +304,6 @@ final class FloatingLyricsWindowController: NSObject, ObservableObject, NSWindow
             defaults.set(stored, forKey: Self.framePreferenceKey)
         }
     }
-
-    @objc private func screensChanged(_ notification: Notification) { updateWindowGeometry() }
 
     @objc private func applicationWillTerminate(_ notification: Notification) {
         close()
@@ -259,9 +323,21 @@ final class FloatingLyricsPanel: NSPanel {
     private lazy var cursorCoordinator = FloatingLyricsCursorCoordinator(window: self)
     private var eventDispatchDepth = 0
     private var isResettingCursorRects = false
+    private(set) var isUserManipulatingFrame = false
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
     override func toggleFullScreen(_ sender: Any?) {}
+
+    func performUserGeometryChange(_ body: () -> Void) {
+        isUserManipulatingFrame = true
+        defer { isUserManipulatingFrame = false }
+        body()
+    }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        // 悬浮窗多屏与尺寸边界由 FloatingLyricsWindowGeometry 统一约束，阻止 AppKit 在熄屏过渡态私自裁剪窗口。
+        frameRect
+    }
 
     override func sendEvent(_ event: NSEvent) {
         eventDispatchDepth += 1
@@ -372,7 +448,7 @@ enum FloatingLyricsWindowGeometry {
         }
     }
 
-    private static func isUsable(_ frame: NSRect) -> Bool {
+    static func isUsable(_ frame: NSRect) -> Bool {
         frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width.isFinite && frame.height.isFinite
             && frame.width > 0 && frame.height > 0
     }

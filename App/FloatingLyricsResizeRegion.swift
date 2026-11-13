@@ -106,7 +106,11 @@ struct FloatingLyricsResizeRegion: NSViewRepresentable {
                 initial: initialFrame, delta: NSSize(width: point.x - initialPoint.x, height: point.y - initialPoint.y),
                 edge: edge, limits: .init(minimumSize: window.minSize, maximumSize: window.maxSize, visibleFrame: visibleFrame)
             )
-            window.setFrame(frame, display: true, animate: false)
+            if let panel = window as? FloatingLyricsPanel {
+                panel.performUserGeometryChange { panel.setFrame(frame, display: true, animate: false) }
+            } else {
+                window.setFrame(frame, display: true, animate: false)
+            }
         }
 
         override func mouseUp(with event: NSEvent) {

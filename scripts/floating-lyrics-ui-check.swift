@@ -87,6 +87,11 @@ private struct FloatingToggleFramePreference: PreferenceKey {
     var time: TimeInterval = 100
 }
 
+@MainActor private final class FloatingScreensProbe {
+    var frames: [NSRect]
+    init(_ frames: [NSRect]) { self.frames = frames }
+}
+
 @main
 private struct FloatingLyricsUICheck {
     @MainActor static func main() {
@@ -282,6 +287,9 @@ private struct FloatingLyricsUICheck {
             try await showSettingsSynchronizationFixture(model: model, defaults: defaults)
             return
         }
+        if !typographyOnly {
+            try checkScreenSleepWakeRestoration(model: model, defaults: defaults)
+        }
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1_280, height: 800)
         defaults.set(NSStringFromRect(NSRect(x: 90_000, y: 90_000, width: 900, height: 200)),
                      forKey: FloatingLyricsWindowController.framePreferenceKey)
@@ -339,10 +347,14 @@ private struct FloatingLyricsUICheck {
         main.isReleasedWhenClosed = false
         main.contentView = NSHostingView(rootView: Text("原创检查主窗口").defaultAppStorage(defaults))
         // 本项显式准备可成为 key 的模拟主窗；此前的后台浮窗检查均已完成。
-        NSApplication.shared.activate()
+        NSApplication.shared.activate(ignoringOtherApps: true)
         main.makeKeyAndOrderFront(nil)
         try await eventually("主窗准备超时：key=\(main.isKeyWindow)，visible=\(main.isVisible)，appActive=\(NSApplication.shared.isActive)") {
-            main.isKeyWindow && main.isVisible
+            if !main.isKeyWindow {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                main.makeKeyAndOrderFront(nil)
+            }
+            return main.isKeyWindow && main.isVisible
         }
         bottomWindow.close()
         try await eventually("焦点已交给模拟主窗后，底栏夹具应关闭且主窗保持 key") {
@@ -381,6 +393,55 @@ private struct FloatingLyricsUICheck {
         precondition(restored.window?.frame == rememberedFrame, "新控制器应从隔离偏好恢复窗口位置")
         restored.close()
         print("PASS 独立唯一窗口、开关/关闭同步、背景焦点、暂停初始化、主窗最小化/销毁及长句双语")
+    }
+
+    @MainActor private static func checkScreenSleepWakeRestoration(model: AppModel, defaults _: UserDefaults) throws {
+        let suite = "ShinApple.FloatingCheck.SleepWake.\(UUID().uuidString)"
+        let isolatedDefaults = UserDefaults(suiteName: suite)!
+        defer { isolatedDefaults.removePersistentDomain(forName: suite) }
+
+        let activeScreens = FloatingScreensProbe([NSRect(x: 0, y: 0, width: 2_560, height: 1_440)])
+        let workspaceCenter = NotificationCenter()
+        let controller = FloatingLyricsWindowController(
+            defaults: isolatedDefaults,
+            workspaceNotificationCenter: workspaceCenter,
+            visibleFrames: { activeScreens.frames }
+        )
+        defer { controller.close() }
+
+        controller.show(model: model)
+        guard let panel = controller.window else { preconditionFailure("熄屏恢复检查缺少悬浮窗") }
+        let topRight = NSRect(x: 1_960, y: 1_235, width: 600, height: 180)
+        (panel as? FloatingLyricsPanel)?.performUserGeometryChange {
+            panel.setFrame(topRight, display: true)
+        }
+        precondition(panel.frame == topRight, "用户移动到右上角后窗口位置应保留")
+        let storedPreference: () -> NSRect? = {
+            isolatedDefaults.string(forKey: FloatingLyricsWindowController.framePreferenceKey).map(NSRectFromString)
+        }
+        precondition(storedPreference() == topRight, "用户移动后应保存右上角偏好")
+
+        workspaceCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
+        activeScreens.frames = []
+        NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
+
+        workspaceCenter.post(name: NSWorkspace.screensDidWakeNotification, object: nil)
+        activeScreens.frames = [NSRect(x: 0, y: 0, width: 1_024, height: 768)]
+        NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        precondition(panel.frame == NSRect(x: 424, y: 588, width: 600, height: 180),
+                     "过渡小分辨率下应临时约束窗口到可见区")
+        precondition(storedPreference() == topRight, "熄屏唤醒过渡小分辨率不得覆盖用户位置偏好")
+
+        controller.windowDidMove(Notification(name: NSWindow.didMoveNotification, object: panel))
+        precondition(storedPreference() == topRight, "非用户交互移动回调不得覆盖用户位置偏好")
+
+        activeScreens.frames = [NSRect(x: 0, y: 0, width: 2_560, height: 1_440)]
+        NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        precondition(panel.frame == topRight, "屏幕分辨率恢复后应自动还原到用户右上角位置")
+        precondition(storedPreference() == topRight, "屏幕恢复后应保留用户右上角偏好")
+
+        controller.close()
+        print("PASS 熄屏/唤醒过渡分辨率临时约束不覆盖偏好与原分辨率自动还原")
     }
 
     /// 供外部 GUI 工具操作原有 Stepper；不复制绑定实现，也不直接写入字号或字距。
@@ -505,13 +566,21 @@ private struct FloatingLyricsUICheck {
         window.contentView = host
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        func ensureKeyWindow() {
+            guard !window.isKeyWindow else { return }
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+        }
         try await saveScreenshot(window, name: "floating-lyrics-bottom-bar-original.png")
         try await eventually("底栏按钮应完成实际布局并能接收点击") {
+            ensureKeyWindow()
             host.layoutSubtreeIfNeeded()
             return window.isKeyWindow && probe.frame.width > 0 && probe.frame.height > 0
         }
+        ensureKeyWindow()
         try await clickButton(frame: probe.frame, host: host, window: window)
         try await eventually("底栏实际点击应关闭浮窗") { !controller.isPresented && controller.window?.isVisible == false }
+        ensureKeyWindow()
         try await clickButton(frame: probe.frame, host: host, window: window)
         try await eventually("底栏实际点击应重新开启浮窗") { controller.isPresented && controller.window?.isVisible == true }
         guard let panel = controller.window else { preconditionFailure("锁定检查需要已显示浮窗") }
@@ -529,6 +598,7 @@ private struct FloatingLyricsUICheck {
         let lockedBitmap = try await visibleTextBitmap(panel)
         precondition(hasClearToolbar(lockedBitmap), "锁态不得留下悬浮工具或背景遮挡")
         try await saveScreenshot(panel, name: "floating-lyrics-locked-original.png")
+        ensureKeyWindow()
         try await clickButton(frame: probe.frame, host: host, window: window)
         try await eventually("底栏首击只解锁并保持浮窗显示") {
             !controller.isLocked && !panel.ignoresMouseEvents && controller.isPresented && panel.isVisible

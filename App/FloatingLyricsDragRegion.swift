@@ -133,8 +133,13 @@ struct FloatingLyricsDragRegion: NSViewRepresentable {
             guard canInteract, let window, window.isMovable, dragWindow === window,
                   let initialFrame, let initialPoint else { cancelDrag(); return }
             let point = window.convertPoint(toScreen: event.locationInWindow)
-            window.setFrameOrigin(NSPoint(x: initialFrame.minX + point.x - initialPoint.x,
-                                          y: initialFrame.minY + point.y - initialPoint.y))
+            let origin = NSPoint(x: initialFrame.minX + point.x - initialPoint.x,
+                                 y: initialFrame.minY + point.y - initialPoint.y)
+            if let panel = window as? FloatingLyricsPanel {
+                panel.performUserGeometryChange { panel.setFrameOrigin(origin) }
+            } else {
+                window.setFrameOrigin(origin)
+            }
         }
 
         override func mouseUp(with event: NSEvent) {
