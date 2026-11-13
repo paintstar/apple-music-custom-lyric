@@ -31,6 +31,11 @@ final class AudioLinkImportModel: ObservableObject {
     @Published var album: String = ""
     @Published var genre: String = ""
     @Published var embedThumbnail: Bool = true
+    @Published var includeSourceMetadata: Bool = true
+    @Published var audioQuality: AudioQualityOption = .best
+    @Published var trimStart: String = ""
+    @Published var trimEnd: String = ""
+    @Published var proxy: String = ""
     @Published var cookieMode: CookieMode = .none
     @Published var keepLocalCopy: Bool = false
     @Published var localCopyDirectory: URL?
@@ -249,13 +254,29 @@ final class AudioLinkImportModel: ObservableObject {
             cookieSource = .cookiesFile(url)
         }
 
+        let normalizedTrim: (start: String?, end: String?)
+        let normalizedProxy: String?
+        do {
+            normalizedTrim = try AudioLinkURLNormalizer.validateTrimRange(start: trimStart, end: trimEnd)
+            normalizedProxy = try AudioLinkURLNormalizer.normalizeProxy(proxy)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            phase = .failed(message)
+            return nil
+        }
+
         let copyDirectory = keepLocalCopy ? (localCopyDirectory ?? Self.defaultLocalCopyDirectory()) : nil
         return AudioLinkImportRequest(
             urlString: trimmedURL,
             metadata: AudioLinkMetadata(title: title, artist: artist, album: album, genre: genre),
             embedThumbnail: embedThumbnail,
             cookieSource: cookieSource,
-            keepCopyDirectory: copyDirectory
+            keepCopyDirectory: copyDirectory,
+            audioQuality: audioQuality,
+            includeSourceMetadata: includeSourceMetadata,
+            trimStart: normalizedTrim.start ?? "",
+            trimEnd: normalizedTrim.end ?? "",
+            proxy: normalizedProxy ?? ""
         )
     }
 
@@ -311,7 +332,9 @@ final class AudioLinkImportModel: ObservableObject {
             phase = .idle
         }
     }
+}
 
+extension AudioLinkImportModel {
     func prepareForReopen() {
         guard !isRunning else { return }
         if case .succeeded = phase {
@@ -328,6 +351,8 @@ final class AudioLinkImportModel: ObservableObject {
         artist = ""
         album = ""
         genre = ""
+        trimStart = ""
+        trimEnd = ""
         importedResult = nil
         urlInspection = nil
         autoCleanedNotice = nil
@@ -386,6 +411,8 @@ struct MockAudioLinkImportService: AudioLinkImporting {
         if let warning = inspection.formatWarning {
             throw AudioLinkImportError.unsupportedPlatformURL(detail: warning)
         }
+        _ = try AudioLinkURLNormalizer.validateTrimRange(start: request.trimStart, end: request.trimEnd)
+        _ = try AudioLinkURLNormalizer.normalizeProxy(request.proxy)
 
         if case let .cookiesFile(cookieURL) = request.cookieSource {
             guard cookieURL.isFileURL, FileManager.default.fileExists(atPath: cookieURL.path) else {

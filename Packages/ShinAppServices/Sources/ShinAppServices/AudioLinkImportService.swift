@@ -139,6 +139,17 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
         let ffmpegURL: URL
         let tempDir: URL
         let environment: [String: String]
+        let normalizedProxy: String?
+    }
+
+    private struct RewriteContext {
+        let sourceURL: URL
+        let stagedURL: URL
+        let metadata: AudioLinkMetadata
+        let trimStart: String?
+        let trimEnd: String?
+        let ffmpegURL: URL
+        let environment: [String: String]
     }
 
     private let importer: @Sendable (URL) async throws -> MusicLibraryImportedTrack
@@ -192,6 +203,8 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
 
         let validatedURL = try Self.validateURL(request.urlString)
         try Self.validateCookieSource(request.cookieSource)
+        let trimRange = try AudioLinkURLNormalizer.validateTrimRange(start: request.trimStart, end: request.trimEnd)
+        let normalizedProxy = try AudioLinkURLNormalizer.normalizeProxy(request.proxy)
         let tools = try await resolveRequiredTools()
 
         try checkNotCancelled()
@@ -208,7 +221,8 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
             ytdlpURL: tools.ytdlpURL,
             ffmpegURL: tools.ffmpegURL,
             tempDir: tempDir,
-            environment: childEnvironment
+            environment: childEnvironment,
+            normalizedProxy: normalizedProxy
         )
         let downloadedM4A = try await downloadAudio(context: context, onStage: onStage)
 
@@ -216,11 +230,15 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
         onStage(.tagging)
         let stagedURL = try makeStagedOutputURL()
         try await rewriteMetadata(
-            sourceURL: downloadedM4A,
-            stagedURL: stagedURL,
-            metadata: request.metadata,
-            ffmpegURL: tools.ffmpegURL,
-            environment: childEnvironment
+            context: RewriteContext(
+                sourceURL: downloadedM4A,
+                stagedURL: stagedURL,
+                metadata: request.metadata,
+                trimStart: trimRange.start,
+                trimEnd: trimRange.end,
+                ffmpegURL: tools.ffmpegURL,
+                environment: childEnvironment
+            )
         )
 
         try checkNotCancelled()
@@ -249,19 +267,14 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
     }
 
     private func createTemporaryWorkingDirectory() throws -> URL {
-        let tempDir = temporaryRootDirectory.appendingPathComponent(
-            "shin-audio-link-\(UUID().uuidString)",
-            isDirectory: true
-        )
+        let tempDir = temporaryRootDirectory.appendingPathComponent("shin-audio-link-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         return tempDir
     }
 
     private func makeStagedOutputURL() throws -> URL {
         try FileManager.default.createDirectory(at: stagingRootDirectory, withIntermediateDirectories: true)
-        return stagingRootDirectory
-            .appendingPathComponent("shin-import-\(UUID().uuidString).m4a")
-            .standardizedFileURL
+        return stagingRootDirectory.appendingPathComponent("shin-import-\(UUID().uuidString).m4a").standardizedFileURL
     }
 
     private func downloadAudio(
@@ -273,7 +286,8 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
             url: context.url,
             request: context.request,
             ffmpegURL: context.ffmpegURL,
-            outputTemplate: context.tempDir.appendingPathComponent("download.%(ext)s").path
+            outputTemplate: context.tempDir.appendingPathComponent("download.%(ext)s").path,
+            proxy: context.normalizedProxy
         )
         let lastProgress = OSAllocatedUnfairLock<Double?>(initialState: nil)
         let output: AudioProcessOutput
@@ -304,37 +318,37 @@ public final class LiveAudioLinkImportService: AudioLinkImporting, Sendable {
         return try Self.findDownloadedM4A(in: context.tempDir)
     }
 
-    private func rewriteMetadata(
-        sourceURL: URL,
-        stagedURL: URL,
-        metadata: AudioLinkMetadata,
-        ffmpegURL: URL,
-        environment: [String: String]
-    ) async throws {
-        let args = Self.buildFfmpegArguments(sourceURL: sourceURL, stagedURL: stagedURL, metadata: metadata)
+    private func rewriteMetadata(context: RewriteContext) async throws {
+        let args = Self.buildFfmpegTagArguments(
+            sourceURL: context.sourceURL,
+            stagedURL: context.stagedURL,
+            metadata: context.metadata,
+            trimStart: context.trimStart,
+            trimEnd: context.trimEnd
+        )
         let output: AudioProcessOutput
         do {
             output = try await processRunner.run(
-                executableURL: ffmpegURL,
+                executableURL: context.ffmpegURL,
                 arguments: args,
-                environment: environment
+                environment: context.environment
             ) { _ in }
         } catch AudioLinkImportError.cancelled, is CancellationError {
-            try? FileManager.default.removeItem(at: stagedURL)
+            try? FileManager.default.removeItem(at: context.stagedURL)
             throw AudioLinkImportError.cancelled
         } catch {
-            try? FileManager.default.removeItem(at: stagedURL)
+            try? FileManager.default.removeItem(at: context.stagedURL)
             throw AudioLinkImportError.taggingFailed(detail: error.localizedDescription)
         }
 
         if Task.isCancelled {
-            try? FileManager.default.removeItem(at: stagedURL)
+            try? FileManager.default.removeItem(at: context.stagedURL)
             throw AudioLinkImportError.cancelled
         }
 
         guard output.terminationStatus == 0,
-              FileManager.default.fileExists(atPath: stagedURL.path) else {
-            try? FileManager.default.removeItem(at: stagedURL)
+              FileManager.default.fileExists(atPath: context.stagedURL.path) else {
+            try? FileManager.default.removeItem(at: context.stagedURL)
             let detail = output.terminationStatus == 0 ? "未生成目标音频文件。" : Self.conciseFailureDetail(output)
             throw AudioLinkImportError.taggingFailed(detail: detail)
         }

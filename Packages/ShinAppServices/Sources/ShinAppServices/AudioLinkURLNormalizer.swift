@@ -1,5 +1,26 @@
 import Foundation
 
+/// 音频质量预设，原始值对应 `yt-dlp --audio-quality` 参数。
+public enum AudioQualityOption: String, CaseIterable, Identifiable, Equatable, Sendable {
+    case best = "0"
+    case kbps320 = "320K"
+    case kbps256 = "256K"
+    case kbps192 = "192K"
+    case kbps128 = "128K"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .best: return "最佳音质 (0 · 默认)"
+        case .kbps320: return "320 kbps 极高"
+        case .kbps256: return "256 kbps 高音质"
+        case .kbps192: return "192 kbps 均衡"
+        case .kbps128: return "128 kbps 紧凑"
+        }
+    }
+}
+
 /// 链接导入识别出的常见平台类型，用于自动精简追踪参数与格式引导。
 public enum AudioLinkPlatform: String, CaseIterable, Equatable, Sendable {
     case bilibili
@@ -361,7 +382,7 @@ public enum AudioLinkURLNormalizer {
             || (0x61...0x7A).contains(scalar.value)
     }
 
-    private static func isASCIIDigit(_ scalar: Unicode.Scalar) -> Bool {
+    static func isASCIIDigit(_ scalar: Unicode.Scalar) -> Bool {
         (0x30...0x39).contains(scalar.value)
     }
 }

@@ -135,6 +135,42 @@ struct AudioLinkURLNormalizerTests {
         let ytdlpArgs = try #require(runner.ytdlpArguments)
         #expect(ytdlpArgs.suffix(2) == ["--", "https://www.bilibili.com/video/BV1hAj16dESQ"])
     }
+
+    @Test("裁剪时间与代理规范化支持常用格式并拒绝非法或倒置输入")
+    func trimTimeAndProxyNormalization() throws {
+        #expect(try AudioLinkURLNormalizer.normalizeTrimTime("   ") == nil)
+        #expect(try AudioLinkURLNormalizer.normalizeTrimTime(" 00:15 ") == "00:15")
+        #expect(try AudioLinkURLNormalizer.normalizeTrimTime("01:23.5") == "01:23.5")
+        #expect(try AudioLinkURLNormalizer.normalizeTrimTime("1:02:03") == "1:02:03")
+        #expect(try AudioLinkURLNormalizer.normalizeTrimTime("90") == "90")
+
+        let validRange = try AudioLinkURLNormalizer.validateTrimRange(start: "00:05", end: "03:45")
+        #expect(validRange.start == "00:05")
+        #expect(validRange.end == "03:45")
+
+        for badTime in ["-5", "01:60", "1::2", "01:", "abc", "1.2.3"] {
+            #expect(throws: AudioLinkImportError.self) {
+                _ = try AudioLinkURLNormalizer.normalizeTrimTime(badTime)
+            }
+        }
+        #expect(throws: AudioLinkImportError.invalidTrimTime(detail: "裁剪结束时间必须晚于起始时间。")) {
+            _ = try AudioLinkURLNormalizer.validateTrimRange(start: "01:00", end: "00:30")
+        }
+
+        #expect(try AudioLinkURLNormalizer.normalizeProxy("  ") == nil)
+        #expect(try AudioLinkURLNormalizer.normalizeProxy("127.0.0.1:7890") == "http://127.0.0.1:7890")
+        #expect(try AudioLinkURLNormalizer.normalizeProxy("socks5://127.0.0.1:1080") == "socks5://127.0.0.1:1080")
+        for badProxy in ["--proxy=x", "ftp://127.0.0.1:21", "not-a-proxy", "http://bad host:80"] {
+            #expect(throws: AudioLinkImportError.self) {
+                _ = try AudioLinkURLNormalizer.normalizeProxy(badProxy)
+            }
+        }
+
+        #expect(AudioQualityOption.best.rawValue == "0")
+        #expect(AudioQualityOption.kbps320.rawValue == "320K")
+        #expect(AudioCookieBrowser.chrome.shortName == "Chrome")
+        #expect(AudioCookieBrowser.safari.shortName == "Safari")
+    }
 }
 
 private final class NormalizerMockRunner: AudioProcessRunning, @unchecked Sendable {

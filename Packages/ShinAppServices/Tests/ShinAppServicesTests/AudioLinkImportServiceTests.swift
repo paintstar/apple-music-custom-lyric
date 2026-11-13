@@ -152,6 +152,64 @@ struct AudioLinkImportServiceTests {
         #expect(containsPair(ytdlpCall2.arguments, "--cookies", cookiesFile.standardizedFileURL.path))
     }
 
+    @Test("扩展配置正确透传音质、源标签开关、代理与 ffmpeg 首尾裁剪参数，非法参数不发起下载")
+    func extendedOptionsAndPrevalidation() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let runner = MockAudioProcessRunner()
+        let service = makeTestService(
+            runner: runner,
+            stagingDir: root.appendingPathComponent("staging", isDirectory: true),
+            tempRoot: root.appendingPathComponent("tmp", isDirectory: true)
+        ) { stagedURL in
+            makeImportedTrack(title: "TrimmedTrack", resolvedFileURL: stagedURL)
+        }
+
+        _ = try await service.importFromLink(
+            AudioLinkImportRequest(
+                urlString: "https://www.bilibili.com/video/BV1mockExt01",
+                audioQuality: .kbps320,
+                includeSourceMetadata: false,
+                trimStart: "00:05",
+                trimEnd: "03:45",
+                proxy: "127.0.0.1:7890"
+            )
+        ) { _ in }
+
+        let ytdlpArgs = runner.recordedCalls[0].arguments
+        #expect(containsPair(ytdlpArgs, "--audio-quality", "320K"))
+        #expect(!ytdlpArgs.contains("--add-metadata"))
+        #expect(containsPair(ytdlpArgs, "--proxy", "http://127.0.0.1:7890"))
+
+        let ffmpegArgs = runner.recordedCalls[1].arguments
+        #expect(containsPair(ffmpegArgs, "-ss", "00:05"))
+        #expect(containsPair(ffmpegArgs, "-to", "03:45"))
+        #expect(containsPair(ffmpegArgs, "-avoid_negative_ts", "make_zero"))
+
+        runner.reset()
+        await #expect(throws: AudioLinkImportError.self) {
+            _ = try await service.importFromLink(
+                AudioLinkImportRequest(
+                    urlString: "https://www.bilibili.com/video/BV1mockExt01",
+                    trimStart: "02:00",
+                    trimEnd: "01:00"
+                )
+            ) { _ in }
+        }
+        #expect(runner.recordedCalls.isEmpty)
+
+        await #expect(throws: AudioLinkImportError.self) {
+            _ = try await service.importFromLink(
+                AudioLinkImportRequest(
+                    urlString: "https://www.bilibili.com/video/BV1mockExt01",
+                    proxy: "ftp://127.0.0.1:21"
+                )
+            ) { _ in }
+        }
+        #expect(runner.recordedCalls.isEmpty)
+    }
+
     @Test("Music 拷贝到自有媒体目录时清理暂存文件；直接引用暂存路径时保留文件")
     func stagingCleanupMatchesMusicBehavior() async throws {
         let root = try makeTempDir()

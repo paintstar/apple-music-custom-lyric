@@ -1,5 +1,4 @@
 import Foundation
-import os
 import ShinAppleKit
 
 /// 链接导入音频时写入的自定义元数据；空字符串表示保留工具或源文件原有标签。
@@ -27,6 +26,16 @@ public enum AudioCookieBrowser: String, CaseIterable, Identifiable, Equatable, S
 
     public var id: String { rawValue }
 
+    public var shortName: String {
+        switch self {
+        case .chrome: return "Chrome"
+        case .safari: return "Safari"
+        case .edge: return "Edge"
+        case .firefox: return "Firefox"
+        case .brave: return "Brave"
+        }
+    }
+
     public var displayName: String {
         switch self {
         case .chrome: return "Chrome 浏览器"
@@ -53,19 +62,34 @@ public struct AudioLinkImportRequest: Equatable, Sendable {
     public var cookieSource: AudioCookieSource
     /// 非 nil 时在指定目录额外保留一份 `<安全标题>.m4a` 副本；nil 表示仅导入「音乐」资料库。
     public var keepCopyDirectory: URL?
+    public var audioQuality: AudioQualityOption
+    public var includeSourceMetadata: Bool
+    public var trimStart: String
+    public var trimEnd: String
+    public var proxy: String
 
     public init(
         urlString: String,
         metadata: AudioLinkMetadata = AudioLinkMetadata(),
         embedThumbnail: Bool = true,
         cookieSource: AudioCookieSource = .none,
-        keepCopyDirectory: URL? = nil
+        keepCopyDirectory: URL? = nil,
+        audioQuality: AudioQualityOption = .best,
+        includeSourceMetadata: Bool = true,
+        trimStart: String = "",
+        trimEnd: String = "",
+        proxy: String = ""
     ) {
         self.urlString = urlString
         self.metadata = metadata
         self.embedThumbnail = embedThumbnail
         self.cookieSource = cookieSource
         self.keepCopyDirectory = keepCopyDirectory
+        self.audioQuality = audioQuality
+        self.includeSourceMetadata = includeSourceMetadata
+        self.trimStart = trimStart
+        self.trimEnd = trimEnd
+        self.proxy = proxy
     }
 }
 
@@ -137,6 +161,8 @@ public struct AudioToolAvailability: Equatable, Sendable {
 public enum AudioLinkImportError: LocalizedError, Equatable, Sendable {
     case invalidURL
     case unsupportedPlatformURL(detail: String)
+    case invalidTrimTime(detail: String)
+    case invalidProxy(detail: String)
     case ytdlpNotFound(searchedPaths: [String])
     case ffmpegNotFound(searchedPaths: [String])
     case invalidCookiesFile
@@ -151,7 +177,9 @@ public enum AudioLinkImportError: LocalizedError, Equatable, Sendable {
         switch self {
         case .invalidURL:
             return "请输入有效的 http 或 https 链接。"
-        case .unsupportedPlatformURL(let detail):
+        case .unsupportedPlatformURL(let detail),
+             .invalidTrimTime(let detail),
+             .invalidProxy(let detail):
             return detail
         case .ytdlpNotFound(let searchedPaths):
             return "未找到 yt-dlp 工具（已搜索：\(searchedPaths.joined(separator: "、"))）。请先安装 yt-dlp 后重试。"
@@ -208,274 +236,4 @@ public protocol AudioLinkImporting: Sendable {
         _ request: AudioLinkImportRequest,
         onStage: @escaping @Sendable (AudioLinkImportStage) -> Void
     ) async throws -> AudioLinkImportResult
-}
-
-// MARK: - 纯参数校验与路径/进度辅助（不含子进程调用）
-
-extension LiveAudioLinkImportService {
-
-    static func validateURL(_ raw: String) throws -> URL {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              !trimmed.hasPrefix("-"),
-              let inspection = AudioLinkURLNormalizer.inspect(trimmed) else {
-            throw AudioLinkImportError.invalidURL
-        }
-        if let warning = inspection.formatWarning {
-            throw AudioLinkImportError.unsupportedPlatformURL(detail: warning)
-        }
-        let normalized = inspection.normalizedURLString
-        guard !normalized.unicodeScalars.contains(where: {
-                  CharacterSet.whitespacesAndNewlines.contains($0)
-                      || CharacterSet.controlCharacters.contains($0)
-              }),
-              let url = URL(string: normalized),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let host = url.host,
-              !host.isEmpty else {
-            throw AudioLinkImportError.invalidURL
-        }
-        return url
-    }
-
-    static func validateCookieSource(_ cookieSource: AudioCookieSource) throws {
-        guard case .cookiesFile(let url) = cookieSource else { return }
-        var isDirectory: ObjCBool = false
-        guard url.isFileURL,
-              FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              !isDirectory.boolValue else {
-            throw AudioLinkImportError.invalidCookiesFile
-        }
-    }
-
-    static func buildYtdlpArguments(
-        url: URL,
-        request: AudioLinkImportRequest,
-        ffmpegURL: URL,
-        outputTemplate: String
-    ) -> [String] {
-        var args: [String] = [
-            "-x",
-            "--audio-format", "m4a",
-            "--audio-quality", "0",
-            "--add-metadata",
-            "--no-playlist",
-            "--newline",
-            "--ffmpeg-location", ffmpegURL.path
-        ]
-        if request.embedThumbnail {
-            args.append("--embed-thumbnail")
-        }
-        switch request.cookieSource {
-        case .none:
-            break
-        case .browser(let browser):
-            args.append(contentsOf: ["--cookies-from-browser", browser.rawValue])
-        case .cookiesFile(let cookieURL):
-            args.append(contentsOf: ["--cookies", cookieURL.standardizedFileURL.path])
-        }
-        args.append(contentsOf: ["-o", outputTemplate, "--", url.absoluteString])
-        return args
-    }
-
-    static func buildFfmpegArguments(
-        sourceURL: URL,
-        stagedURL: URL,
-        metadata: AudioLinkMetadata
-    ) -> [String] {
-        var args: [String] = [
-            "-y",
-            "-i", sourceURL.path,
-            "-map", "0",
-            "-c", "copy"
-        ]
-        let fields: [(String, String)] = [
-            ("title", metadata.title),
-            ("artist", metadata.artist),
-            ("album", metadata.album),
-            ("genre", metadata.genre)
-        ]
-        for (key, rawValue) in fields {
-            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                args.append(contentsOf: ["-metadata", "\(key)=\(trimmed)"])
-            }
-        }
-        args.append(contentsOf: ["-movflags", "+faststart", stagedURL.path])
-        return args
-    }
-
-    static func parseYtdlpProgress(from line: String) -> Double? {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("[download]") else { return nil }
-        let afterTag = trimmed.dropFirst("[download]".count).drop(while: { $0.isWhitespace })
-        let numberPart = afterTag.prefix(while: { $0.isNumber || $0 == "." })
-        guard !numberPart.isEmpty,
-              afterTag.dropFirst(numberPart.count).first == "%",
-              let percent = Double(String(numberPart)),
-              percent.isFinite else {
-            return nil
-        }
-        return min(max(percent / 100.0, 0.0), 1.0)
-    }
-
-    static func findDownloadedM4A(in directory: URL) throws -> URL {
-        let items = (try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        let candidates = items.filter { url in
-            let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? true
-            return isRegular && url.pathExtension.lowercased() == "m4a"
-        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-        guard let found = candidates.first else {
-            throw AudioLinkImportError.downloadedAudioNotFound
-        }
-        return found.standardizedFileURL
-    }
-
-    static func sanitizedFileBaseName(preferredTitle: String, fallbackTitle: String) -> String {
-        let trimmedPreferred = preferredTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = trimmedPreferred.isEmpty ? fallbackTitle : trimmedPreferred
-        let filtered = raw.unicodeScalars.filter { scalar in
-            scalar != "/" && scalar != ":" && !CharacterSet.controlCharacters.contains(scalar)
-        }
-        let cleaned = String(String.UnicodeScalarView(filtered))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        return cleaned.isEmpty ? "导入音频" : cleaned
-    }
-
-    static func uniqueDestinationURL(in directory: URL, baseName: String) -> URL {
-        let primary = directory.appendingPathComponent("\(baseName).m4a")
-        if !FileManager.default.fileExists(atPath: primary.path) {
-            return primary
-        }
-        var index = 2
-        while true {
-            let candidate = directory.appendingPathComponent("\(baseName) (\(index)).m4a")
-            if !FileManager.default.fileExists(atPath: candidate.path) {
-                return candidate
-            }
-            index += 1
-        }
-    }
-
-    static func searchDirectories(additionalPaths: [String] = []) -> [String] {
-        let localBin = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin", isDirectory: true).path
-        let envPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
-            .split(separator: ":")
-            .map(String.init)
-        let raw = additionalPaths + [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            localBin
-        ] + envPaths
-
-        var seen = Set<String>()
-        var result: [String] = []
-        for entry in raw {
-            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
-            result.append(trimmed)
-        }
-        return result
-    }
-
-    static let defaultExecutableResolver: AudioExecutableResolver = { toolName, searchedDirectories in
-        for directory in searchedDirectories {
-            let candidate = URL(fileURLWithPath: directory, isDirectory: true)
-                .appendingPathComponent(toolName)
-            var isDirectory: ObjCBool = false
-            if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
-               !isDirectory.boolValue,
-               FileManager.default.isExecutableFile(atPath: candidate.path) {
-                return candidate.standardizedFileURL
-            }
-        }
-        return nil
-    }
-
-    static func buildEnvironment(searchDirectories: [String], ffmpegDirectory: String) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        var pathParts = [ffmpegDirectory] + searchDirectories
-        var seen = Set<String>()
-        pathParts = pathParts.filter { !$0.isEmpty && seen.insert($0).inserted }
-        env["PATH"] = pathParts.joined(separator: ":")
-        return env
-    }
-
-    static func defaultStagingRootDirectory() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-        return base.appendingPathComponent("ShinApple/ImportedAudio", isDirectory: true)
-    }
-
-    static func conciseFailureDetail(_ output: AudioProcessOutput) -> String {
-        let source = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? output.stdout
-            : output.stderr
-        let lines = source
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard let last = lines.last else {
-            return "退出码 \(output.terminationStatus)"
-        }
-        return String(last.prefix(300))
-    }
-}
-
-// MARK: - 管道行缓冲辅助
-
-final class PipeLineBuffer: Sendable {
-    private struct State: Sendable {
-        var collected = Data()
-        var lineBuffer = Data()
-        var closed = false
-    }
-
-    private let state = OSAllocatedUnfairLock(initialState: State())
-
-    func append(_ chunk: Data, onLine: @Sendable (String) -> Void) {
-        let lines: [String] = state.withLock { s in
-            guard !s.closed else { return [] }
-            s.collected.append(chunk)
-            s.lineBuffer.append(chunk)
-            var extracted: [String] = []
-            while let newlineIndex = s.lineBuffer.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
-                let lineData = s.lineBuffer[..<newlineIndex]
-                s.lineBuffer.removeSubrange(...newlineIndex)
-                let line = (String(bytes: lineData, encoding: .utf8) ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !line.isEmpty {
-                    extracted.append(line)
-                }
-            }
-            return extracted
-        }
-        for line in lines {
-            onLine(line)
-        }
-    }
-
-    func finish() -> (shouldLeave: Bool, trailingLine: String?) {
-        state.withLock { s in
-            guard !s.closed else { return (false, nil) }
-            s.closed = true
-            guard !s.lineBuffer.isEmpty else { return (true, nil) }
-            let trailing = (String(bytes: s.lineBuffer, encoding: .utf8) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            s.lineBuffer.removeAll(keepingCapacity: false)
-            return (true, trailing.isEmpty ? nil : trailing)
-        }
-    }
-
-    func text() -> String {
-        state.withLock { String(bytes: $0.collected, encoding: .utf8) ?? "" }
-    }
 }
