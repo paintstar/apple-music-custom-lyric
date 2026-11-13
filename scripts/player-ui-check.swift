@@ -1288,6 +1288,20 @@ private struct PlayerUICheck {
         await linkModel.checkTools()
         precondition(linkModel.toolAvailability?.isReady == true, "Mock 模式依赖工具探测应就绪")
 
+        linkModel.urlString = "https://www.bilibili.com/"
+        precondition(linkModel.urlInspection?.formatWarning != nil, "B 站首页应产生平台格式提示")
+        precondition(!linkModel.canStart, "存在格式提示时应禁用开始导入")
+
+        linkModel.urlString = "https://www.bilibili.com/video/BV1mockClean01/?spm_id_from=333.1007.search_card.click&vd_source=mockTrackingValue"
+        linkModel.applyNormalizedURLIfNeeded()
+        precondition(
+            linkModel.urlString == "https://www.bilibili.com/video/BV1mockClean01",
+            "带追踪参数的 B 站链接应自动裁剪为标准视频地址"
+        )
+        precondition(linkModel.urlInspection?.platform == .bilibili, "应识别为 B 站平台")
+        precondition(linkModel.autoCleanedNotice != nil, "应给出已自动裁剪提示")
+        precondition(linkModel.canStart, "规范化后应允许开始导入")
+
         linkModel.urlString = "https://www.bilibili.com/video/BV1mockTest"
         linkModel.title = "Crack0day/Caribdis"
         linkModel.artist = "测试歌手"

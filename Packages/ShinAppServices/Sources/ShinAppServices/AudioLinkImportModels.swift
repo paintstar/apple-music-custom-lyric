@@ -76,6 +76,16 @@ public enum AudioLinkImportStage: Equatable, Sendable {
     case tagging
     case importingToMusic
     case savingCopy
+
+    public var statusTitle: String {
+        switch self {
+        case .validating: return "正在校验链接与工具……"
+        case .downloading: return "正在下载并提取音频……"
+        case .tagging: return "正在写入歌曲标签与封面……"
+        case .importingToMusic: return "正在导入「音乐」资料库……"
+        case .savingCopy: return "正在保存本地 .m4a 副本……"
+        }
+    }
 }
 
 /// 链接导入成功结果。
@@ -84,6 +94,16 @@ public struct AudioLinkImportResult: Equatable, Sendable {
     public var savedCopyURL: URL?
     public var keptInStaging: Bool
     public var stagedFileURL: URL?
+
+    public var storageSummary: String {
+        if keptInStaging, let stagedURL = stagedFileURL {
+            return "「音乐」App 直接引用源文件，已在应用支持目录保留：\(stagedURL.path)"
+        }
+        if let resolved = importedTrack.resolvedFileURL {
+            return "「音乐」App 已拷贝至媒体库（\(resolved.path)），临时暂存已清理。"
+        }
+        return "已完成导入「音乐」资料库。"
+    }
 
     public init(
         importedTrack: MusicLibraryImportedTrack,
@@ -116,6 +136,7 @@ public struct AudioToolAvailability: Equatable, Sendable {
 /// 链接导入错误类型，统一提供简体中文用户提示。
 public enum AudioLinkImportError: LocalizedError, Equatable, Sendable {
     case invalidURL
+    case unsupportedPlatformURL(detail: String)
     case ytdlpNotFound(searchedPaths: [String])
     case ffmpegNotFound(searchedPaths: [String])
     case invalidCookiesFile
@@ -130,6 +151,8 @@ public enum AudioLinkImportError: LocalizedError, Equatable, Sendable {
         switch self {
         case .invalidURL:
             return "请输入有效的 http 或 https 链接。"
+        case .unsupportedPlatformURL(let detail):
+            return detail
         case .ytdlpNotFound(let searchedPaths):
             return "未找到 yt-dlp 工具（已搜索：\(searchedPaths.joined(separator: "、"))）。请先安装 yt-dlp 后重试。"
         case .ffmpegNotFound(let searchedPaths):
@@ -195,11 +218,18 @@ extension LiveAudioLinkImportService {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               !trimmed.hasPrefix("-"),
-              !trimmed.unicodeScalars.contains(where: {
+              let inspection = AudioLinkURLNormalizer.inspect(trimmed) else {
+            throw AudioLinkImportError.invalidURL
+        }
+        if let warning = inspection.formatWarning {
+            throw AudioLinkImportError.unsupportedPlatformURL(detail: warning)
+        }
+        let normalized = inspection.normalizedURLString
+        guard !normalized.unicodeScalars.contains(where: {
                   CharacterSet.whitespacesAndNewlines.contains($0)
                       || CharacterSet.controlCharacters.contains($0)
               }),
-              let url = URL(string: trimmed),
+              let url = URL(string: normalized),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               let host = url.host,

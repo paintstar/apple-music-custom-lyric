@@ -1,8 +1,9 @@
+import AppKit
 import Foundation
 import ShinAppleKit
 import ShinAppServices
 
-/// 链接导入音频界面状态机：探测本机工具、管理阶段进度与取消，并串联入库后的歌词流程。
+/// 链接导入音频界面状态机：探测本机工具、规范化输入链接、管理阶段进度与取消，并串联入库后的歌词流程。
 @MainActor
 final class AudioLinkImportModel: ObservableObject {
 
@@ -19,7 +20,12 @@ final class AudioLinkImportModel: ObservableObject {
         case failed(String)
     }
 
-    @Published var urlString: String = ""
+    @Published var urlString: String = "" {
+        didSet {
+            guard !isApplyingNormalizedURL, urlString != oldValue else { return }
+            processURLInputChange(urlString)
+        }
+    }
     @Published var title: String = ""
     @Published var artist: String = ""
     @Published var album: String = ""
@@ -33,6 +39,9 @@ final class AudioLinkImportModel: ObservableObject {
     @Published private(set) var isCheckingTools = false
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var importedResult: AudioLinkImportResult?
+    @Published private(set) var urlInspection: AudioLinkNormalization?
+    @Published private(set) var autoCleanedNotice: String?
+    @Published private(set) var copiedInstallCommand = false
 
     var onImportSucceeded: ((AudioLinkImportResult) -> Void)?
     var onFetchOnlineLyrics: ((MusicLibraryTrack) -> Void)?
@@ -42,8 +51,10 @@ final class AudioLinkImportModel: ObservableObject {
     private let service: any AudioLinkImporting
     private var importTask: Task<Void, Never>?
     private var toolCheckTask: Task<Void, Never>?
+    private var copyResetTask: Task<Void, Never>?
     private var generation = 0
     private var toolCheckGeneration = 0
+    private var isApplyingNormalizedURL = false
 
     init(service: any AudioLinkImporting) {
         self.service = service
@@ -53,6 +64,7 @@ final class AudioLinkImportModel: ObservableObject {
     deinit {
         importTask?.cancel()
         toolCheckTask?.cancel()
+        copyResetTask?.cancel()
     }
 
     var isRunning: Bool {
@@ -61,12 +73,27 @@ final class AudioLinkImportModel: ObservableObject {
     }
 
     var canStart: Bool {
-        !isRunning && !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !isRunning
+            && !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (urlInspection?.formatWarning == nil)
+            && (toolAvailability?.isReady ?? true)
+    }
+
+    var installCommand: String? {
+        guard let tools = toolAvailability, !tools.isReady else { return nil }
+        switch (tools.ytdlpURL == nil, tools.ffmpegURL == nil) {
+        case (true, true): return "brew install yt-dlp ffmpeg"
+        case (true, false): return "brew install yt-dlp"
+        case (false, true): return "brew install ffmpeg"
+        case (false, false): return nil
+        }
     }
 
     static func defaultLocalCopyDirectory() -> URL? {
         FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
     }
+
+    // MARK: - 工具探测与安装引导
 
     func checkTools() async {
         toolCheckGeneration += 1
@@ -85,8 +112,99 @@ final class AudioLinkImportModel: ObservableObject {
         }
     }
 
+    func copyInstallCommand() {
+        guard let command = installCommand else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        copiedInstallCommand = true
+        copyResetTask?.cancel()
+        copyResetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            self?.copiedInstallCommand = false
+        }
+    }
+
+    func openTerminalApp() {
+        let terminalURL = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.openApplication(at: terminalURL, configuration: configuration, completionHandler: nil)
+    }
+
+    // MARK: - 链接检查与规范化
+
+    func processURLInputChange(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            urlInspection = nil
+            autoCleanedNotice = nil
+            return
+        }
+
+        let inspection = AudioLinkURLNormalizer.inspect(trimmed)
+        urlInspection = inspection
+
+        guard let inspection, inspection.wasModified else {
+            autoCleanedNotice = nil
+            return
+        }
+        guard shouldAutoNormalizeOnEdit(trimmed: trimmed, inspection: inspection) else { return }
+        commitNormalizedURL(inspection)
+    }
+
+    func applyNormalizedURLIfNeeded() {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            urlInspection = nil
+            autoCleanedNotice = nil
+            return
+        }
+        let inspection = AudioLinkURLNormalizer.inspect(trimmed)
+        urlInspection = inspection
+        guard let inspection, inspection.wasModified else { return }
+        commitNormalizedURL(inspection)
+    }
+
+    func pasteAndNormalizeFromClipboard() {
+        guard !isRunning,
+              let pasted = NSPasteboard.general.string(forType: .string) else {
+            return
+        }
+        urlString = pasted
+        applyNormalizedURLIfNeeded()
+    }
+
+    func clearURLInput() {
+        guard !isRunning else { return }
+        urlString = ""
+        urlInspection = nil
+        autoCleanedNotice = nil
+    }
+
+    private func shouldAutoNormalizeOnEdit(trimmed: String, inspection: AudioLinkNormalization) -> Bool {
+        if trimmed.hasSuffix("?") || trimmed.hasSuffix("&") || trimmed.hasSuffix("=") || trimmed.hasSuffix("?p") {
+            return false
+        }
+        return inspection.normalizedURLString != trimmed
+            && (trimmed.contains("?") || trimmed.contains(" ") || trimmed.contains("\n")
+                || trimmed != inspection.normalizedURLString && !trimmed.hasSuffix("/"))
+    }
+
+    private func commitNormalizedURL(_ inspection: AudioLinkNormalization) {
+        if urlString != inspection.normalizedURLString {
+            isApplyingNormalizedURL = true
+            urlString = inspection.normalizedURLString
+            isApplyingNormalizedURL = false
+        }
+        urlInspection = AudioLinkURLNormalizer.inspect(inspection.normalizedURLString)
+        autoCleanedNotice = inspection.notice ?? "已自动裁剪多余追踪参数"
+    }
+
+    // MARK: - 下载与导入流程
+
     func startImport() {
         guard !isRunning else { return }
+        applyNormalizedURLIfNeeded()
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedURL.isEmpty else {
             phase = .failed("请输入需要导入的音频或视频链接。")
@@ -186,6 +304,8 @@ final class AudioLinkImportModel: ObservableObject {
         importTask = nil
         toolCheckTask?.cancel()
         toolCheckTask = nil
+        copyResetTask?.cancel()
+        copyResetTask = nil
         isCheckingTools = false
         if isRunning {
             phase = .idle
@@ -209,6 +329,8 @@ final class AudioLinkImportModel: ObservableObject {
         album = ""
         genre = ""
         importedResult = nil
+        urlInspection = nil
+        autoCleanedNotice = nil
         phase = .idle
     }
 
@@ -258,16 +380,11 @@ struct MockAudioLinkImportService: AudioLinkImporting {
         let trimmed = request.urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               !trimmed.hasPrefix("-"),
-              !trimmed.unicodeScalars.contains(where: {
-                  CharacterSet.whitespacesAndNewlines.contains($0)
-                      || CharacterSet.controlCharacters.contains($0)
-              }),
-              let url = URL(string: trimmed),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let host = url.host,
-              !host.isEmpty else {
+              let inspection = AudioLinkURLNormalizer.inspect(trimmed) else {
             throw AudioLinkImportError.invalidURL
+        }
+        if let warning = inspection.formatWarning {
+            throw AudioLinkImportError.unsupportedPlatformURL(detail: warning)
         }
 
         if case let .cookiesFile(cookieURL) = request.cookieSource {
