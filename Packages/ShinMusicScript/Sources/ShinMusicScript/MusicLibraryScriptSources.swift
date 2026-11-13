@@ -5,6 +5,8 @@ import ShinAppleKit
 enum MusicLibraryScriptSources {
     /// 每次 Apple Event 最多等待 4 秒；列间由宿主检查取消，不长时间占用播放采样锁。
     static let eventTimeoutSeconds = 4
+    /// 本地音频导入至 Music 时可能涉及拷贝/元信息索引，单独使用 15 秒超时。
+    static let importTimeoutSeconds = 15
 
     enum TrackColumn: String, CaseIterable {
         case persistentID = "persistent ID"
@@ -101,6 +103,71 @@ enum MusicLibraryScriptSources {
         """)
     }
 
+    private static func isSafeASCIIFileNameScalar(_ scalar: Unicode.Scalar) -> Bool {
+        (0x41...0x5A).contains(scalar.value)
+            || (0x61...0x7A).contains(scalar.value)
+            || (0x30...0x39).contains(scalar.value)
+            || scalar == "."
+            || scalar == "_"
+            || scalar == "-"
+    }
+
+    static func isSafePOSIXFilePath(_ path: String) -> Bool {
+        guard path.hasPrefix("/"),
+              path.lowercased().hasSuffix(".m4a") else {
+            return false
+        }
+        let hasForbiddenScalar = path.unicodeScalars.contains { scalar in
+            CharacterSet.controlCharacters.contains(scalar)
+                || scalar == "\""
+                || scalar == "\\"
+        }
+        guard !hasForbiddenScalar else { return false }
+        let fileName = URL(fileURLWithPath: path).lastPathComponent
+        guard fileName.count > 4,
+              fileName.unicodeScalars.allSatisfy(isSafeASCIIFileNameScalar) else {
+            return false
+        }
+        return true
+    }
+
+    static func addAudioFile(posixPath: String) -> String {
+        precondition(isSafePOSIXFilePath(posixPath))
+        return wrap("""
+        set importedFile to (POSIX file "\(posixPath)") as alias
+        set addedTrack to (add importedFile to library playlist 1)
+        if addedTrack is missing value then error number -1728
+        set pId to persistent ID of addedTrack
+        set tName to name of addedTrack
+        set tArtist to ""
+        try
+            set tArtist to artist of addedTrack
+        end try
+        set tAlbumArtist to ""
+        try
+            set tAlbumArtist to album artist of addedTrack
+        end try
+        set tAlbum to ""
+        try
+            set tAlbum to album of addedTrack
+        end try
+        set tDur to 0
+        try
+            set tDur to duration of addedTrack
+        end try
+        set tFav to false
+        try
+            set tFav to favorited of addedTrack
+        end try
+        set tLoc to ""
+        try
+            set locValue to location of addedTrack
+            if locValue is not missing value then set tLoc to POSIX path of (locValue as alias)
+        end try
+        return {pId, tName, tArtist, tAlbumArtist, tAlbum, tDur, tFav, tLoc}
+        """, timeoutSeconds: importTimeoutSeconds)
+    }
+
     private static func trackSelection(_ id: String, in source: MusicLibrarySource = .library) throws -> String {
         guard SongBinding.isValidPersistentID(id) else { throw MusicLibraryError.invalidRequest }
         return """
@@ -125,10 +192,10 @@ enum MusicLibraryScriptSources {
         }
     }
 
-    private static func wrap(_ body: String) -> String {
+    private static func wrap(_ body: String, timeoutSeconds: Int = eventTimeoutSeconds) -> String {
         """
         if application id "com.apple.Music" is not running then error number -600
-        with timeout of \(eventTimeoutSeconds) seconds
+        with timeout of \(timeoutSeconds) seconds
             tell application id "com.apple.Music"
                 \(body)
             end tell

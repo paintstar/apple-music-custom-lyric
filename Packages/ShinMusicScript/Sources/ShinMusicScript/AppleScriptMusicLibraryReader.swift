@@ -11,6 +11,7 @@ protocol MusicLibraryScriptReading: Sendable {
     func setFavorite(persistentID: String, value: Bool, cancellation: MusicLibraryCancellation) throws -> Bool
     func setFavorite(persistentID: String, value: Bool, in source: MusicLibrarySource,
                      cancellation: MusicLibraryCancellation) throws -> Bool
+    func importAudioFile(posixPath: String, cancellation: MusicLibraryCancellation) throws -> MusicLibraryImportedTrack
 }
 
 extension MusicLibraryScriptReading {
@@ -25,6 +26,9 @@ extension MusicLibraryScriptReading {
     func setFavorite(persistentID: String, value: Bool, in source: MusicLibrarySource,
                      cancellation: MusicLibraryCancellation) throws -> Bool {
         try setFavorite(persistentID: persistentID, value: value, cancellation: cancellation)
+    }
+    func importAudioFile(posixPath: String, cancellation: MusicLibraryCancellation) throws -> MusicLibraryImportedTrack {
+        throw MusicLibraryError.unsupported
     }
 }
 
@@ -75,6 +79,17 @@ struct AppleScriptMusicLibraryReader: MusicLibraryScriptReading {
             throw MusicScriptFailure.fieldUnavailable("library:favorite")
         }
         return confirmed
+    }
+
+    func importAudioFile(posixPath: String, cancellation: MusicLibraryCancellation) throws -> MusicLibraryImportedTrack {
+        guard MusicLibraryScriptSources.isSafePOSIXFilePath(posixPath) else {
+            throw MusicLibraryError.invalidRequest
+        }
+        try cancellation.check()
+        let script = MusicLibraryScriptSources.addAudioFile(posixPath: posixPath)
+        let result = try MusicLibraryScriptExecution.execute(script, cancellation: cancellation)
+        try cancellation.check()
+        return try MusicLibraryDescriptorParser.importedTrack(result, fallbackFilePath: posixPath)
     }
 
     func readTracks(in source: MusicLibrarySource, cancellation: MusicLibraryCancellation) throws -> [MusicLibraryTrack] {
@@ -170,11 +185,54 @@ enum MusicLibraryDescriptorParser {
         }
     }
 
+    static func nonEmptyText(_ descriptor: NSAppleEventDescriptor) -> String? {
+        guard let value = text(descriptor), !value.isEmpty else { return nil }
+        return value
+    }
+
+    static func number(_ descriptor: NSAppleEventDescriptor) -> Double? {
+        guard [typeIEEE32BitFloatingPoint, typeIEEE64BitFloatingPoint, typeSInt32, typeSInt64]
+            .contains(descriptor.descriptorType) else { return nil }
+        return descriptor.doubleValue
+    }
+
     static func boolean(_ descriptor: NSAppleEventDescriptor) -> Bool? {
         switch descriptor.descriptorType {
         case typeBoolean, typeTrue, typeFalse: return descriptor.booleanValue
         default: return nil
         }
+    }
+
+    static func importedTrack(
+        _ descriptor: NSAppleEventDescriptor,
+        fallbackFilePath: String
+    ) throws -> MusicLibraryImportedTrack {
+        let items = try list(descriptor)
+        guard items.count == 8,
+              let persistentID = text(items[0]),
+              SongBinding.isValidPersistentID(persistentID) else {
+            throw MusicScriptFailure.fieldUnavailable("library:importAudioFile")
+        }
+        let rawTitle = text(items[1]) ?? ""
+        let fallbackTitle = URL(fileURLWithPath: fallbackFilePath).deletingPathExtension().lastPathComponent
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (fallbackTitle.isEmpty ? "导入曲目" : fallbackTitle)
+            : rawTitle
+        let resolvedFileURL = nonEmptyText(items[7]).flatMap { path -> URL? in
+            guard path.hasPrefix("/") else { return nil }
+            return URL(fileURLWithPath: path).standardizedFileURL
+        }
+        let track = MusicLibraryTrack(
+            persistentID: persistentID,
+            title: title,
+            artist: nonEmptyText(items[2]),
+            albumArtist: nonEmptyText(items[3]),
+            album: nonEmptyText(items[4]),
+            durationMs: number(items[5]).flatMap(MusicScriptMapping.secondsToMs),
+            isFavorite: boolean(items[6]),
+            dateAdded: Date()
+        )
+        return MusicLibraryImportedTrack(track: track, resolvedFileURL: resolvedFileURL)
     }
 
     static func tracks(
@@ -188,12 +246,7 @@ enum MusicLibraryDescriptorParser {
             guard let id = text(firstIDs[index]), SongBinding.isValidPersistentID(id) else {
                 throw MusicLibraryError.contentsChanged
             }
-            let duration = columns[.duration]?[index]
-            let seconds = duration.flatMap { value -> Double? in
-                guard [typeIEEE32BitFloatingPoint, typeIEEE64BitFloatingPoint, typeSInt32, typeSInt64]
-                    .contains(value.descriptorType) else { return nil }
-                return value.doubleValue
-            }
+            let seconds = columns[.duration].flatMap { number($0[index]) }
             return MusicLibraryTrack(
                 persistentID: id, title: columns[.title].flatMap { text($0[index]) } ?? "",
                 artist: columns[.artist].flatMap { text($0[index]) },

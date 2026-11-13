@@ -28,7 +28,11 @@ enum FloatingLyricsSettings {
 @MainActor
 enum FloatingLyricsActions {
     static func hasPresentedSheet(_ model: AppModel) -> Bool {
-        model.isImportPresented || model.isLyricsFetchPresented || model.isLyricsEditorPresented || model.isLibraryPresented
+        model.isImportPresented
+            || model.isLyricsFetchPresented
+            || model.isLyricsEditorPresented
+            || model.isLibraryPresented
+            || model.isAudioLinkImportPresented
     }
 
     static func fetch(_ model: AppModel, presentMainWindow: () -> Void) {

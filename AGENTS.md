@@ -17,6 +17,8 @@ ShinApple 是 macOS 歌曲语言学习播放器。官方「音乐」App 负责�
 - 播放自动化只使用 Music.app 公开脚本词典与 Apple 官方支持的 AppleScript、NSAppleScript、osascript 或 Scripting Bridge。禁止私有 MediaRemote 等未公开播放 API，禁止读取、录制、下载或分发受保护音频。
 - `Packages/ShinMusicScript` 是唯一允许发送 Music Apple Events 的模块。UI 与服务层通过项目协议使用播放能力；固定脚本和受验证参数，不把歌词、歌名等用户文本拼接为可执行代码。
 - `Packages/ShinLyricsProvider` 是唯一允许发送 HTTP 的模块，端点 host 集中定义，限于 `music.163.com` 和 `interface3.music.163.com`。只查询歌曲信息、歌词与翻译，匿名访问，不读存登录凭据，不绕过受限内容。
+- `Packages/ShinAppServices/Sources/ShinAppServices/AudioLinkImportService.swift` 是唯一允许使用 `Foundation.Process` 的文件，仅用于通过参数数组（禁止 shell 拼接）调用本机安装的 `yt-dlp` 与 `ffmpeg` 完成链接音频下载、元数据写入及本地导入「音乐」资料库的前置准备；入库仍经 `Packages/ShinMusicScript` 的公开 Apple Events 完成。
+- 仅按用户选择向 `yt-dlp` 透传 `--cookies-from-browser` 或 `--cookies` 文件路径，应用本身不读取、解析、日志输出或持久化 Cookie 内容。
 - 网易云歌词端点并非官方公开 API，解析失败应明确报告，不能猜测返回结构。获取请求串行限速，自动获取只由用户配置的播放列表成员变化触发。
 - 学习资料和获取结果只存本机，无云端、账号系统、遥测、上传或公共歌词库。备份为本地文件导出。
 

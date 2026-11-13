@@ -97,4 +97,136 @@ extension AppModel {
             await flow.openSession(target: target, provenance: provenance, fetchedLyrics: merged)
         }
     }
+
+    // MARK: - 手动导入与从链接导入音频及后续歌词串联
+
+    static func makeDefaultAudioLinkImporter(
+        isMock: Bool,
+        controller: PlaybackController
+    ) -> any AudioLinkImporting {
+        let fileImporter: @Sendable (URL) async throws -> MusicLibraryImportedTrack = { [weak controller] url in
+            guard let browser = controller as? any MusicLibraryBrowsing else {
+                throw MusicLibraryError.unsupported
+            }
+            return try await browser.importAudioFile(at: url)
+        }
+        return isMock
+            ? MockAudioLinkImportService(importer: fileImporter)
+            : LiveAudioLinkImportService(importer: fileImporter)
+    }
+
+    /// 打开导入窗口：目标在打开时从当前曲目键固定（不随后续播放变化）。
+    func beginImport() {
+        guard !isTerminating, let trackKey = currentTrackKey else { return }
+        let target = ImportSessionTarget(
+            trackKey: trackKey,
+            titleHint: snapshot.title ?? selectedSong?.title,
+            artistHint: selectedSong?.artistName,
+            durationHintMs: snapshot.durationMs ?? selectedSong?.durationMs
+        )
+        openManualImportSession(target: target)
+    }
+
+    func openManualImportSession(target: ImportSessionTarget) {
+        guard !isTerminating, let flow = importFlow else { return }
+        isImportPresented = true
+        importTask?.cancel()
+        importTask = Task { [weak self] in
+            guard self?.isTerminating == false, !Task.isCancelled else { return }
+            await flow.openSession(target: target)
+        }
+    }
+
+    /// 打开链接导入弹窗：运行中重开保留当前进度；已结束状态重开时清理旧结果。
+    func beginAudioLinkImport() {
+        guard !isTerminating else { return }
+        pendingAudioLinkSheetAction = nil
+        let linkModel: AudioLinkImportModel
+        if let existing = audioLinkImportModel {
+            existing.prepareForReopen()
+            linkModel = existing
+        } else {
+            let created = AudioLinkImportModel(service: audioLinkImporter)
+            created.onImportSucceeded = { [weak self] _ in
+                self?.musicLibraryBrowser.refreshAfterLibraryImport()
+            }
+            created.onFetchOnlineLyrics = { [weak self] track in
+                self?.beginOnlineFetch(for: track)
+            }
+            created.onImportManualLyrics = { [weak self] track in
+                self?.beginManualImport(for: track)
+            }
+            audioLinkImportModel = created
+            linkModel = created
+        }
+        if audioLinkImportModel !== linkModel { audioLinkImportModel = linkModel }
+        isAudioLinkImportPresented = true
+    }
+
+    /// 为新入库曲目发起网易云在线搜词（固定该曲目的 trackRef，不随当前播放变化）。
+    func beginOnlineFetch(for track: MusicLibraryTrack) {
+        guard !isTerminating else { return }
+        let target = ImportSessionTarget(
+            trackKey: track.trackRef,
+            titleHint: track.title,
+            artistHint: track.artist,
+            durationHintMs: track.durationMs
+        )
+        let matchQuery = LyricsMatchQuery(
+            title: track.title,
+            artist: track.artist,
+            durationMs: track.durationMs
+        )
+        let openFetch: @MainActor () -> Void = { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            self.presentFetchSheet(
+                target: target,
+                matchQuery: matchQuery,
+                onDelivered: { [weak self] lyrics, provenance, deliveredTarget in
+                    self?.handleFetchedLyrics(lyrics, provenance: provenance, target: deliveredTarget)
+                }
+            )
+        }
+        if isAudioLinkImportPresented {
+            isAudioLinkImportPresented = false
+            schedulePostAudioLinkSheetAction(openFetch)
+        } else {
+            openFetch()
+        }
+    }
+
+    /// 为新入库曲目打开本地歌词文件/文本导入窗口。
+    func beginManualImport(for track: MusicLibraryTrack) {
+        guard !isTerminating, importFlow != nil else { return }
+        let target = ImportSessionTarget(
+            trackKey: track.trackRef,
+            titleHint: track.title,
+            artistHint: track.artist,
+            durationHintMs: track.durationMs
+        )
+        let openManual: @MainActor () -> Void = { [weak self] in
+            self?.openManualImportSession(target: target)
+        }
+        if isAudioLinkImportPresented {
+            isAudioLinkImportPresented = false
+            schedulePostAudioLinkSheetAction(openManual)
+        } else {
+            openManual()
+        }
+    }
+
+    /// 避免 SwiftUI 同窗同时弹出两个 sheet；优先由 onDismiss 触发，无视图挂载时由短延时兜底。
+    private func schedulePostAudioLinkSheetAction(_ action: @escaping @MainActor () -> Void) {
+        pendingAudioLinkSheetAction = action
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(30))
+            self?.flushPendingAudioLinkSheetAction()
+        }
+    }
+
+    func flushPendingAudioLinkSheetAction() {
+        guard let action = pendingAudioLinkSheetAction else { return }
+        pendingAudioLinkSheetAction = nil
+        action()
+    }
 }

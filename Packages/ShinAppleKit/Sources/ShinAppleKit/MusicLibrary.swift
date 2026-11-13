@@ -63,6 +63,17 @@ public struct MusicLibraryTrackPage: Equatable, Sendable {
     }
 }
 
+/// 导入本地音频文件后返回的入库曲目与 Music 落盘文件路径。
+public struct MusicLibraryImportedTrack: Equatable, Sendable {
+    public var track: MusicLibraryTrack
+    public var resolvedFileURL: URL?
+
+    public init(track: MusicLibraryTrack, resolvedFileURL: URL? = nil) {
+        self.track = track
+        self.resolvedFileURL = resolvedFileURL
+    }
+}
+
 /// 资料库浏览使用分页读取，调用方在切页/取消后丢弃旧请求；不包含云目录搜索或下载。
 public protocol MusicLibraryBrowsing: AnyObject, Sendable {
     /// 仅启动 Music 宿主，不激活窗口、不开始播放。
@@ -87,6 +98,8 @@ public protocol MusicLibraryBrowsing: AnyObject, Sendable {
     func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool
     /// 在用户点击时的真实来源中定位曲目，支持未加入资料库的歌单成员。
     func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool
+    /// 将本地音频文件导入用户「音乐」资料库并返回入库曲目及落盘路径。
+    func importAudioFile(at fileURL: URL) async throws -> MusicLibraryImportedTrack
 }
 
 public extension MusicLibraryBrowsing {
@@ -101,6 +114,9 @@ public extension MusicLibraryBrowsing {
     func setFavorite(_ trackRef: String, value: Bool) async throws -> Bool { throw MusicLibraryError.unsupported }
     func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool {
         try await setFavorite(trackRef, value: value)
+    }
+    func importAudioFile(at fileURL: URL) async throws -> MusicLibraryImportedTrack {
+        throw MusicLibraryError.unsupported
     }
 }
 

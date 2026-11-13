@@ -111,12 +111,16 @@ extension MockPlaybackController: MusicLibraryBrowsing {
     }
 
     private func libraryTracks(in source: MusicLibrarySource) throws -> [MusicLibraryTrack] {
+        let imported = mockImportedTracks.withLock { $0 }
         if source == .playlist(id: "B000000000000005") {
             let overrides = mockLibraryFavorites.withLock { $0 }
-            return MockMusicLibrary.tracks.filter { (overrides[$0.trackRef] ?? $0.isFavorite) == true }
+            return (MockMusicLibrary.tracks + imported).filter { (overrides[$0.trackRef] ?? $0.isFavorite) == true }
         }
         if source == .playlist(id: MockMusicLibrary.playbackContextID) {
             return mockPlaybackContext.withLock { $0 }
+        }
+        if source == .library {
+            return MockMusicLibrary.tracks + imported
         }
         return try MockMusicLibrary.tracks(in: source)
     }
@@ -140,5 +144,33 @@ extension MockPlaybackController: MusicLibraryBrowsing {
         }
         mockLibraryFavorites.withLock { $0[trackRef] = value }
         return value
+    }
+
+    public func importAudioFile(at fileURL: URL) async throws -> MusicLibraryImportedTrack {
+        try Task.checkCancellation()
+        let standardizedURL = fileURL.standardizedFileURL
+        guard standardizedURL.isFileURL,
+              FileManager.default.fileExists(atPath: standardizedURL.path) else {
+            throw MusicLibraryError.invalidRequest
+        }
+        let rawTitle = standardizedURL.deletingPathExtension().lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = rawTitle.isEmpty ? "导入曲目" : rawTitle
+        let track = mockImportedTracks.withLock { imported -> MusicLibraryTrack in
+            let nextIndex = imported.count + 1
+            let persistentID = nextIndex <= 0xFFF
+                ? String(format: "A000000000001%03X", nextIndex)
+                : String(format: "A0000001%08X", nextIndex)
+            let item = MusicLibraryTrack(
+                persistentID: persistentID,
+                title: title,
+                durationMs: 180_000,
+                isFavorite: false,
+                dateAdded: Date()
+            )
+            imported.append(item)
+            return item
+        }
+        return MusicLibraryImportedTrack(track: track, resolvedFileURL: standardizedURL)
     }
 }

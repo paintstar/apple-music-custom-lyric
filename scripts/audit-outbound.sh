@@ -4,6 +4,8 @@
 # App 与各包（含测试）禁止直接网络/子进程调用；本地歌词不通过这些原语出站。
 # ShinLyricsProvider 是唯一允许 HTTP 出站的模块
 # （仅 music.163.com 与 interface3.music.163.com）；测试经 URLProtocol 拦截，不打真实网络。
+# Packages/ShinAppServices/Sources/ShinAppServices/AudioLinkImportService.swift 是唯一允许使用
+# Foundation.Process 的文件，仅通过参数数组（禁止 shell）调用本机 yt-dlp 与 ffmpeg。
 # MusicKit 与私有播放 API 禁止使用；Apple Events 原语只能位于 ShinMusicScript。
 # 当前 App 的文件/设置操作均不使用 AppleScript，没有需要放行的非 Music 脚本。
 # 若新增此类用途，须按具体固定目标审查，不能整目录豁免脚本执行能力。
@@ -21,19 +23,29 @@ source_files() {
     -print | LC_ALL=C sort
 }
 
-FORBIDDEN_OUTBOUND=(
+AUDIO_IMPORT_SERVICE="Packages/ShinAppServices/Sources/ShinAppServices/AudioLinkImportService.swift"
+
+FORBIDDEN_NETWORK=(
   -e 'URLSession|NSURLConnection|dataTask|downloadTask|uploadTask'
   -e 'import[[:space:]]+Network|NWConnection|NWListener|NWPathMonitor'
+)
+FORBIDDEN_SUBPROCESS=(
   -e '(^|[^[:alnum:]_])(Process([[:space:]]*\(|[.])|NSTask|posix_spawn|popen[[:space:]]*\()'
   # 不把 SwiftUI 的 Font.system(...) 当成 C system()。
   -e '(^|[^[:alnum:]_.])system[[:space:]]*\('
   -e '(Darwin|Glibc)[.]system[[:space:]]*\('
 )
+FORBIDDEN_OUTBOUND=(
+  "${FORBIDDEN_NETWORK[@]}"
+  "${FORBIDDEN_SUBPROCESS[@]}"
+)
 
-echo "== 1) App 与所有包的网络/子进程禁令（ShinLyricsProvider 除外）=="
+echo "== 1) App 与所有包的网络/子进程禁令（ShinLyricsProvider 与 AudioLinkImportService.swift 例外分别单审）=="
 FOUND=0
 while IFS= read -r file; do
-  case "$file" in Packages/ShinLyricsProvider/*) continue ;; esac
+  case "$file" in
+    Packages/ShinLyricsProvider/*|"$AUDIO_IMPORT_SERVICE") continue ;;
+  esac
   hits="$(grep -nE "${FORBIDDEN_OUTBOUND[@]}" "$file" | grep -vE ':[[:space:]]*//' || true)"
   if [ -n "$hits" ]; then
     echo "  FAIL $file:$hits"
@@ -41,7 +53,7 @@ while IFS= read -r file; do
   fi
 done < <(source_files)
 if [ "$FOUND" -eq 0 ]; then
-  echo "  通过：除 ShinLyricsProvider 外，项目源码未发现直接网络或子进程原语。"
+  echo "  通过：除单审例外外，项目源码未发现直接网络或子进程原语。"
 else
   FAILURES=$((FAILURES + 1))
 fi
@@ -110,6 +122,27 @@ then
   :
 else
   FAILURES=$((FAILURES + 1))
+fi
+
+echo "== 1c) AudioLinkImportService.swift：仅允许 Foundation.Process（禁止网络/shell/其它子进程原语）=="
+if [ ! -f "$AUDIO_IMPORT_SERVICE" ]; then
+  echo "  FAIL 缺少文件：$AUDIO_IMPORT_SERVICE"
+  FAILURES=$((FAILURES + 1))
+else
+  FORBIDDEN_IN_AUDIO_IMPORT=(
+    "${FORBIDDEN_NETWORK[@]}"
+    -e '(^|[^[:alnum:]_])(NSTask|posix_spawn|popen[[:space:]]*\()'
+    -e '(^|[^[:alnum:]_.])system[[:space:]]*\('
+    -e '(Darwin|Glibc)[.]system[[:space:]]*\('
+    -e '/bin/(sh|zsh|bash)'
+  )
+  hits="$(grep -nE "${FORBIDDEN_IN_AUDIO_IMPORT[@]}" "$AUDIO_IMPORT_SERVICE" | grep -vE ':[[:space:]]*//' || true)"
+  if [ -n "$hits" ]; then
+    echo "  FAIL $AUDIO_IMPORT_SERVICE:$hits"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "  通过：AudioLinkImportService.swift 未发现网络、shell 或 Process 之外的子进程原语。"
+  fi
 fi
 
 echo "== 2) 废弃 SDK 与私有播放 API 禁令 =="
@@ -183,6 +216,7 @@ echo ""
 if [ "$FAILURES" -eq 0 ]; then
   echo "audit-outbound：通过。播放集成限于 ShinMusicScript → 本机 Music.app 公开脚本；"
   echo "网络出站限于 ShinLyricsProvider → music.163.com / interface3.music.163.com（搜索与歌词文本）；"
+  echo "本地子进程限于 AudioLinkImportService.swift → 本机 yt-dlp / ffmpeg 参数数组调用；"
   echo "其余源码未发现网络/子进程原语。静态检查不替代真实 Music 人工验证。"
   exit 0
 fi

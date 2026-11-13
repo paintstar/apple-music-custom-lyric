@@ -210,6 +210,16 @@ final class MusicLibraryBrowserModel: ObservableObject {
         artworkRequestVersion += 1
         loadPage(reset: true, includePlaylists: true)
     }
+
+    /// 外部导入新音频曲目后，清掉资料库缓存并在当前浏览库页时立即刷新。
+    func refreshAfterLibraryImport() {
+        guard !isTerminating else { return }
+        cache[.library] = nil
+        if destination.source == .library {
+            didStart = true
+            reload()
+        }
+    }
     func setPlaylistSort(_ sort: MusicLibraryPlaylistSort) {
         guard !isTerminating, case let .playlist(id) = destination, sort != playlistSort else { return }
         playlistSort = sort

@@ -78,6 +78,7 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
     private let state = OSAllocatedUnfairLock(initialState: State())
     let mockLibraryFavorites = OSAllocatedUnfairLock(initialState: [String: Bool]())
     let mockPlaybackContext = OSAllocatedUnfairLock(initialState: [MusicLibraryTrack]())
+    let mockImportedTracks = OSAllocatedUnfairLock(initialState: [MusicLibraryTrack]())
     let mockPlaybackOptions = MockPlaybackOptionsController()
 
     public init(

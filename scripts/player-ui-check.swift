@@ -1256,7 +1256,68 @@ private struct PlayerUICheck {
         try await PlaybackOptionsUICheck.runChecks()
         try await checkPlaybackDragging(store: store, snapshot: initial)
         try await ArtworkUICheck.runChecks()
+        try await checkAudioLinkImport(store: store)
         fflush(nil)
         print("App player UI checks: AUTOMATED_PASS（未执行真实 Music 验证）")
+    }
+
+    @MainActor static func checkAudioLinkImport(store: GRDBLyricsStore) async throws {
+        let controller = MockPlaybackController(defaultDurationMs: 240_000)
+        let model = AppModel(
+            isMock: true,
+            controller: controller,
+            searchService: nil,
+            makeLyricsDatabase: {
+                LyricsDatabase.Database(
+                    store: store,
+                    locationDescription: "临时测试库",
+                    directory: URL(fileURLWithPath: "/tmp")
+                )
+            }
+        )
+        await model.start()
+        model.musicLibraryBrowser.select(.songs)
+        model.musicLibraryBrowser.startIfNeeded()
+        await model.musicLibraryBrowser.waitForTrackRows()
+        let initialCount = model.musicLibraryBrowser.displayedTracks.count
+
+        model.beginAudioLinkImport()
+        precondition(model.isAudioLinkImportPresented, "beginAudioLinkImport 应打开链接导入弹窗")
+        precondition(FloatingLyricsActions.hasPresentedSheet(model), "链接导入弹窗应纳入 sheet 互斥检查")
+        let linkModel = model.audioLinkImportModel!
+        await linkModel.checkTools()
+        precondition(linkModel.toolAvailability?.isReady == true, "Mock 模式依赖工具探测应就绪")
+
+        linkModel.urlString = "https://www.bilibili.com/video/BV1mockTest"
+        linkModel.title = "Crack0day/Caribdis"
+        linkModel.artist = "测试歌手"
+        linkModel.genre = "轻音乐, 英语"
+        linkModel.startImport()
+        await linkModel.waitForImportCompletion()
+
+        guard case let .succeeded(result) = linkModel.phase else {
+            preconditionFailure("Mock 链接导入应成功完成")
+        }
+        defer {
+            if let stagedURL = result.stagedFileURL {
+                try? FileManager.default.removeItem(at: stagedURL.deletingLastPathComponent())
+            }
+        }
+        let importedTrack = result.importedTrack.track
+        precondition(importedTrack.title == "Crack0day/Caribdis", "导入曲目应保留特殊字符标题")
+        try await eventually("资料库歌曲列表应刷新并包含新导入曲目") {
+            model.musicLibraryBrowser.displayedTracks.contains { $0.trackRef == importedTrack.trackRef }
+                && model.musicLibraryBrowser.displayedTracks.count == initialCount + 1
+        }
+
+        linkModel.fetchOnlineLyrics()
+        try await eventually("链入在线搜词应切换 sheet 并固定新曲目 trackKey") {
+            !model.isAudioLinkImportPresented
+                && model.isLyricsFetchPresented
+                && model.lyricsFetchModel?.target.trackKey == importedTrack.trackRef
+                && model.lyricsFetchModel?.target.titleHint == "Crack0day/Caribdis"
+        }
+        model.prepareForTermination()
+        print("PASS Mock 链接导入入库、资料库刷新与后续网易云搜词串联")
     }
 }

@@ -10,8 +10,8 @@ ShinApple 使用 SwiftUI 构建界面，局部使用 AppKit 管理窗口和歌�
 | `ShinAppleKit` | 领域模型、播放和存储协议、LRC 解析、Mock |
 | `ShinLyricsEngine` | 纯时间轴查询、歌词分组和偏移换算 |
 | `ShinAppleData` | GRDB/SQLite 存储、事务、迁移、备份校验与恢复 |
-| `ShinAppServices` | 导入、关联、编辑、播放与歌词协调、导出和备份工作流 |
-| `ShinMusicScript` | 唯一 Music Apple Events 适配层，包含资料库、播放选项与封面读取 |
+| `ShinAppServices` | 导入、关联、编辑、播放与歌词协调、导出和备份工作流，以及本机链接音频下载与标签封装服务 |
+| `ShinMusicScript` | 唯一 Music Apple Events 适配层，包含资料库、播放选项、封面读取与本地音频文件入库 |
 | `ShinLyricsProvider` | 唯一 HTTP 获取层，包含网易云候选查询、歌词文本获取、匹配和双语 LRC 合成 |
 
 界面和服务通过注入协议调用播放、存储与歌词获取能力。领域模型和歌词引擎不依赖 SwiftUI、AppKit、播放系统、数据库或网络；网络层不直接写数据库，获取结果复用歌词导入与确认流程。
@@ -72,6 +72,8 @@ Music 脚本快照是播放状态和位置的权威来源，所有内部时间�
 
 ## 边界
 
-Music 脚本使用固定代码和受验证参数，不拼接用户文本为可执行代码。网易云获取访问集中定义的两个域名，匿名、限速，只查询歌曲信息与歌词文本；歌词端点并非官方公开 API，失败需明确呈现。
+Music 脚本使用固定代码和受验证参数，不拼接用户文本为可执行代码；本地音频导入经 `ShinMusicScript` 校验安全 ASCII `.m4a` 路径并由公开 Apple Events 入库。网易云获取访问集中定义的两个域名，匿名、限速，只查询歌曲信息与歌词文本；歌词端点并非官方公开 API，失败需明确呈现。
 
-学习资料与获取结果存于本机，无遥测或上传。数据操作使用事务、revision 与增量迁移，细节见 [数据迁移](migration.md)。测试通过 Mock 和注入会话隔离 Music、网络与真实用户数据。
+链接音频导入的子进程调用仅限 `ShinAppServices` 中的 `AudioLinkImportService.swift`，通过 `Foundation.Process` 参数数组（禁止 shell 拼接）调用本机安装的 `yt-dlp` 与 `ffmpeg` 完成下载与元数据封装；若用户提供浏览器或 `cookies.txt` 来源，仅透传对应 CLI 参数或文件路径，应用不读取、日志输出或持久化 Cookie 内容。音频文件先落位到 `~/Library/Application Support/ShinApple/ImportedAudio/`，入库后若确认「音乐」App 已复制到媒体目录则清理暂存，否则保留源文件以防断链。
+
+学习资料与获取结果存于本机，无遥测或上传。数据操作使用事务、revision 与增量迁移，细节见 [数据迁移](migration.md)。测试通过 Mock 和注入会话隔离 Music、网络、外部工具与真实用户数据。

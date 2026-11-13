@@ -114,7 +114,9 @@ final class AppModel: ObservableObject {
     private var lyricsRefreshTask: Task<Void, Never>?
     /// 当前歌词库的文件变更订阅；换库扩展安装，退出或释放时取消。
     var lyricsStoreChangesTask: Task<Void, Never>?
-    private var importTask: Task<Void, Never>?
+    var importTask: Task<Void, Never>?
+    let audioLinkImporter: any AudioLinkImporting
+    var pendingAudioLinkSheetAction: (@MainActor () -> Void)?
 
     // MARK: - 构造
 
@@ -122,12 +124,15 @@ final class AppModel: ObservableObject {
         isMock: Bool,
         controller: PlaybackController,
         searchService: CatalogSearchService?,
-        makeLyricsDatabase: (@MainActor () async throws -> LyricsDatabase.Database)? = nil
+        makeLyricsDatabase: (@MainActor () async throws -> LyricsDatabase.Database)? = nil,
+        audioLinkImporter: (any AudioLinkImporting)? = nil
     ) {
         self.isMock = isMock
         self.controller = controller
         self.searchService = searchService
         self.makeLyricsDatabase = makeLyricsDatabase ?? { try await LyricsDatabase.makeStore(isMock: isMock) }
+        self.audioLinkImporter = audioLinkImporter
+            ?? Self.makeDefaultAudioLinkImporter(isMock: isMock, controller: controller)
     }
 
     deinit {
@@ -408,30 +413,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 打开导入窗口：目标在打开时从当前曲目键固定（不随后续播放变化）。
-    func beginImport() {
-        guard !isTerminating, let flow = importFlow, let trackKey = currentTrackKey else { return }
-        let target = ImportSessionTarget(
-            trackKey: trackKey,
-            titleHint: snapshot.title ?? selectedSong?.title,
-            artistHint: selectedSong?.artistName,
-            durationHintMs: snapshot.durationMs ?? selectedSong?.durationMs
-        )
-        isImportPresented = true
-        importTask?.cancel()
-        importTask = Task { [weak self] in
-            guard self?.isTerminating == false, !Task.isCancelled else { return }
-            await flow.openSession(target: target)
-        }
-    }
-
-    // MARK: 在线歌词获取（编排在 AppModel+LyricsFetch.swift）
+    // MARK: 在线歌词获取、手动导入与链接导入（编排在 AppModel+LyricsFetch.swift）
 
     /// 在线获取弹窗呈现开关。
     @Published var isLyricsFetchPresented = false
     /// 获取流程状态（nil = 未打开；目标在创建时固定）。
     /// setter 为 internal：获取扩展（AppModel+LyricsFetch.swift）装配弹窗时写入。
     @Published var lyricsFetchModel: NeteaseLyricsFetchModel?
+    /// 链接导入音频弹窗呈现开关。
+    @Published var isAudioLinkImportPresented = false
+    /// 链接导入音频流程状态。
+    @Published var audioLinkImportModel: AudioLinkImportModel?
 
     /// 能否发起在线获取（与导入同门槛：有明确曲目键且导入服务可用）。
     var canBeginOnlineFetch: Bool {
@@ -460,6 +452,8 @@ extension AppModel {
         importTask?.cancel()
         autoFetch?.invalidateCurrentRun()
         lyricsFetchModel?.cancel()
+        audioLinkImportModel?.cancelImport()
+        pendingAudioLinkSheetAction = nil
         lyricsPanel?.setAutoScrollSuspended(true)
         artworkStore.handleTrackChange(PlaybackSnapshot(), controller: controller)
         musicLibraryBrowser.cancelForTermination()

@@ -208,6 +208,10 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         try await performTransportCommand { try self.executor.previousTrack() }
     }
 
+    var isDisposed: Bool {
+        state.withLock { $0.disposed }
+    }
+
     public func dispose() {
         let task: Task<Void, Never>? = state.withLock { s in
             s.disposed = true

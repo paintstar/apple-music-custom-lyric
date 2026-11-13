@@ -20,6 +20,7 @@ struct MusicWindowMenuActions: Equatable {
     var revealCurrentTrack: (() -> Void)?
     var goBack: (() -> Void)?
     var toggleFullScreen: (() -> Void)?
+    var importAudioFromLink: (() -> Void)?
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.windowID == rhs.windowID && lhs.destination == rhs.destination
@@ -32,6 +33,7 @@ struct MusicWindowMenuActions: Equatable {
             && (lhs.revealCurrentTrack == nil) == (rhs.revealCurrentTrack == nil)
             && (lhs.goBack == nil) == (rhs.goBack == nil)
             && (lhs.toggleFullScreen == nil) == (rhs.toggleFullScreen == nil)
+            && (lhs.importAudioFromLink == nil) == (rhs.importAudioFromLink == nil)
     }
 }
 
@@ -152,6 +154,10 @@ private struct SystemViewMenuContent: View {
             }
             .keyboardShortcut("/", modifiers: .command)
             .disabled(window?.toggleStatusBar == nil)
+            Divider()
+            Button("从链接导入音频…") { window?.importAudioFromLink?() }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
+                .disabled(window?.importAudioFromLink == nil)
         }
     }
 
@@ -174,6 +180,7 @@ struct MusicLibraryNavigationMenu: View {
     let onNowPlaying: () -> Void
     let onImport: () -> Void
     let onEdit: () -> Void
+    var onImportAudioFromLink: (() -> Void)?
     @AppStorage(LyricsPanelView.translationsSettingKey) private var showTranslations = true
     @State private var unlinkRequest: LyricsUnlinkRequest?
 
@@ -218,6 +225,8 @@ struct MusicLibraryNavigationMenu: View {
             .init(title: "学习"),
             .init(title: "学习歌曲与备份", symbol: "books.vertical", action: { onSelect(.library) }),
             .init(title: "导入本地歌词", symbol: "square.and.arrow.down", isEnabled: canImport, action: onImport),
+            .init(title: "从链接导入音频", symbol: "link.badge.plus", isEnabled: onImportAudioFromLink != nil,
+                  action: { onImportAudioFromLink?() }),
             .separator,
             .init(title: "当前歌词")
         ]

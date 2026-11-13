@@ -97,6 +97,24 @@ actor MusicLibraryCache {
         return confirmed
     }
 
+    func importAudioFile(at fileURL: URL) async throws -> MusicLibraryImportedTrack {
+        guard fileURL.isFileURL else { throw MusicLibraryError.invalidRequest }
+        let posixPath = fileURL.standardizedFileURL.path
+        guard MusicLibraryScriptSources.isSafePOSIXFilePath(posixPath) else {
+            throw MusicLibraryError.invalidRequest
+        }
+        let reader = reader
+        let imported = try await runCancellable { cancellation in
+            try reader.importAudioFile(posixPath: posixPath, cancellation: cancellation)
+        }
+        if source == .library {
+            generation += 1
+            source = nil
+            tracks = []
+        }
+        return imported
+    }
+
     private func runCancellable<Value: Sendable>(
         cancellation: MusicLibraryCancellation = MusicLibraryCancellation(),
         _ operation: @escaping @Sendable (MusicLibraryCancellation) throws -> Value
@@ -300,6 +318,23 @@ extension MusicScriptPlaybackController: MusicLibraryBrowsing {
     public func setFavorite(_ trackRef: String, value: Bool, in source: MusicLibrarySource) async throws -> Bool {
         do {
             return try await libraryCache.setFavorite(trackRef, value: value, in: source)
+        } catch let failure as MusicScriptFailure {
+            throw MusicScriptMapping.playbackError(for: failure)
+        }
+    }
+
+    public func importAudioFile(at fileURL: URL) async throws -> MusicLibraryImportedTrack {
+        try Task.checkCancellation()
+        guard !isDisposed else { throw CancellationError() }
+        guard fileURL.isFileURL,
+              MusicLibraryScriptSources.isSafePOSIXFilePath(fileURL.standardizedFileURL.path) else {
+            throw MusicLibraryError.invalidRequest
+        }
+        try await MusicBackgroundLauncher.prepare()
+        try Task.checkCancellation()
+        guard !isDisposed else { throw CancellationError() }
+        do {
+            return try await libraryCache.importAudioFile(at: fileURL)
         } catch let failure as MusicScriptFailure {
             throw MusicScriptMapping.playbackError(for: failure)
         }

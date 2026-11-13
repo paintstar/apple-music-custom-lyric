@@ -15,6 +15,7 @@ struct SidebarView: View {
     @EnvironmentObject private var model: AppModel
     let onEditLyrics: () -> Void
     let onNowPlaying: () -> Void
+    var onImportAudioFromLink: (() -> Void)?
     var topContentInset: CGFloat = 0
 
     var body: some View {
@@ -28,6 +29,10 @@ struct SidebarView: View {
                     musicRow(.artists)
                     musicRow(.albums)
                     musicRow(.songs)
+                    if let onImportAudioFromLink {
+                        actionRow("从链接导入音频", symbol: "link.badge.plus", action: onImportAudioFromLink)
+                            .help("从音频或视频链接下载并导入歌曲")
+                    }
                     sectionTitle("播放列表")
                     if browser.playlists.isEmpty {
                         Text(browser.isLoading ? "正在读取播放列表……" : "暂无可读取的播放列表")
@@ -44,6 +49,10 @@ struct SidebarView: View {
                     row(.library, title: "学习歌曲与备份", symbol: "text.book.closed")
                     actionRow("编辑当前歌词", symbol: "square.and.pencil", action: onEditLyrics)
                         .disabled(!model.canBeginLyricsEditing)
+                    if let onImportAudioFromLink {
+                        actionRow("从链接导入音频", symbol: "link.badge.plus", action: onImportAudioFromLink)
+                            .help("从音频或视频链接下载并导入歌曲")
+                    }
                     Divider().padding(.vertical, 10)
                     actionRow("完整播放器", symbol: "play.square", action: onNowPlaying)
                     row(.settings, title: "设置", symbol: "gearshape")
