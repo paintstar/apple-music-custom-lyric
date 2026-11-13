@@ -57,10 +57,8 @@ struct ContentView: View {
     }
 
     private var hasPresentedSheet: Bool {
-        model.isImportPresented
-            || model.isLyricsFetchPresented
-            || model.isLyricsEditorPresented
-            || model.isLibraryPresented
+        model.isImportPresented || model.isLyricsFetchPresented
+            || model.isLyricsEditorPresented || model.isLibraryPresented
     }
 
     var body: some View {
@@ -116,32 +114,20 @@ struct ContentView: View {
                 hasSavedPresentation = true
             }
         }
-        .sheet(isPresented: $model.isImportPresented) {
-            if let flow = model.importFlow { ImportFlowView(flow: flow) }
-        }
+        .sheet(isPresented: $model.isImportPresented) { if let flow = model.importFlow { ImportFlowView(flow: flow) } }
         .sheet(isPresented: $model.isLyricsFetchPresented) {
             if let fetchModel = model.lyricsFetchModel {
-                NeteaseLyricsFetchView(
-                    model: fetchModel,
-                    isMock: model.isMock,
-                    onClose: { model.isLyricsFetchPresented = false }
-                )
+                NeteaseLyricsFetchView(model: fetchModel, isMock: model.isMock,
+                                       onClose: { model.isLyricsFetchPresented = false })
             }
         }
-        .sheet(isPresented: $model.isLibraryPresented) {
-            if let library = model.library { LyricsLibraryView(library: library) }
-        }
-        .sheet(isPresented: $model.isLyricsEditorPresented,
-               onDismiss: { model.finishLyricsEditing() }, content: {
-            if let editor = model.lyricsEditor {
-                LyricsEditorView(model: editor) { model.requestCloseLyricsEditor() }
-            }
+        .sheet(isPresented: $model.isLibraryPresented) { if let library = model.library { LyricsLibraryView(library: library) } }
+        .sheet(isPresented: $model.isLyricsEditorPresented, onDismiss: { model.finishLyricsEditing() }, content: {
+            if let editor = model.lyricsEditor { LyricsEditorView(model: editor) { model.requestCloseLyricsEditor() } }
         })
         .onAppear {
             configureMainWindowPresentation()
-            if hasPresentedSheet {
-                expandForSheet(true)
-            }
+            if hasPresentedSheet { expandForSheet(true) }
         }
         .onChange(of: model.isImportPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLyricsFetchPresented) { _, shown in expandForSheet(shown) }
@@ -155,9 +141,7 @@ struct ContentView: View {
             preferences.set(mode.rawValue, forKey: "player.compactReturnMode")
         }
         .onReceive(NotificationCenter.default.publisher(for: .shinSelectLibraryPage)) { _ in openPage(.library) }
-        .onReceive(NotificationCenter.default.publisher(for: .shinSelectAudioLinkImportPage)) { _ in
-            openPage(.audioLinkImport)
-        }
+        .onReceive(NotificationCenter.default.publisher(for: .shinSelectAudioLinkImportPage)) { _ in openPage(.audioLinkImport) }
         .onDisappear { cancelTrackReveal() }
     }
 
@@ -233,8 +217,7 @@ struct ContentView: View {
                 libraryUnavailable
             }
         case .audioLinkImport:
-            AudioLinkImportView(model: model.ensureAudioLinkImportModel(),
-                                isMock: model.isMock,
+            AudioLinkImportView(model: model.ensureAudioLinkImportModel(), isMock: model.isMock,
                                 bottomContentInset: bottomInset)
         case .settings:
             SettingsPageView(bottomContentInset: bottomInset)
@@ -308,17 +291,20 @@ struct ContentView: View {
 
     private func navigationMenu(compact: Bool = false) -> some View {
         MusicLibraryNavigationMenu(
-            browser: model.musicLibraryBrowser,
-            panel: model.lyricsPanel,
-            compact: compact,
-            canImport: model.canBeginImport,
-            onSelect: openPage,
-            onNowPlaying: showNowPlaying,
+            browser: model.musicLibraryBrowser, panel: model.lyricsPanel, compact: compact,
+            canImport: model.canBeginImport, onSelect: openPage, onNowPlaying: showNowPlaying,
             onImport: { expandBeforeAction { model.beginImport() } },
             onEdit: { expandBeforeAction { model.beginLyricsEditing() } }
         )
     }
+}
 
+private struct FloatingPlayerHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+extension ContentView {
     /// 浮窗只展示已知主窗；主窗关闭后由同一个 WindowGroup 重建并沿用已有 sheet。
     private func configureMainWindowPresentation() {
         let action = openWindow
@@ -376,9 +362,7 @@ struct ContentView: View {
         action()
     }
 
-    private func expandForSheet(_ shown: Bool) {
-        if shown { expandBeforeAction({}) }
-    }
+    private func expandForSheet(_ shown: Bool) { if shown { expandBeforeAction({}) } }
 
     private var libraryUnavailable: some View {
         VStack(spacing: 8) {
@@ -387,14 +371,7 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-}
 
-private struct FloatingPlayerHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
-extension ContentView {
     private func windowMenuActions(_ browser: MusicLibraryBrowserModel) -> MusicWindowMenuActions {
         let destination = musicDestination
         let isSelectedBrowser = destination == browser.destination

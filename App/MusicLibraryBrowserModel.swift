@@ -102,19 +102,11 @@ final class MusicLibraryBrowserModel: ObservableObject {
     func cancelForTermination() {
         guard !isTerminating else { return }
         isTerminating = true
-        loadSequence += 1
-        filterSequence += 1
-        playSequence += 1
-        playlistSequence += 1
-        loadTask?.cancel()
-        filterTask?.cancel()
-        playTask?.cancel()
-        playlistTask?.cancel()
+        loadSequence += 1; filterSequence += 1; playSequence += 1; playlistSequence += 1
+        loadTask?.cancel(); filterTask?.cancel(); playTask?.cancel(); playlistTask?.cancel()
         favoriteTasks.values.forEach { $0.cancel() }
         favoriteTasks.removeAll()
-        isLoading = false
-        isPlayingRequest = false
-        favoriteWrites.removeAll()
+        isLoading = false; isPlayingRequest = false; favoriteWrites.removeAll()
     }
 
     var title: String {
@@ -211,32 +203,6 @@ final class MusicLibraryBrowserModel: ObservableObject {
         loadPage(reset: true, includePlaylists: true)
     }
 
-    /// 外部导入新音频曲目后，清掉资料库缓存并在当前浏览库页时立即刷新。
-    func refreshAfterLibraryImport() {
-        guard !isTerminating else { return }
-        cache[.library] = nil
-        if destination.source == .library {
-            didStart = true
-            reload()
-        }
-    }
-    func setPlaylistSort(_ sort: MusicLibraryPlaylistSort) {
-        guard !isTerminating, case let .playlist(id) = destination, sort != playlistSort else { return }
-        playlistSort = sort
-        sortPreferences.save(sort, for: id)
-        scheduleFilter()
-    }
-    func selectGroup(_ id: String?) {
-        selectedGroupID = id
-        selectedTrackID = nil
-        scrollOffsetY = 0
-        scrollResetSequence += 1
-    }
-    func loadMore() {
-        guard nextOffset != nil, !isLoading else { return }
-        loadPage(reset: true, includePlaylists: false)
-    }
-
     func play(_ track: MusicLibraryTrack) {
         beginPlayback(track, shuffleEnabled: nil, playbackStarted: nil)
     }
@@ -265,8 +231,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
                 if shuffleEnabled == true {
                     try await service.shuffleTracks(trackRefs, in: source)
                 } else {
-                    try await service.playTracks(trackRefs, startingAt: track.trackRef, in: source,
-                                                 shuffleEnabled: shuffleEnabled)
+                    try await service.playTracks(trackRefs, startingAt: track.trackRef,
+                                                 in: source, shuffleEnabled: shuffleEnabled)
                 }
                 try Task.checkCancellation()
                 guard let self, sequence == self.playSequence else { return }
@@ -353,10 +319,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
         }
     }
 
-    private func collectPages(
-        service: MusicLibraryBrowsing, source: MusicLibrarySource,
-        offset initialOffset: Int, reset: Bool, sequence: Int
-    ) async throws {
+    private func collectPages(service: MusicLibraryBrowsing, source: MusicLibrarySource,
+                              offset initialOffset: Int, reset: Bool, sequence: Int) async throws {
         var offset = initialOffset
         var accumulated = reset ? [] : tracks
         var seen = Set(accumulated.map(\.id))
@@ -396,9 +360,8 @@ final class MusicLibraryBrowserModel: ObservableObject {
             guard !Task.isCancelled else { return }
             let result = await Task.detached(priority: .userInitiated) {
                 var filtered = tracks.filter { track in
-                    let matchesQuery = query.isEmpty || [track.title, track.artist ?? "", track.album ?? ""]
+                    query.isEmpty || [track.title, track.artist ?? "", track.album ?? ""]
                         .contains { $0.localizedStandardContains(query) }
-                    return matchesQuery
                 }
                 if destination == .recent {
                     filtered.sort {
@@ -434,10 +397,30 @@ final class MusicLibraryBrowserModel: ObservableObject {
 }
 
 extension MusicLibraryBrowserModel {
-    func waitForTrackRows() async {
-        await loadTask?.value
-        await filterTask?.value
+    /// 外部导入新音频曲目后，清掉资料库缓存并在当前浏览库页时立即刷新。
+    func refreshAfterLibraryImport() {
+        guard !isTerminating else { return }
+        cache[.library] = nil
+        if destination.source == .library { didStart = true; reload() }
     }
+
+    func setPlaylistSort(_ sort: MusicLibraryPlaylistSort) {
+        guard !isTerminating, case let .playlist(id) = destination, sort != playlistSort else { return }
+        playlistSort = sort
+        sortPreferences.save(sort, for: id)
+        scheduleFilter()
+    }
+
+    func selectGroup(_ id: String?) {
+        selectedGroupID = id; selectedTrackID = nil; scrollOffsetY = 0; scrollResetSequence += 1
+    }
+
+    func loadMore() {
+        guard nextOffset != nil, !isLoading else { return }
+        loadPage(reset: true, includePlaylists: false)
+    }
+
+    func waitForTrackRows() async { await loadTask?.value; await filterTask?.value }
     func artworkData(for trackRef: String, in source: MusicLibrarySource? = nil) async -> Data? {
         guard !isTerminating, !Task.isCancelled, let service else { return nil }
         let data = try? await service.artworkData(for: trackRef, in: source ?? destination.source)
@@ -453,30 +436,20 @@ extension MusicLibraryBrowserModel {
             }
             cache[key] = page
         }
-        for index in tracks.indices where tracks[index].trackRef == trackRef {
-            tracks[index].isFavorite = value
-        }
+        for index in tracks.indices where tracks[index].trackRef == trackRef { tracks[index].isFavorite = value }
         scheduleFilter()
     }
 
     private func invalidateFavoriteMembership(changedIn source: MusicLibrarySource) {
         refreshPlaylists()
-        for key in Array(cache.keys) {
-            if case .playlist = key { cache[key] = nil }
-        }
+        for key in Array(cache.keys) { if case .playlist = key { cache[key] = nil } }
         if source != .library { cache[.library] = nil }
-        if case .playlist = destination.source {
-            loadPage(reset: true, includePlaylists: false)
-        } else if isLoading || source != .library {
-            loadPage(reset: true, includePlaylists: false)
-        }
+        let isPlaylist = if case .playlist = destination.source { true } else { false }
+        if isPlaylist || isLoading || source != .library { loadPage(reset: true, includePlaylists: false) }
     }
 
     private func preparePlaylistRefresh(if requested: Bool) -> Int {
-        if requested {
-            playlistSequence += 1
-            playlistTask?.cancel()
-        }
+        if requested { playlistSequence += 1; playlistTask?.cancel() }
         return playlistSequence
     }
 

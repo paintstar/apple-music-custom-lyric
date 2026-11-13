@@ -1,6 +1,6 @@
 # ShinApple
 
-ShinApple 是 macOS 原生歌曲语言学习播放器，当前发布版本为 **0.1.3**。官方「音乐」App 负责账号与音频播放，ShinApple 提供资料库浏览、播放控制、同步歌词、中文译文与行级重听。歌词和学习资料保存在本机。
+ShinApple 是 macOS 原生歌曲语言学习播放器，当前发布版本为 **0.1.4**。官方「音乐」App 负责账号与音频播放，ShinApple 提供资料库浏览、播放控制、同步歌词、中文译文与行级重听。歌词和学习资料保存在本机。
 
 ## 功能
 
@@ -24,9 +24,9 @@ ShinApple 是 macOS 原生歌曲语言学习播放器，当前发布版本为 **
 
 ## 下载与安装
 
-从 [GitHub Releases](https://github.com/paintstar/apple-music-custom-lyric/releases) 下载 **0.1.3** 安装包，需要 **macOS 14.0 及以上**。已构建 **Apple Silicon（arm64）** 版本，暂未提供 Intel 安装包。
+从 [GitHub Releases](https://github.com/paintstar/apple-music-custom-lyric/releases) 下载 **0.1.4** 安装包，需要 **macOS 14.0 及以上**。已构建 **Apple Silicon（arm64）** 版本，暂未提供 Intel 安装包。
 
-1. 下载 `ShinApple-0.1.3-macOS-arm64.dmg`，打开后将 **ShinApple** 拖到 **Applications**。也可下载同名 ZIP，解压后将 `ShinApple.app` 移到「应用程序」。
+1. 下载 `ShinApple-0.1.4-macOS-arm64.dmg`，打开后将 **ShinApple** 拖到 **Applications**。也可下载同名 ZIP，解压后将 `ShinApple.app` 移到「应用程序」。
 2. 从「应用程序」启动 ShinApple，按提示允许控制官方「音乐」App。
 3. 本次安装包采用 **ad-hoc 签名，未经 Apple 公证**。如果系统提示无法验证开发者，请确认下载来源后按照 [Apple 官方说明](https://support.apple.com/zh-cn/102445) 在「系统设置 → 隐私与安全性」中处理。
 
