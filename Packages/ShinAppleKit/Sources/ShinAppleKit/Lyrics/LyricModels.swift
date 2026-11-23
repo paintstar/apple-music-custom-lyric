@@ -33,6 +33,108 @@ public struct Translation: Codable, Equatable, Sendable {
     }
 }
 
+/// 学习注记（逐行注音、文法讲解等）的来源信息。
+public struct StudyAnnotationSource: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Equatable, Sendable {
+        case manual
+        case ai
+        case imported
+    }
+
+    public var kind: Kind
+    /// 生成注记所使用的模型标识；人工编辑或外部导入时通常为 nil。
+    public var model: String?
+
+    public init(kind: Kind, model: String? = nil) {
+        self.kind = kind
+        self.model = model
+    }
+
+    /// 人工编写或修订来源。
+    public static func manual() -> StudyAnnotationSource {
+        StudyAnnotationSource(kind: .manual, model: nil)
+    }
+
+    /// AI 生成来源，可附带模型标识。
+    public static func ai(model: String? = nil) -> StudyAnnotationSource {
+        StudyAnnotationSource(kind: .ai, model: model)
+    }
+
+    /// 外部导入来源。
+    public static func imported() -> StudyAnnotationSource {
+        StudyAnnotationSource(kind: .imported, model: nil)
+    }
+}
+
+/// 歌词逐行注音的表示形式。
+public enum PronunciationStyle: String, Codable, CaseIterable, Equatable, Sendable {
+    case romaji
+    case furigana
+    case ipa
+    case hangulRomanization
+    case custom
+
+    /// 面向界面展示的中文名称。
+    public var displayName: String {
+        switch self {
+        case .romaji: return "罗马音"
+        case .furigana: return "假名注音"
+        case .ipa: return "国际音标"
+        case .hangulRomanization: return "韩语罗马音"
+        case .custom: return "自定义"
+        }
+    }
+}
+
+/// 单行歌词的注音标注，绑定到 LyricLine 的稳定 id。
+public struct LinePronunciation: Codable, Equatable, Sendable {
+    public var style: PronunciationStyle
+    public var text: String
+    public var source: StudyAnnotationSource
+    /// 原文修改或 AI 自动生成后，可标为待复核。
+    public var needsReview: Bool
+
+    public init(
+        style: PronunciationStyle,
+        text: String,
+        source: StudyAnnotationSource,
+        needsReview: Bool = false
+    ) {
+        self.style = style
+        self.text = text
+        self.source = source
+        self.needsReview = needsReview
+    }
+}
+
+/// 单行歌词的学习讲解笔记，绑定到 LyricLine 的稳定 id。
+public struct LineStudyNote: Codable, Equatable, Sendable {
+    public var grammarSummary: String
+    public var singingTips: String?
+    public var culturalNote: String?
+    public var source: StudyAnnotationSource
+    /// 原文修改或 AI 自动生成后，可标为待复核。
+    public var needsReview: Bool
+    /// ISO8601 更新时间戳。
+    public var updatedAt: String
+
+    public init(
+        grammarSummary: String,
+        singingTips: String? = nil,
+        culturalNote: String? = nil,
+        source: StudyAnnotationSource,
+        needsReview: Bool = false,
+        updatedAt: String = LyricTimestamp.now()
+    ) {
+        self.grammarSummary = grammarSummary
+        self.singingTips = singingTips
+        self.culturalNote = culturalNote
+        self.source = source
+        self.needsReview = needsReview
+        self.updatedAt = updatedAt
+    }
+}
+
 /// 一行歌词。id 为稳定 UUID（同文本多时间戳展开时每个实例各有独立 id）；
 /// 时间统一整数毫秒；未打轴文本为 nil，可静态显示，不参与动态高亮。
 public struct LyricLine: Codable, Equatable, Sendable {
@@ -43,17 +145,54 @@ public struct LyricLine: Codable, Equatable, Sendable {
     /// key 为 BCP-47 语言代码（如 "zh-Hans"）；空对象表示无翻译。
     /// 重复时间戳的多行不推断「第一行原文、第二行译文」，翻译只经明确绑定。
     public var translations: [String: Translation]
+    /// 逐行注音标注；未配置时为 nil。
+    public var pronunciation: LinePronunciation?
+    /// 逐行文法与演唱讲解；未配置时为 nil。
+    public var studyNote: LineStudyNote?
 
     public init(
         id: UUID = UUID(),
         startMs: Int64?,
         text: String,
-        translations: [String: Translation] = [:]
+        translations: [String: Translation] = [:],
+        pronunciation: LinePronunciation? = nil,
+        studyNote: LineStudyNote? = nil
     ) {
         self.id = id
         self.startMs = startMs
         self.text = text
         self.translations = translations
+        self.pronunciation = pronunciation
+        self.studyNote = studyNote
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case startMs
+        case text
+        case translations
+        case pronunciation
+        case studyNote
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.startMs = try container.decodeIfPresent(Int64.self, forKey: .startMs)
+        self.text = try container.decode(String.self, forKey: .text)
+        self.translations = try container.decodeIfPresent([String: Translation].self, forKey: .translations) ?? [:]
+        self.pronunciation = try container.decodeIfPresent(LinePronunciation.self, forKey: .pronunciation)
+        self.studyNote = try container.decodeIfPresent(LineStudyNote.self, forKey: .studyNote)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(startMs, forKey: .startMs)
+        try container.encode(text, forKey: .text)
+        try container.encode(translations, forKey: .translations)
+        try container.encodeIfPresent(pronunciation, forKey: .pronunciation)
+        try container.encodeIfPresent(studyNote, forKey: .studyNote)
     }
 }
 

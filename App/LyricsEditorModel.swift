@@ -37,11 +37,15 @@ final class LyricsEditorModel: ObservableObject {
     /// 保存成功后的回调（宿主用于刷新歌词面板）。
     var onDidCommit: (() -> Void)?
 
+    let store: GRDBLyricsStore
+    let isMock: Bool
     private let service: LyricsEditingService
     /// 最近一次打开的文档 id（冲突后「重新载入」复用）。
     private var lastOpenedDocumentId: UUID?
 
-    init(store: GRDBLyricsStore) {
+    init(store: GRDBLyricsStore, isMock: Bool = false) {
+        self.store = store
+        self.isMock = isMock
         service = LyricsEditingService(store: store)
     }
 
@@ -134,6 +138,16 @@ final class LyricsEditorModel: ObservableObject {
         }
     }
 
+    func setPronunciation(lineId: UUID, style: PronunciationStyle?, to text: String) {
+        Task {
+            await perform(preserveTimeInputOf: lineId) {
+                try await self.service.setPronunciation(
+                    lineId: lineId, style: style, text: text
+                )
+            }
+        }
+    }
+
     /// 时间输入框变化：先本地解析；失败只标行内错误（草稿不动），成功才推送。
     func updateTimeRaw(lineId: UUID, raw: String) {
         timeInputs[lineId] = raw
@@ -217,6 +231,14 @@ final class LyricsEditorModel: ObservableObject {
         snapshot?.lines.first { $0.id == lineId }?.text ?? ""
     }
 
+    func pronunciation(of lineId: UUID) -> String {
+        snapshot?.lines.first { $0.id == lineId }?.pronunciation?.text ?? ""
+    }
+
+    func pronunciationStyle(of lineId: UUID) -> PronunciationStyle? {
+        snapshot?.lines.first { $0.id == lineId }?.pronunciation?.style
+    }
+
     func translation(of lineId: UUID) -> String {
         snapshot?.lines.first { $0.id == lineId }?
             .translations[Self.translationLanguage]?.text ?? ""
@@ -287,6 +309,42 @@ final class LyricsEditorModel: ObservableObject {
             return "毫秒不能带小数"
         case .outOfRange:
             return "数值超出可表示范围"
+        }
+    }
+}
+
+// MARK: - 编辑器草稿 AI 学习批处理
+
+extension LyricsEditorModel {
+    func currentWorkingDocument() async -> LyricDocument? {
+        await service.currentWorkingDocument()
+    }
+
+    func applyAIStudyPreview(
+        items: [AIStudyPreviewLine],
+        task: AIStudyBatchTaskKind,
+        modelName: String?
+    ) async {
+        guard let draft = await service.currentWorkingDocument() else { return }
+        let expectedDocId = draft.id
+        await perform {
+            guard await self.service.currentWorkingDocument()?.id == expectedDocId else {
+                throw LyricsEditingError.noOpenEditor
+            }
+            switch task {
+            case .pronunciation(let style):
+                let updated = AIStudyWorkflowService.mergedPronunciations(
+                    in: draft, items: items, style: style, modelName: modelName
+                )
+                return try await self.service.applyBatchPronunciations(updated)
+            case .translation(let targetLanguage):
+                let updated = AIStudyWorkflowService.mergedTranslations(
+                    in: draft, items: items, language: targetLanguage
+                )
+                return try await self.service.applyBatchTranslations(
+                    updated, language: targetLanguage
+                )
+            }
         }
     }
 }

@@ -9,6 +9,7 @@ struct FloatingLyricsView: View {
     let onClose: () -> Void
     var onPresentMainWindow: () -> Void = {}
     @AppStorage(LyricsPanelView.translationsSettingKey) private var showsTranslations = true
+    @AppStorage(LyricsPanelView.pronunciationsSettingKey) private var showsPronunciations = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.accessibilitySwitchControlEnabled) private var switchControlEnabled
@@ -85,12 +86,14 @@ struct FloatingLyricsView: View {
     private func lyricsContent(onContentChange: @escaping () -> Void) -> some View {
         if let panel = model.lyricsPanel {
             ObservedFloatingLyricsContent(model: model, panel: panel, showsTranslations: showsTranslations,
+                                         showsPronunciations: showsPronunciations,
                                          onContentChange: onContentChange)
         } else {
             FloatingLyricsText(presentation: FloatingLyricsPresentation.resolve(
                 snapshot: model.snapshot, panel: nil,
                 display: model.lyricsCoordinator?.currentDisplay() ?? .empty,
-                showsTranslations: showsTranslations
+                showsTranslations: showsTranslations,
+                showsPronunciations: showsPronunciations
             ), onContentChange: onContentChange)
         }
     }
@@ -160,13 +163,15 @@ private struct ObservedFloatingLyricsContent: View {
     @ObservedObject var model: AppModel
     @ObservedObject var panel: LyricsPanelModel
     let showsTranslations: Bool
+    let showsPronunciations: Bool
     let onContentChange: () -> Void
 
     var body: some View {
         FloatingLyricsText(presentation: FloatingLyricsPresentation.resolve(
             snapshot: model.snapshot, panel: panel,
             display: model.lyricsCoordinator?.currentDisplay() ?? .empty,
-            showsTranslations: showsTranslations
+            showsTranslations: showsTranslations,
+            showsPronunciations: showsPronunciations
         ), onContentChange: onContentChange)
     }
 }
@@ -175,13 +180,20 @@ private struct FloatingLyricsText: View {
     let presentation: FloatingLyricsPresentation
     let onContentChange: () -> Void
     @ScaledMetric(relativeTo: .title2) private var originalSize = CGFloat(FloatingLyricsSettings.defaultFontSize)
+    @ScaledMetric(relativeTo: .body) private var pronunciationSize = CGFloat(FloatingLyricsSettings.defaultPronunciationFontSize)
     @ScaledMetric(relativeTo: .body) private var translationSize = CGFloat(FloatingLyricsSettings.defaultTranslationFontSize)
     @AppStorage(FloatingLyricsSettings.fontSizePreferenceKey)
     private var fontSize = FloatingLyricsSettings.defaultFontSize
+    @AppStorage(LyricsPronunciationDisplaySettings.fontSizePreferenceKey)
+    private var pronunciationFontSize = LyricsPronunciationDisplaySettings.defaultFontSize
     @AppStorage(FloatingLyricsSettings.characterSpacingPreferenceKey)
     private var characterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
     private var normalizedFontSize: CGFloat { CGFloat(FloatingLyricsSettings.normalizedFontSize(fontSize)) }
     private var fontScale: CGFloat { normalizedFontSize / CGFloat(FloatingLyricsSettings.defaultFontSize) }
+    private var normalizedPronunciationSize: CGFloat {
+        let configured = CGFloat(LyricsPronunciationDisplaySettings.normalizedFontSize(pronunciationFontSize))
+        return pronunciationSize * (configured / CGFloat(FloatingLyricsSettings.defaultPronunciationFontSize)) * fontScale
+    }
     private var normalizedCharacterSpacing: CGFloat { CGFloat(FloatingLyricsSettings.normalizedCharacterSpacing(characterSpacing)) }
     // 延续原默认排版；字距只影响文字测量，不改变纵向层次。
     private static let wrappedLineSpacing: CGFloat = 3
@@ -197,6 +209,14 @@ private struct FloatingLyricsText: View {
                         VStack(spacing: Self.translationSpacing) {
                             Text(line.text).tracking(normalizedCharacterSpacing)
                                 .font(.system(size: originalSize * fontScale, weight: .semibold))
+                            if let pronunciation = line.pronunciation {
+                                Text(pronunciation).tracking(normalizedCharacterSpacing)
+                                    .font(.system(size: normalizedPronunciationSize, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.76))
+                                if line.pronunciationNeedsReview {
+                                    Text("注音待复核").font(.caption2).foregroundStyle(.orange)
+                                }
+                            }
                             if let translation = line.translation {
                                 Text(translation).tracking(normalizedCharacterSpacing)
                                     .font(.system(size: translationSize * fontScale, weight: .medium))
@@ -225,6 +245,7 @@ private struct FloatingLyricsText: View {
         .onChange(of: presentation) { _, _ in onContentChange() }
         .onChange(of: normalizedCharacterSpacing) { _, _ in onContentChange() }
         .onChange(of: normalizedFontSize) { _, _ in onContentChange() }
+        .onChange(of: pronunciationFontSize) { _, _ in onContentChange() }
     }
 
     private func message(_ text: String) -> some View {

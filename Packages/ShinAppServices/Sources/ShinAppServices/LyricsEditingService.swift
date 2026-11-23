@@ -40,11 +40,11 @@ public actor LyricsEditingService {
     static let maxUndoEntries = 100
 
     private let store: GRDBLyricsStore
-    private var phase: Phase = .idle
+    var phase: Phase = .idle
     /// 基线：打开时（或上次成功保存后）的文档快照。
     private var baseDocument: LyricDocument?
     /// 工作草稿：所有编辑只发生在这里。
-    private var workingDocument: LyricDocument?
+    var workingDocument: LyricDocument?
     private var undoStack: [LyricDocument] = []
     private var redoStack: [LyricDocument] = []
     /// 连续同类编辑的合并键（如 "text:<lineId>"）；nil 表示不合并。
@@ -135,11 +135,13 @@ public actor LyricsEditingService {
             }
             guard document.lines[index].text != text else { return }
             document.lines[index].text = text
-            // 原文变化：该行已有译文全部标待复核（键快照后再改值，避免边遍历边写）。
+            // 原文变化：该行已有译文、注音与学习笔记全部标待复核。
             let translationKeys = Array(document.lines[index].translations.keys)
             for key in translationKeys {
                 document.lines[index].translations[key]?.needsReview = true
             }
+            document.lines[index].pronunciation?.needsReview = true
+            document.lines[index].studyNote?.needsReview = true
         }
     }
 
@@ -331,7 +333,7 @@ public actor LyricsEditingService {
     // MARK: - 内部
 
     /// 行查找唯一入口：按稳定 id，绝不用数组下标当身份。
-    private static func lineIndex(
+    static func lineIndex(
         of lineId: UUID, in document: LyricDocument
     ) -> Array<LyricLine>.Index? {
         document.lines.firstIndex { $0.id == lineId }
@@ -339,7 +341,7 @@ public actor LyricsEditingService {
 
     /// 统一的变更入口：拷贝草稿 → 变换 → 无变化则 no-op（不产生历史），
     /// 否则按合并键压栈/合并、清空重做分支、更新工作副本。
-    private func mutate(
+    func mutate(
         coalesceKey: String?,
         _ transform: (inout LyricDocument) throws -> Void
     ) async throws -> LyricsEditingSnapshot {

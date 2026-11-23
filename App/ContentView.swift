@@ -3,27 +3,27 @@ import ShinAppleKit
 
 /// 浏览位置与展示模式独立；窄窗临时显示小播放器，放大后恢复原浏览位置。
 struct ContentView: View {
-    private enum Presentation: String { case browser, nowPlaying, compact }
+    enum Presentation: String { case browser, nowPlaying, compact }
     private static let lyricsRailWidth: CGFloat = 260
     private static let floatingPlayerMargin: CGFloat = 16
-    @EnvironmentObject private var model: AppModel
-    @Environment(\.openWindow) private var openWindow
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @StateObject private var windowController = PlayerWindowController()
-    @State private var selection: SidebarPage = .music(.recent)
-    @State private var presentation: Presentation
-    @State private var compactReturn: Presentation
+    @EnvironmentObject var model: AppModel
+    @Environment(\.openWindow) var openWindow
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
+    @StateObject var windowController = PlayerWindowController()
+    @State var selection: SidebarPage = .music(.recent)
+    @State var presentation: Presentation
+    @State var compactReturn: Presentation
     private let preferences: UserDefaults
     @AppStorage("player.hasSavedPresentation") private var hasSavedPresentation = false
-    @State private var windowWidth: CGFloat = 1180
+    @State var windowWidth: CGFloat = 1180
     @State private var floatingPlayerHeight: CGFloat = 0
-    @State private var previousPages: [SidebarPage] = []
-    @State private var showsPlaybackList = false
-    @State private var showsStatusBar = false
-    @State private var searchFocusRequest: UUID?
-    @State private var trackRevealRequest: MusicLibraryTrackReveal?
-    @State private var revealTask: Task<Void, Never>?
-    @AppStorage("player.showLibraryLyrics") private var showsLibraryLyrics = true
+    @State var previousPages: [SidebarPage] = []
+    @State var showsPlaybackList = false
+    @State var showsStatusBar = false
+    @State var searchFocusRequest: UUID?
+    @State var trackRevealRequest: MusicLibraryTrackReveal?
+    @State var revealTask: Task<Void, Never>?
+    @AppStorage("player.showLibraryLyrics") var showsLibraryLyrics = true
     var floatingLyricsWindow: FloatingLyricsWindowController?
     var menuRouter: MusicWindowMenuRouter?
 
@@ -42,23 +42,24 @@ struct ContentView: View {
         Binding(get: { selection }, set: { selectPage($0) })
     }
 
-    private var musicDestination: MusicLibraryDestination? {
+    var musicDestination: MusicLibraryDestination? {
         if case let .music(destination) = selection { return destination }
         return nil
     }
 
-    private var isBrowsing: Bool {
+    var isBrowsing: Bool {
         expandedPresentation == .browser && windowWidth >= PlayerWindowController.compactBreakpoint
     }
 
-    private var libraryLyricsVisible: Bool {
+    var libraryLyricsVisible: Bool {
         let sidebarWidth = windowWidth >= 900 ? SidebarView.width : 0
         return isBrowsing && showsLibraryLyrics && windowWidth - sidebarWidth >= 740
     }
 
-    private var hasPresentedSheet: Bool {
+    var hasPresentedSheet: Bool {
         model.isImportPresented || model.isLyricsFetchPresented
             || model.isLyricsEditorPresented || model.isLibraryPresented
+            || model.isAIStudyPreviewPresented || model.isAIKeyPointsPresented
     }
 
     var body: some View {
@@ -71,7 +72,6 @@ struct ContentView: View {
                 if hasSidebar {
                     SidebarView(selection: selectionBinding, browser: model.musicLibraryBrowser,
                                 onEditLyrics: { model.beginLyricsEditing() },
-                                onNowPlaying: { showNowPlaying() },
                                 topContentInset: geometry.safeAreaInsets.top)
                 }
                 if usesCompact {
@@ -125,6 +125,12 @@ struct ContentView: View {
         .sheet(isPresented: $model.isLyricsEditorPresented, onDismiss: { model.finishLyricsEditing() }, content: {
             if let editor = model.lyricsEditor { LyricsEditorView(model: editor) { model.requestCloseLyricsEditor() } }
         })
+        .sheet(isPresented: $model.isAIStudyPreviewPresented, onDismiss: { model.finishAIStudyPreview() }, content: {
+            if let previewModel = model.aiStudyPreviewModel { AIStudyPreviewView(model: previewModel) }
+        })
+        .sheet(isPresented: $model.isAIKeyPointsPresented, onDismiss: { model.finishAIKeyPoints() }, content: {
+            if let keyPointsModel = model.aiKeyPointsModel { AIKeyPointsView(model: keyPointsModel) }
+        })
         .onAppear {
             configureMainWindowPresentation()
             if hasPresentedSheet { expandForSheet(true) }
@@ -133,6 +139,8 @@ struct ContentView: View {
         .onChange(of: model.isLyricsFetchPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLibraryPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: model.isLyricsEditorPresented) { _, shown in expandForSheet(shown) }
+        .onChange(of: model.isAIStudyPreviewPresented) { _, shown in expandForSheet(shown) }
+        .onChange(of: model.isAIKeyPointsPresented) { _, shown in expandForSheet(shown) }
         .onChange(of: presentation) { _, mode in
             preferences.set(mode.rawValue, forKey: "player.presentationMode")
             if mode != .browser { showsPlaybackList = false }
@@ -142,6 +150,11 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .shinSelectLibraryPage)) { _ in openPage(.library) }
         .onReceive(NotificationCenter.default.publisher(for: .shinSelectAudioLinkImportPage)) { _ in openPage(.audioLinkImport) }
+        .onReceive(NotificationCenter.default.publisher(for: .shinSelectSettingsPage)) { notification in
+            let category = notification.object as? SettingsCategory ?? .aiStudy
+            preferences.set(category.rawValue, forKey: SettingsCategory.preferenceKey)
+            openPage(.settings)
+        }
         .onDisappear { cancelTrackReveal() }
     }
 
@@ -213,6 +226,17 @@ struct ContentView: View {
         case .library:
             if let library = model.library {
                 LyricsLibraryView(library: library, isEmbedded: true, bottomContentInset: bottomInset)
+            } else {
+                libraryUnavailable
+            }
+        case .vocabulary:
+            if let store = model.lyricsStore {
+                VocabularyBookContainerView(
+                    store: store,
+                    model: model,
+                    bottomContentInset: bottomInset
+                )
+                .id(ObjectIdentifier(store))
             } else {
                 libraryUnavailable
             }
@@ -302,184 +326,4 @@ struct ContentView: View {
 private struct FloatingPlayerHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
-extension ContentView {
-    /// 浮窗只展示已知主窗；主窗关闭后由同一个 WindowGroup 重建并沿用已有 sheet。
-    private func configureMainWindowPresentation() {
-        let action = openWindow
-        let controller = windowController
-        floatingLyricsWindow?.presentMainWindow = { [weak controller] in
-            if controller?.presentAttachedWindow() != true {
-                action(id: PlayerWindowController.mainWindowGroupID)
-            }
-        }
-    }
-
-    private func openPage(_ page: SidebarPage) {
-        returnToBrowser()
-        selectPage(page)
-    }
-
-    private func selectPage(_ page: SidebarPage, remember: Bool = true, fromReveal: Bool = false) {
-        if !fromReveal { cancelTrackReveal() }
-        guard selection != page else { return }
-        if remember { previousPages.append(selection) }
-        searchFocusRequest = nil
-        selection = page
-        if page == .audioLinkImport { model.prepareAudioLinkImportPage() }
-        if case let .music(destination) = page { model.musicLibraryBrowser.select(destination) }
-    }
-
-    private func returnToBrowser() {
-        if presentation == .compact || windowWidth < PlayerWindowController.compactBreakpoint {
-            windowController.showExpanded(reduceMotion: reduceMotion)
-        }
-        presentation = .browser
-    }
-
-    private func showNowPlaying() {
-        cancelTrackReveal()
-        if presentation == .compact || windowWidth < PlayerWindowController.compactBreakpoint {
-            windowController.showExpanded(reduceMotion: reduceMotion)
-        }
-        presentation = .nowPlaying
-    }
-
-    private func toggleLibraryLyrics(isVisible: Bool) {
-        showsLibraryLyrics = !isVisible
-        let hasSidebar = windowWidth >= 900
-        if !isVisible && windowWidth - (hasSidebar ? SidebarView.width : 0) < 740 {
-            windowController.showExpanded(reduceMotion: reduceMotion)
-        }
-    }
-
-    private func expandBeforeAction(_ action: () -> Void) {
-        if windowWidth < 900 {
-            windowController.showExpanded(reduceMotion: true)
-            if presentation == .compact { presentation = compactReturn }
-        }
-        action()
-    }
-
-    private func expandForSheet(_ shown: Bool) { if shown { expandBeforeAction({}) } }
-
-    private var libraryUnavailable: some View {
-        VStack(spacing: 8) {
-            Text("本地歌词库不可用。").font(.headline)
-            Text(model.lyricsDatabaseNote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func windowMenuActions(_ browser: MusicLibraryBrowserModel) -> MusicWindowMenuActions {
-        let destination = musicDestination
-        let isSelectedBrowser = destination == browser.destination
-        let playlistSort: MusicLibraryPlaylistSort?
-        if case .playlist = destination, isSelectedBrowser, !browser.isFolder {
-            playlistSort = browser.playlistSort
-        } else {
-            playlistSort = nil
-        }
-        let canGoBack = !isBrowsing && presentation != .browser
-            || isSelectedBrowser && browser.selectedGroupID != nil || !previousPages.isEmpty
-        let find: (() -> Void)? = isSelectedBrowser && !browser.isFolder ? { focusLibrarySearch() } : nil
-        let status: (() -> Void)? = destination != nil ? { toggleStatusBar() } : nil
-        let reveal: () -> Void = { revealCurrentTrack() }
-        let back: (() -> Void)? = canGoBack ? { goBack() } : nil
-        return MusicWindowMenuActions(
-            windowID: ObjectIdentifier(windowController),
-            destination: destination, playlists: browser.playlists, playlistSort: playlistSort,
-            isPlaybackListVisible: isBrowsing && showsPlaybackList, areLyricsVisible: libraryLyricsVisible,
-            isStatusBarVisible: isBrowsing && destination != nil && showsStatusBar,
-            selectDestination: { openPage(.music($0)) },
-            changePlaylistSort: { sort in
-                guard musicDestination == destination, destination == browser.destination, !browser.isFolder else { return }
-                browser.setPlaylistSort(sort)
-            },
-            findInList: find, togglePlaybackList: { togglePlaybackList() }, toggleLyrics: { toggleLyricsFromMenu() },
-            toggleStatusBar: status, revealCurrentTrack: reveal, goBack: back,
-            importAudioFromLink: { openPage(.audioLinkImport) }
-        )
-    }
-
-    private func focusLibrarySearch() {
-        cancelTrackReveal()
-        returnToBrowser()
-        searchFocusRequest = UUID()
-    }
-
-    private func togglePlaybackList() {
-        let wasVisible = isBrowsing && showsPlaybackList
-        returnToBrowser()
-        showsPlaybackList = !wasVisible
-    }
-
-    private func toggleLyricsFromMenu() {
-        let wasVisible = libraryLyricsVisible
-        returnToBrowser()
-        toggleLibraryLyrics(isVisible: wasVisible)
-    }
-
-    private func toggleStatusBar() {
-        returnToBrowser()
-        showsStatusBar.toggle()
-    }
-
-    private func goBack() {
-        cancelTrackReveal()
-        if !isBrowsing && presentation != .browser {
-            returnToBrowser()
-        } else if musicDestination == model.musicLibraryBrowser.destination,
-                  model.musicLibraryBrowser.selectedGroupID != nil {
-            model.musicLibraryBrowser.selectGroup(nil)
-        } else if let previous = previousPages.popLast() {
-            returnToBrowser()
-            selectPage(previous, remember: false)
-        }
-    }
-
-    private func revealCurrentTrack() {
-        cancelTrackReveal()
-        guard let trackKey = model.snapshot.trackKey else { return }
-        let browser = model.musicLibraryBrowser
-        returnToBrowser()
-        if musicDestination == browser.destination, browser.hasTrackRow(trackKey) {
-            trackRevealRequest = MusicLibraryTrackReveal(destination: browser.destination, trackKey: trackKey)
-            return
-        }
-        let originalPage = selection
-        let originalGroup = browser.selectedGroupID
-        let originalSearch = browser.searchText
-        revealTask = Task { @MainActor in
-            let source = try? await browser.browsingService?.currentPlaybackSource()
-            guard !Task.isCancelled, selection == originalPage, browser.selectedGroupID == originalGroup,
-                  browser.searchText == originalSearch, presentation == .browser, !hasPresentedSheet,
-                  model.snapshot.trackKey == trackKey else { return }
-            var destinations: [MusicLibraryDestination] = [.songs]
-            if case let .playlist(id) = source, browser.playlists.contains(where: { $0.id == id && !$0.isFolder }) {
-                destinations.insert(.playlist(id), at: 0)
-            }
-            for (index, destination) in destinations.enumerated() {
-                selectPage(.music(destination), remember: index == 0, fromReveal: true)
-                if !browser.searchText.isEmpty { browser.searchText = "" }
-                let search = browser.searchText
-                await browser.waitForTrackRows()
-                guard !Task.isCancelled, musicDestination == destination, browser.destination == destination,
-                      browser.searchText == search, presentation == .browser, !hasPresentedSheet,
-                      model.snapshot.trackKey == trackKey else { return }
-                if browser.hasTrackRow(trackKey) {
-                    trackRevealRequest = MusicLibraryTrackReveal(destination: destination, trackKey: trackKey)
-                    return
-                }
-            }
-            model.playbackMessage = "当前歌曲暂未出现在已同步的资料库中。"
-        }
-    }
-
-    private func cancelTrackReveal() {
-        revealTask?.cancel()
-        revealTask = nil
-        trackRevealRequest = nil
-    }
 }

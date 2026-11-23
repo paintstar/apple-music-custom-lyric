@@ -107,6 +107,8 @@ public enum BackupParser {
         try requireTimestamp(file.exportedAt, path: "root.exportedAt")
         try validateDocuments(file.documents)
         try validateBindings(file.bindings, documentIds: Set(file.documents.map { $0.id }))
+        let entryIds = try validateVocabularyEntries(file.vocabularyEntries ?? [])
+        try validateVocabularyOccurrences(file.vocabularyOccurrences ?? [], entryIds: entryIds)
     }
 
     private static func validateDocuments(_ documents: [LyricDocument]) throws {
@@ -118,6 +120,14 @@ public enum BackupParser {
             }
             try requireTimestamp(document.createdAt, path: "\(path).createdAt")
             try requireTimestamp(document.updatedAt, path: "\(path).updatedAt")
+            for (lineIndex, line) in document.lines.enumerated() {
+                if let studyNote = line.studyNote {
+                    try requireTimestamp(
+                        studyNote.updatedAt,
+                        path: "\(path).lines[\(lineIndex)].studyNote.updatedAt"
+                    )
+                }
+            }
             guard !seenIds.contains(document.id) else {
                 throw rejection(.duplicateDocumentId(document.id))
             }
@@ -126,6 +136,55 @@ public enum BackupParser {
             let issues = LyricSchemaValidator.issues(in: document)
             if !issues.isEmpty {
                 throw rejection(.schemaIssues(issues))
+            }
+        }
+    }
+
+    private static func validateVocabularyEntries(
+        _ entries: [VocabularyEntry]
+    ) throws -> Set<UUID> {
+        var seenIds = Set<UUID>()
+        for (index, entry) in entries.enumerated() {
+            let path = "root.vocabularyEntries[\(index)]"
+            try requireTimestamp(entry.createdAt, path: "\(path).createdAt")
+            try requireTimestamp(entry.updatedAt, path: "\(path).updatedAt")
+            guard !seenIds.contains(entry.id) else {
+                throw rejection(.wrongType(
+                    path: "\(path).id",
+                    expected: "唯一生词条 id（重复：\(entry.id.uuidString)）"
+                ))
+            }
+            seenIds.insert(entry.id)
+        }
+        return seenIds
+    }
+
+    private static func validateVocabularyOccurrences(
+        _ occurrences: [VocabularyOccurrence],
+        entryIds: Set<UUID>
+    ) throws {
+        var seenIds = Set<UUID>()
+        for (index, occurrence) in occurrences.enumerated() {
+            let path = "root.vocabularyOccurrences[\(index)]"
+            try requireTimestamp(occurrence.createdAt, path: "\(path).createdAt")
+            guard occurrence.utf16Location >= 0 else {
+                throw rejection(.wrongType(path: "\(path).utf16Location", expected: "非负整数"))
+            }
+            guard occurrence.utf16Length >= 0 else {
+                throw rejection(.wrongType(path: "\(path).utf16Length", expected: "非负整数"))
+            }
+            guard !seenIds.contains(occurrence.id) else {
+                throw rejection(.wrongType(
+                    path: "\(path).id",
+                    expected: "唯一生词出处 id（重复：\(occurrence.id.uuidString)）"
+                ))
+            }
+            seenIds.insert(occurrence.id)
+            guard entryIds.contains(occurrence.entryId) else {
+                throw rejection(.wrongType(
+                    path: "\(path).entryId",
+                    expected: "备份内存在的生词条 id（\(occurrence.entryId.uuidString)）"
+                ))
             }
         }
     }
@@ -205,10 +264,13 @@ public enum BackupParser {
     ) -> BackupFile {
         let allowed = file.settings.filter { configuration.settingAllowlist.contains($0.key) }
         return BackupFile(
+            schemaVersion: file.schemaVersion,
             exportedAt: file.exportedAt,
             documents: file.documents,
             bindings: file.bindings,
-            settings: allowed
+            settings: allowed,
+            vocabularyEntries: file.vocabularyEntries,
+            vocabularyOccurrences: file.vocabularyOccurrences
         )
     }
 

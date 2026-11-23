@@ -7,11 +7,12 @@ import ShinAppleKit
 // 结构上不存在 token、密钥、Apple 用户身份、音频等字段。
 
 /// 备份文件顶层模型（BackupFile JSON，schemaVersion 独立于文档 schema）。
-/// v2：绑定支持 `music-script:persistent:` 身份
-/// （`track` 可缺省、新增 `persistentId`）；导入端同时接受 v1。
+/// v2：绑定支持 `music-script:persistent:` 身份（`track` 可缺省、新增 `persistentId`）；
+/// v3：支持逐行学习注记（`pronunciation` / `studyNote`）与生词本快照（`vocabularyEntries` /
+/// `vocabularyOccurrences`）；导入端同时接受 v1、v2 与 v3。
 public struct BackupFile: Codable, Equatable, Sendable {
     /// 备份格式版本；未来版本由导入端拒绝（原库不动）。
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
     /// 可导入的最旧版本（v1：全目录身份绑定）。
     public static let oldestSupportedSchemaVersion = 1
 
@@ -22,19 +23,27 @@ public struct BackupFile: Codable, Equatable, Sendable {
     public var bindings: [BackupBinding]
     /// 仅白名单键（BackupConfiguration.settingAllowlist）。
     public var settings: [String: String]
+    /// v3：生词本词条（v1/v2 备份缺省为 nil）。
+    public var vocabularyEntries: [VocabularyEntry]?
+    /// v3：生词本语境出处快照（v1/v2 备份缺省为 nil）。
+    public var vocabularyOccurrences: [VocabularyOccurrence]?
 
     init(
         schemaVersion: Int = BackupFile.currentSchemaVersion,
         exportedAt: String,
         documents: [LyricDocument],
         bindings: [BackupBinding],
-        settings: [String: String]
+        settings: [String: String],
+        vocabularyEntries: [VocabularyEntry]? = nil,
+        vocabularyOccurrences: [VocabularyOccurrence]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.exportedAt = exportedAt
         self.documents = documents
         self.bindings = bindings
         self.settings = settings
+        self.vocabularyEntries = vocabularyEntries
+        self.vocabularyOccurrences = vocabularyOccurrences
     }
 }
 
@@ -135,6 +144,8 @@ public struct BackupLimits: Equatable, Sendable {
     /// JSON 嵌套深度上限（含未知键下的内容，防御恶意构造）。
     public var maxDepth: Int
     public var maxUnknownArrayLength: Int
+    public var maxVocabularyEntries: Int
+    public var maxVocabularyOccurrences: Int
 
     public static let standard = BackupLimits(
         maxBytes: 2 * 1024 * 1024,
@@ -143,7 +154,9 @@ public struct BackupLimits: Equatable, Sendable {
         maxTotalLines: 10_000,
         maxSettingsEntries: 256,
         maxDepth: 32,
-        maxUnknownArrayLength: 10_000
+        maxUnknownArrayLength: 10_000,
+        maxVocabularyEntries: 20_000,
+        maxVocabularyOccurrences: 50_000
     )
 
     public init(
@@ -153,7 +166,9 @@ public struct BackupLimits: Equatable, Sendable {
         maxTotalLines: Int,
         maxSettingsEntries: Int,
         maxDepth: Int,
-        maxUnknownArrayLength: Int
+        maxUnknownArrayLength: Int,
+        maxVocabularyEntries: Int = 20_000,
+        maxVocabularyOccurrences: Int = 50_000
     ) {
         self.maxBytes = maxBytes
         self.maxDocuments = maxDocuments
@@ -162,6 +177,8 @@ public struct BackupLimits: Equatable, Sendable {
         self.maxSettingsEntries = maxSettingsEntries
         self.maxDepth = maxDepth
         self.maxUnknownArrayLength = maxUnknownArrayLength
+        self.maxVocabularyEntries = maxVocabularyEntries
+        self.maxVocabularyOccurrences = maxVocabularyOccurrences
     }
 }
 
@@ -202,12 +219,27 @@ public struct BackupParseResult: Equatable, Sendable {
 }
 
 /// 当前库状态的纯值快照，供纯函数冲突预览使用（UI 也可自行构造/比对）。
-/// 使用编译器合成的 memberwise 初始化器。
 public struct BackupStoreSnapshot: Equatable, Sendable {
     public var documents: [UUID: LyricDocument]
     /// key 为 trackKey。
     public var bindings: [String: SongBinding]
     public var settings: [String: String]
+    public var vocabularyEntries: [UUID: VocabularyEntry]
+    public var vocabularyOccurrences: [UUID: VocabularyOccurrence]
+
+    public init(
+        documents: [UUID: LyricDocument],
+        bindings: [String: SongBinding],
+        settings: [String: String],
+        vocabularyEntries: [UUID: VocabularyEntry] = [:],
+        vocabularyOccurrences: [UUID: VocabularyOccurrence] = [:]
+    ) {
+        self.documents = documents
+        self.bindings = bindings
+        self.settings = settings
+        self.vocabularyEntries = vocabularyEntries
+        self.vocabularyOccurrences = vocabularyOccurrences
+    }
 }
 
 /// 预览：将被替换的文档（现有 → 传入）。
@@ -228,6 +260,28 @@ public struct BackupSettingReplacement: Equatable, Sendable {
     public var incoming: String
 }
 
+/// 预览：将被替换的生词条（现有 → 传入）。
+public struct BackupVocabularyEntryReplacement: Equatable, Sendable {
+    public var existing: VocabularyEntry
+    public var incoming: VocabularyEntry
+
+    public init(existing: VocabularyEntry, incoming: VocabularyEntry) {
+        self.existing = existing
+        self.incoming = incoming
+    }
+}
+
+/// 预览：将被替换的生词出处（现有 → 传入）。
+public struct BackupVocabularyOccurrenceReplacement: Equatable, Sendable {
+    public var existing: VocabularyOccurrence
+    public var incoming: VocabularyOccurrence
+
+    public init(existing: VocabularyOccurrence, incoming: VocabularyOccurrence) {
+        self.existing = existing
+        self.incoming = incoming
+    }
+}
+
 /// 冲突预览（纯函数结果）：确认后提交将新增/替换的内容。
 /// 与备份一致且库中已相同的条目是 no-op，不出现。
 public struct BackupConflictPreview: Equatable, Sendable {
@@ -237,6 +291,34 @@ public struct BackupConflictPreview: Equatable, Sendable {
     public var bindingReplacements: [BackupBindingReplacement]
     public var settingsToWrite: [String: String]
     public var settingsToReplace: [String: BackupSettingReplacement]
+    public var vocabularyEntriesToAdd: [VocabularyEntry]
+    public var vocabularyEntriesToReplace: [BackupVocabularyEntryReplacement]
+    public var vocabularyOccurrencesToAdd: [VocabularyOccurrence]
+    public var vocabularyOccurrencesToReplace: [BackupVocabularyOccurrenceReplacement]
+
+    public init(
+        documentsToAdd: [LyricDocument],
+        documentReplacements: [BackupDocumentReplacement],
+        bindingsToAdd: [SongBinding],
+        bindingReplacements: [BackupBindingReplacement],
+        settingsToWrite: [String: String],
+        settingsToReplace: [String: BackupSettingReplacement],
+        vocabularyEntriesToAdd: [VocabularyEntry] = [],
+        vocabularyEntriesToReplace: [BackupVocabularyEntryReplacement] = [],
+        vocabularyOccurrencesToAdd: [VocabularyOccurrence] = [],
+        vocabularyOccurrencesToReplace: [BackupVocabularyOccurrenceReplacement] = []
+    ) {
+        self.documentsToAdd = documentsToAdd
+        self.documentReplacements = documentReplacements
+        self.bindingsToAdd = bindingsToAdd
+        self.bindingReplacements = bindingReplacements
+        self.settingsToWrite = settingsToWrite
+        self.settingsToReplace = settingsToReplace
+        self.vocabularyEntriesToAdd = vocabularyEntriesToAdd
+        self.vocabularyEntriesToReplace = vocabularyEntriesToReplace
+        self.vocabularyOccurrencesToAdd = vocabularyOccurrencesToAdd
+        self.vocabularyOccurrencesToReplace = vocabularyOccurrencesToReplace
+    }
 
     /// 没有任何写入（备份与库完全一致）。
     public var isEmpty: Bool {
@@ -246,6 +328,10 @@ public struct BackupConflictPreview: Equatable, Sendable {
             && bindingReplacements.isEmpty
             && settingsToWrite.isEmpty
             && settingsToReplace.isEmpty
+            && vocabularyEntriesToAdd.isEmpty
+            && vocabularyEntriesToReplace.isEmpty
+            && vocabularyOccurrencesToAdd.isEmpty
+            && vocabularyOccurrencesToReplace.isEmpty
     }
 }
 

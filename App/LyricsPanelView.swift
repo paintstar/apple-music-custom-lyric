@@ -29,6 +29,10 @@ struct LyricsPanelView: View {
 
     /// 「显示译文」的 UserDefaults 键（@AppStorage；不进歌词库设置表）。
     static let translationsSettingKey = "lyrics.showTranslations"
+    /// 「显示注音」的 UserDefaults 键（@AppStorage；与设置页、悬浮窗互通）。
+    static let pronunciationsSettingKey = AISettingsSectionView.pronunciationsSettingKey
+    /// 「盲听挖空自测模式（Cloze）」的 UserDefaults 键（@AppStorage）。
+    static let clozeModeSettingKey = "lyrics.clozeMode"
 
     var body: some View {
         if let panel = model.lyricsPanel {
@@ -62,6 +66,10 @@ private struct ObservedLyricsPanelView: View {
     /// 域，key 见 `translationsSettingKey`（README 有说明；不入歌词库备份）。
     @AppStorage(LyricsPanelView.translationsSettingKey)
     private var showTranslations = true
+    @AppStorage(LyricsPanelView.pronunciationsSettingKey)
+    private var showPronunciations = true
+    @AppStorage(LyricsPanelView.clozeModeSettingKey)
+    private var isClozeMode = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: headerTrailing == nil ? 8 : 16) {
@@ -82,6 +90,9 @@ private struct ObservedLyricsPanelView: View {
             if phase == .active {
                 panel.refreshSyncFromForeground()
             }
+        }
+        .onChange(of: panel.currentDocumentId) { _, newDocumentId in
+            model.lyricsStudy?.reconcileDocument(id: newDocumentId)
         }
     }
 
@@ -168,6 +179,10 @@ private struct ObservedLyricsPanelView: View {
                         model.beginLyricsEditing()
                     }
                     .disabled(!model.canBeginLyricsEditing)
+                    Button("AI 生成注音 / 译文…") {
+                        model.beginAIStudyPreview()
+                    }
+                    .disabled(!model.canBeginAIStudyPreview)
                     unlinkButton
                 }
             }
@@ -225,10 +240,15 @@ private struct ObservedLyricsPanelView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            if panel.activeABLoop != nil || panel.pendingLoopAnchorLineId != nil {
+                ABLoopStatusBanner(panel: panel)
+            }
             SyncLyricsArea(
                 document: document,
                 panel: panel,
                 showTranslations: showTranslations,
+                showPronunciations: showPronunciations,
+                isClozeMode: isClozeMode,
                 reduceMotion: reduceMotion,
                 onTapLine: { [expected = model.snapshot] lineId in
                     if let target = panel.seekPosition(forLineId: lineId) {
@@ -252,6 +272,10 @@ private struct ObservedLyricsPanelView: View {
                 },
                 waitingIsPlaying: model.snapshot.status == .playing && model.pendingSeek == nil
                     && !panel.isTransitioning && !panel.isAutoScrollSuspended,
+                studyModel: model.lyricsStudy,
+                onToggleSingleLineLoop: { lineId in model.toggleSingleLineLoop(lineId: lineId) },
+                onSetABLoopAnchor: { lineId in model.setABLoopAnchor(lineId: lineId) },
+                onCompleteABLoop: { lineId in model.completeABLoop(endLineId: lineId) },
                 menu: {
                     if showsInlineMenu, headerTrailing == nil { lyricsMenu }
                 }
@@ -263,6 +287,11 @@ private struct ObservedLyricsPanelView: View {
         SyncLyricsMenu(
             panel: panel,
             showTranslations: $showTranslations,
+            showPronunciations: $showPronunciations,
+            isClozeMode: $isClozeMode,
+            onToggleCurrentLineLoop: { model.toggleCurrentLineLoop() },
+            onAIStudy: { model.beginAIStudyPreview() },
+            onAIKeyPoints: { model.beginAIKeyPoints() },
             onUnlink: { unlinkRequest = LyricsUnlinkRequest(model: model) },
             onEdit: { model.beginLyricsEditing() }
         )
@@ -300,5 +329,56 @@ private struct ObservedLyricsPanelView: View {
             return prefix + "\n……其余 \(texts.count - limit) 行略"
         }
         return prefix
+    }
+}
+
+private struct ABLoopStatusBanner: View {
+    @ObservedObject var panel: LyricsPanelModel
+
+    var body: some View {
+        if let loop = panel.activeABLoop {
+            let isSingle = loop.startLineId == loop.endLineId
+            let summary = isSingle
+                ? "🔁 单句循环中：\(Self.snippet(loop.startLineText)) · 点击退出"
+                : "🔁 AB 复读中：\(Self.snippet(loop.startLineText)) → \(Self.snippet(loop.endLineText)) · 点击退出"
+            pillButton(text: summary, tint: Color.appleMusicPink.opacity(0.84), help: "点击退出单句或 AB 循环复读")
+        } else if panel.pendingLoopAnchorLineId != nil {
+            pillButton(
+                text: "📍 已设起点 A · 请右键目标行设终点 B（点击取消）",
+                tint: Color.orange.opacity(0.78),
+                help: "点击取消待定的 AB 复读起点 A"
+            )
+        }
+    }
+
+    private func pillButton(text: String, tint: Color, help: String) -> some View {
+        Button {
+            panel.clearABLoop()
+        } label: {
+            Text(text)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(tint, in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.white.opacity(0.24), lineWidth: 0.75)
+                }
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(text)
+    }
+
+    private static func snippet(_ text: String) -> String {
+        let singleLine = text
+            .components(separatedBy: .newlines)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !singleLine.isEmpty else { return "当前句" }
+        return singleLine.count <= 14 ? singleLine : String(singleLine.prefix(14)) + "…"
     }
 }

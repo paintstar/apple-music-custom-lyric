@@ -22,6 +22,9 @@ struct LyricsEditorView: View {
 
     @State private var showCloseConfirm = false
     @State private var showDiscardConfirm = false
+    @State private var aiStudyPreviewModel: AIStudyPreviewModel?
+    @State private var isAIStudyPresented = false
+    @State private var isPreparingAIStudy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -72,6 +75,14 @@ struct LyricsEditorView: View {
         } message: {
             Text("歌词将恢复为打开编辑器（或上次保存）时的内容；本机歌词库不变。")
         }
+        .sheet(isPresented: $isAIStudyPresented, onDismiss: {
+            aiStudyPreviewModel?.invalidate()
+            aiStudyPreviewModel = nil
+        }, content: {
+            if let previewModel = aiStudyPreviewModel {
+                AIStudyPreviewView(model: previewModel)
+            }
+        })
     }
 
     // MARK: - 头部
@@ -82,6 +93,11 @@ struct LyricsEditorView: View {
                 Text("编辑歌词").font(.title3.weight(.semibold))
                 dirtyBadge
                 Spacer()
+                Button("✨ AI 生成注音 / 译文…") {
+                    Task { await openAIStudyPreview() }
+                }
+                .disabled(!model.isEditing || model.isSaving || isPreparingAIStudy)
+                .help("基于当前编辑草稿批量生成注音或译文，预览确认后写入草稿")
                 Text("共 \(model.lineCount) 行　·　库内版本 r\(model.snapshot?.baseRevision ?? 0)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -92,6 +108,28 @@ struct LyricsEditorView: View {
                     .foregroundStyle(.orange)
             }
         }
+    }
+
+    private func openAIStudyPreview() async {
+        guard !isPreparingAIStudy, model.isEditing else { return }
+        isPreparingAIStudy = true
+        defer { isPreparingAIStudy = false }
+        guard let draft = await model.currentWorkingDocument(), model.isEditing else { return }
+        let previewModel = AIStudyPreviewModel(
+            store: model.store,
+            document: draft,
+            songTitle: draft.metadata["ti"]?.first,
+            artist: draft.metadata["ar"]?.first,
+            commitTarget: .editorDraft { items, task, modelName in
+                await model.applyAIStudyPreview(items: items, task: task, modelName: modelName)
+            },
+            isMock: model.isMock,
+            onApplied: {
+                isAIStudyPresented = false
+            }
+        )
+        aiStudyPreviewModel = previewModel
+        isAIStudyPresented = true
     }
 
     @ViewBuilder
@@ -199,6 +237,16 @@ private struct EditorLineRow: View {
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
                 .font(.body)
+            HStack(spacing: 6) {
+                TextField("注音（留空表示无注音）", text: bindingForPronunciation)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout)
+                if let style = model.pronunciationStyle(of: line.id) {
+                    Text(style.displayName)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
             TextField(
                 "译文（简体中文，留空表示无译文）",
                 text: bindingForTranslation
@@ -231,6 +279,12 @@ private struct EditorLineRow: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .help("该行没有起始时间，只静态显示，不参与同步高亮")
+            }
+            if line.pronunciation?.needsReview == true {
+                Text("注音待复核")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("原文已修改，请核对注音后重新保存")
             }
             if line.translations[LyricsEditorModel.translationLanguage]?.needsReview == true {
                 Text("待复核")
@@ -285,6 +339,19 @@ private struct EditorLineRow: View {
         Binding(
             get: { model.text(of: line.id) },
             set: { model.setLineText(lineId: line.id, to: $0) }
+        )
+    }
+
+    private var bindingForPronunciation: Binding<String> {
+        Binding(
+            get: { model.pronunciation(of: line.id) },
+            set: {
+                model.setPronunciation(
+                    lineId: line.id,
+                    style: model.pronunciationStyle(of: line.id),
+                    to: $0
+                )
+            }
         )
     }
 

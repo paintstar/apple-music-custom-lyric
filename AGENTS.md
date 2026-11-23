@@ -16,7 +16,8 @@ ShinApple 是 macOS 歌曲语言学习播放器。官方「音乐」App 负责�
 
 - 播放自动化只使用 Music.app 公开脚本词典与 Apple 官方支持的 AppleScript、NSAppleScript、osascript 或 Scripting Bridge。禁止私有 MediaRemote 等未公开播放 API，禁止读取、录制、下载或分发受保护音频。
 - `Packages/ShinMusicScript` 是唯一允许发送 Music Apple Events 的模块。UI 与服务层通过项目协议使用播放能力；固定脚本和受验证参数，不把歌词、歌名等用户文本拼接为可执行代码。
-- `Packages/ShinLyricsProvider` 是唯一允许发送 HTTP 的模块，端点 host 集中定义，限于 `music.163.com` 和 `interface3.music.163.com`。只查询歌曲信息、歌词与翻译，匿名访问，不读存登录凭据，不绕过受限内容。
+- `Packages/ShinLyricsProvider` 是唯一允许访问网易云音乐 HTTP 端点的歌词获取模块，端点 host 集中定义，限于 `music.163.com` 和 `interface3.music.163.com`。只查询歌曲信息、歌词与翻译，匿名访问，不读存登录凭据，不绕过受限内容。
+- `Packages/ShinAIProvider` 是唯一允许向用户配置的 OpenAI 兼容 HTTPS 或本机回环 HTTP 端点发起学习文本请求的模块（仅 `OpenAICompatibleClient.swift` 允许持有与调用 `URLSession`）。API Key 仅存于 macOS 钥匙串（`com.shinapple.ai-credentials`），不进入本地库、日志、UserDefaults 或导出备份；提示词仅传递必要的歌词文本、译文与曲目名称，不读传音乐库清单或 Cookie。
 - `Packages/ShinAppServices/Sources/ShinAppServices/AudioLinkImportService.swift` 是唯一允许使用 `Foundation.Process` 的文件，仅用于通过参数数组（禁止 shell 拼接）调用本机安装的 `yt-dlp` 与 `ffmpeg` 完成链接音频下载、元数据写入及本地导入「音乐」资料库的前置准备；入库仍经 `Packages/ShinMusicScript` 的公开 Apple Events 完成。
 - 仅按用户选择向 `yt-dlp` 透传 `--cookies-from-browser` 或 `--cookies` 文件路径，应用本身不读取、解析、日志输出或持久化 Cookie 内容。
 - 网易云歌词端点并非官方公开 API，解析失败应明确报告，不能猜测返回结构。获取请求串行限速，自动获取只由用户配置的播放列表成员变化触发。
@@ -28,14 +29,16 @@ ShinApple 是 macOS 歌曲语言学习播放器。官方「音乐」App 负责�
 - `ShinAppleKit` 领域模型和 `ShinLyricsEngine` 不依赖 UI、播放系统、数据库或网络。新学习功能也应保持文本逻辑与播放、UI 分离。
 - 存储集中于 `ShinAppleData`，使用事务、revision 和显式增量迁移；GRDB 精确锁定 7.7.0。文档与绑定原子写入，导入默认不覆盖旧资料，任何失败不得清库或重建用户数据库。
 - 本地学习资料以 UUID 为主键，Music persistent ID 等仅是带来源命名空间的外部引用，不当作 Apple Music 目录 ID。不按歌名自动合并或永久关联；缺少可靠标识时由用户确认。
-- 歌词行使用稳定 UUID，翻译及后续注音绑定行 ID 与文本 revision，不用数组下标。重复词语的不同位置分别处理。
+- 歌词行使用稳定 UUID，翻译、逐行注音与整句学习笔记绑定行 ID 与文本 revision，不用数组下标；原文修改后相应译文、注音与学习笔记标为待复核。重复词语的不同位置分别处理，生词出处按行 ID 与 UTF-16 词段偏移定位并保留原文快照。
 - 播放快照中的位置是权威时间，不能用计时器累加冒充进度。展示层只允许基于最近有效样本做有上限的单调时钟插值，新样本立即校正；未知值使用 nil，不显示为 0。
-- 内部时间为整数毫秒，`userDelayMs > 0` 表示延后，文件 offset 独立保存；渲染、跳转和导出共用同一转换逻辑。
+- 内部时间为整数毫秒，`userDelayMs > 0` 表示延后，文件 offset 独立保存；渲染、跳转、AB 复读区间和导出共用同一转换逻辑。
 - 异步结果必须检查生命周期和请求顺序（epoch、seq 或等价机制）。切歌、取消导入或切换文档后，旧结果不得覆盖新状态；定时器、监听与动画可取消、可清理。
-- 后续 AI 功能必须由用户主动触发、预览后接受，不随切歌调用或静默覆盖人工成果。文本注音不代表歌手实际演唱读法，不读取音频推断唱法。
+- 离线本机词典（`CoreServices.DictionaryServices` + `NaturalLanguage`）默认零网络响应划词查询；AI 学习功能（逐行注音、整句解析、生词语境解析、全曲重点词汇提炼）均遵守人工成果优先原则，必须由用户主动触发、预览或确认后写入并校验 `expectedRevision` 与稳定 `lineId`，不随切歌调用或静默覆盖人工成果。文本注音仅基于歌词文字生成，不代表歌手实际演唱唱法，不读取音频推断唱法。
+- 生词本（`vocabularyEntry` / `vocabularyOccurrence`）、单句/AB 选段复读与盲听生词挖空（Cloze）复用权威播放快照与临时绘制属性；AB 复读按当前曲目键、`trackEpoch` 与文档 ID 评估回跳，不独立计时。
 
 ## 验证与隐私
 
+- 本地源码按七个 Swift 包组织：`ShinAppleKit`（领域模型与协议）、`ShinLyricsEngine`（纯时间轴索引与分段查询）、`ShinAppleData`（GRDB/SQLite 存储、迁移与备份）、`ShinAppServices`（业务工作流、本机离线词典与链接音频导入）、`ShinMusicScript`（唯一 Music Apple Events 适配）、`ShinLyricsProvider`（唯一网易云歌词 HTTP 获取）与 `ShinAIProvider`（唯一 OpenAI 兼容学习文本请求与钥匙串凭据存储）。
 - 测试、截图、示例只使用原创虚构内容；不提交真实用户歌词、音乐库清单、凭据或个人环境文件。HTTP 测试通过注入会话与 URLProtocol 拦截，默认不访问真实网络。
 - 系统接口有疑问时先查本机脚本词典和官方文档。终端脚本可用不代表打包 App 已获权限，相关变更分别验证终端与 App。
 - 执行适用的 lint、typecheck、单元测试、集成检查、GUI 检查和构建。真实 Music 授权、播放和在线接口联测不进入无人值守 CI；自动化通过不等于真实环境通过，未执行如实标注。

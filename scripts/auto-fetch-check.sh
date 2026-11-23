@@ -26,7 +26,7 @@ APP_BUILD="$APP_PACKAGE_BUILD/$ARCH-apple-macosx/debug"
 MUSIC_BUILD="$MUSIC_PACKAGE_BUILD/$ARCH-apple-macosx/debug"
 PROVIDER_BUILD="$PROVIDER_PACKAGE_BUILD/$ARCH-apple-macosx/debug"
 OBJECTS=()
-for module in ShinAppServices ShinAppleData ShinAppleKit ShinLyricsEngine GRDB; do
+for module in ShinAppServices ShinAppleData ShinAppleKit ShinLyricsEngine ShinAIProvider GRDB; do
     OBJECTS+=("$APP_BUILD/$module.build/"*.o)
 done
 for module in ShinMusicScript ShinMSObjC; do

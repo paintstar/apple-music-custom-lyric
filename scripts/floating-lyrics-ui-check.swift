@@ -455,7 +455,7 @@ private struct FloatingLyricsUICheck {
                 .font(.callout).padding(12)
             Divider()
             HStack(alignment: .top, spacing: 0) {
-                SettingsPageView(bottomContentInset: 0).environmentObject(model)
+                SettingsPageView(initialCategory: .display, bottomContentInset: 0).environmentObject(model)
                 Divider()
                 FloatingLyricsSettingsPopover(model: model, onFetch: {}, onImport: {})
             }

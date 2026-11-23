@@ -256,136 +256,6 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
         }
     }
 
-    // MARK: - 备份
-
-    /// 导出完整备份（权威无损出口）。同一 Date 参数下输出字节确定
-    /// （sortedKeys + 确定性排序），便于 diff 与测试。
-    public func exportBackup(at date: Date = Date()) async throws -> Data {
-        let snapshot = try await currentSnapshot()
-        let documents = snapshot.documents.values
-            .sorted { $0.id.uuidString < $1.id.uuidString }
-        let bindings = snapshot.bindings.values
-            .sorted { $0.trackKey < $1.trackKey }
-            .map { BackupBinding(from: $0) }
-        let settings = snapshot.settings
-            .filter { backupConfiguration.settingAllowlist.contains($0.key) }
-        let file = BackupFile(
-            exportedAt: LyricTimestamp.string(from: date),
-            documents: Array(documents),
-            bindings: bindings,
-            settings: settings
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(file)
-    }
-
-    /// 当前库的纯值快照（冲突预览的输入）。
-    public func currentSnapshot() async throws -> BackupStoreSnapshot {
-        try await performRead { db in
-            var documents: [UUID: LyricDocument] = [:]
-            for row in try LyricDocumentRow.fetchAll(db) {
-                guard let id = row.documentId else {
-                    throw CorruptRowError(reason: "lyricDocument.id 不是合法 UUID：\(row.id)")
-                }
-                documents[id] = try row.decodeDocument()
-            }
-            var bindings: [String: SongBinding] = [:]
-            for row in try SongBindingRow.fetchAll(db) {
-                bindings[row.trackKey] = try row.songBinding()
-            }
-            let settings = try SettingRow.fetchAll(db)
-            return BackupStoreSnapshot(
-                documents: documents,
-                bindings: bindings,
-                settings: Dictionary(uniqueKeysWithValues: settings.map { ($0.key, $0.value) })
-            )
-        }
-    }
-
-    /// 解析备份字节（不写库）。抛 invalidBackup（类型化拒绝原因）。
-    public func parseBackup(
-        _ data: Data,
-        configuration: BackupConfiguration? = nil
-    ) throws -> BackupParseResult {
-        try BackupParser.parse(data, configuration: configuration ?? backupConfiguration)
-    }
-
-    /// 冲突预览：读取当前快照 + 纯函数计算。
-    public func backupConflictPreview(
-        for parsed: BackupParseResult
-    ) async throws -> BackupConflictPreview {
-        let snapshot = try await currentSnapshot()
-        return BackupPlanner.conflictPreview(parsed: parsed, currentState: snapshot)
-    }
-
-    /// 重新导入同一首歌的预览（确认界面数据源）。
-    public func reimportPreview(
-        incomingDocument: LyricDocument,
-        binding: SongBinding
-    ) async throws -> ReimportPreview {
-        try Self.validateBindingShape(binding, referencedDocument: incomingDocument.id)
-        let trackKey = binding.trackKey
-        return try await performRead { db in
-            let currentRow = try SongBindingRow.fetchOne(db, key: trackKey)
-            let currentBinding = try currentRow?.songBinding()
-            var replacedDocument: LyricDocument?
-            var otherBindings: [SongBinding] = []
-            if let current = currentBinding {
-                let oldId = current.lyricDocumentId.uuidString
-                replacedDocument = try LyricDocumentRow.fetchOne(db, key: oldId)?.decodeDocument()
-                let rows = try SongBindingRow
-                    .filter(Column("lyricDocumentId") == oldId)
-                    .fetchAll(db)
-                otherBindings = try rows
-                    .filter { $0.trackKey != trackKey }
-                    .map { try $0.songBinding() }
-            }
-            return BackupPlanner.reimportPreview(
-                incomingDocument: incomingDocument,
-                incomingBinding: binding,
-                currentBinding: currentBinding,
-                replacedDocument: replacedDocument,
-                otherBindingsForReplacedDocument: otherBindings
-            )
-        }
-    }
-
-    /// 用户确认后单事务提交。提交前对每个文档做防御性 schema 校验；
-    /// 绑定直接按备份内容 upsert（备份对同 id 文档/同键绑定是权威替换，
-    /// 预览已展示将替换的内容）。备份中不存在的本地数据不受影响。
-    public func importBackup(_ parsed: BackupParseResult) async throws {
-        for document in parsed.file.documents {
-            let issues = LyricSchemaValidator.issues(in: document)
-            guard issues.isEmpty else {
-                throw ShinAppleDataError.invalidDocument(issues)
-            }
-        }
-        let documents = parsed.file.documents
-        let bindings = parsed.file.bindings.map { $0.songBinding }
-        let settings = parsed.file.settings.sorted(by: { $0.key < $1.key })
-        try await performWrite { db in
-            for document in documents {
-                var documentRow = try LyricDocumentRow(from: document)
-                try documentRow.save(db)
-            }
-            for binding in bindings {
-                guard try LyricDocumentRow.fetchOne(db, key: binding.lyricDocumentId.uuidString) != nil else {
-                    // 防御：手工构造的 ParseResult 绕过了导入前校验。
-                    throw ShinAppleDataError.invalidBackup(
-                        .danglingBinding(documentId: binding.lyricDocumentId)
-                    )
-                }
-                var bindingRow = SongBindingRow(from: binding)
-                try bindingRow.save(db)
-            }
-            for (key, value) in settings {
-                var settingRow = SettingRow(key: key, value: value)
-                try settingRow.save(db)
-            }
-        }
-    }
-
     // MARK: - 保存核心（事务 + 失败注入点）
 
     func performSave(
@@ -427,11 +297,9 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
         }
     }
 
-    // 校验函数移至 GRDBLyricsStore+Validation.swift（文件/类型长度约束）。
-
     // MARK: - 错误包装
 
-    private func performRead<T: Sendable>(
+    func performRead<T: Sendable>(
         _ body: @Sendable (Database) throws -> T
     ) async throws -> T {
         do {
@@ -445,6 +313,155 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
 
     static func describe(_ error: Error) -> String {
         "\(String(describing: type(of: error))): \(error.localizedDescription)"
+    }
+}
+
+// MARK: - 备份
+
+public extension GRDBLyricsStore {
+
+    /// 导出完整备份（权威无损出口）。同一 Date 参数下输出字节确定
+    /// （sortedKeys + 确定性排序），便于 diff 与测试。
+    func exportBackup(at date: Date = Date()) async throws -> Data {
+        let snapshot = try await currentSnapshot()
+        let documents = snapshot.documents.values
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+        let bindings = snapshot.bindings.values
+            .sorted { $0.trackKey < $1.trackKey }
+            .map { BackupBinding(from: $0) }
+        let settings = snapshot.settings
+            .filter { backupConfiguration.settingAllowlist.contains($0.key) }
+        let vocabularyEntries = snapshot.vocabularyEntries.values
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+        let vocabularyOccurrences = snapshot.vocabularyOccurrences.values
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+        let file = BackupFile(
+            exportedAt: LyricTimestamp.string(from: date),
+            documents: Array(documents),
+            bindings: bindings,
+            settings: settings,
+            vocabularyEntries: vocabularyEntries.isEmpty ? nil : vocabularyEntries,
+            vocabularyOccurrences: vocabularyOccurrences.isEmpty ? nil : vocabularyOccurrences
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(file)
+    }
+
+    /// 当前库的纯值快照（冲突预览的输入）。
+    func currentSnapshot() async throws -> BackupStoreSnapshot {
+        try await performRead { db in
+            var documents: [UUID: LyricDocument] = [:]
+            for row in try LyricDocumentRow.fetchAll(db) {
+                guard let id = row.documentId else {
+                    throw CorruptRowError(reason: "lyricDocument.id 不是合法 UUID：\(row.id)")
+                }
+                documents[id] = try row.decodeDocument()
+            }
+            var bindings: [String: SongBinding] = [:]
+            for row in try SongBindingRow.fetchAll(db) {
+                bindings[row.trackKey] = try row.songBinding()
+            }
+            let settings = try SettingRow.fetchAll(db)
+            let vocabulary = try Self.fetchVocabularySnapshot(in: db)
+            return BackupStoreSnapshot(
+                documents: documents,
+                bindings: bindings,
+                settings: Dictionary(uniqueKeysWithValues: settings.map { ($0.key, $0.value) }),
+                vocabularyEntries: vocabulary.entries,
+                vocabularyOccurrences: vocabulary.occurrences
+            )
+        }
+    }
+
+    /// 解析备份字节（不写库）。抛 invalidBackup（类型化拒绝原因）。
+    func parseBackup(
+        _ data: Data,
+        configuration: BackupConfiguration? = nil
+    ) throws -> BackupParseResult {
+        try BackupParser.parse(data, configuration: configuration ?? backupConfiguration)
+    }
+
+    /// 冲突预览：读取当前快照 + 纯函数计算。
+    func backupConflictPreview(
+        for parsed: BackupParseResult
+    ) async throws -> BackupConflictPreview {
+        let snapshot = try await currentSnapshot()
+        return BackupPlanner.conflictPreview(parsed: parsed, currentState: snapshot)
+    }
+
+    /// 重新导入同一首歌的预览（确认界面数据源）。
+    func reimportPreview(
+        incomingDocument: LyricDocument,
+        binding: SongBinding
+    ) async throws -> ReimportPreview {
+        try Self.validateBindingShape(binding, referencedDocument: incomingDocument.id)
+        let trackKey = binding.trackKey
+        return try await performRead { db in
+            let currentRow = try SongBindingRow.fetchOne(db, key: trackKey)
+            let currentBinding = try currentRow?.songBinding()
+            var replacedDocument: LyricDocument?
+            var otherBindings: [SongBinding] = []
+            if let current = currentBinding {
+                let oldId = current.lyricDocumentId.uuidString
+                replacedDocument = try LyricDocumentRow.fetchOne(db, key: oldId)?.decodeDocument()
+                let rows = try SongBindingRow
+                    .filter(Column("lyricDocumentId") == oldId)
+                    .fetchAll(db)
+                otherBindings = try rows
+                    .filter { $0.trackKey != trackKey }
+                    .map { try $0.songBinding() }
+            }
+            return BackupPlanner.reimportPreview(
+                incomingDocument: incomingDocument,
+                incomingBinding: binding,
+                currentBinding: currentBinding,
+                replacedDocument: replacedDocument,
+                otherBindingsForReplacedDocument: otherBindings
+            )
+        }
+    }
+
+    /// 用户确认后单事务提交。提交前对每个文档做防御性 schema 校验；
+    /// 绑定直接按备份内容 upsert（备份对同 id 文档/同键绑定是权威替换，
+    /// 预览已展示将替换的内容）。备份中不存在的本地数据不受影响。
+    func importBackup(_ parsed: BackupParseResult) async throws {
+        for document in parsed.file.documents {
+            let issues = LyricSchemaValidator.issues(in: document)
+            guard issues.isEmpty else {
+                throw ShinAppleDataError.invalidDocument(issues)
+            }
+        }
+        let documents = parsed.file.documents
+        let bindings = parsed.file.bindings.map { $0.songBinding }
+        let settings = parsed.file.settings.sorted(by: { $0.key < $1.key })
+        let vocabularyEntries = parsed.file.vocabularyEntries ?? []
+        let vocabularyOccurrences = parsed.file.vocabularyOccurrences ?? []
+        try await performWrite { db in
+            for document in documents {
+                var documentRow = try LyricDocumentRow(from: document)
+                try documentRow.save(db)
+            }
+            for binding in bindings {
+                guard try LyricDocumentRow.fetchOne(db, key: binding.lyricDocumentId.uuidString) != nil else {
+                    // 防御：手工构造的 ParseResult 绕过了导入前校验。
+                    throw ShinAppleDataError.invalidBackup(
+                        .danglingBinding(documentId: binding.lyricDocumentId)
+                    )
+                }
+                var bindingRow = SongBindingRow(from: binding)
+                try bindingRow.save(db)
+            }
+            for (key, value) in settings {
+                var settingRow = SettingRow(key: key, value: value)
+                try settingRow.save(db)
+            }
+            try Self.writeVocabularyBackup(
+                entries: vocabularyEntries,
+                occurrences: vocabularyOccurrences,
+                in: db
+            )
+        }
     }
 }
 
@@ -477,17 +494,4 @@ public extension GRDBLyricsStore {
             try documentRow.save(db)
         }
     }
-}
-
-/// 文档摘要（v3 摘要列；库总览不解码 payload 全文）。
-public struct DocumentSummary: Equatable, Sendable {
-    public let id: UUID
-    public let revision: Int
-    public let updatedAt: String
-    public let lineCount: Int
-    public let timedLineCount: Int
-    public var untimedLineCount: Int { lineCount - timedLineCount }
-    public let sourceOffsetMs: Int64
-    public let titleHint: String?
-    public let originalFilename: String?
 }

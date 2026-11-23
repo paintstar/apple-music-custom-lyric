@@ -288,3 +288,187 @@ struct LyricsMatchRankerTests {
         #expect(!score.isAutoHighEligible)
     }
 }
+
+@Suite("LyricsMatchRankerCrossScript")
+struct LyricsMatchRankerCrossScriptTests {
+
+    private func candidate(
+        id: Int64,
+        title: String,
+        artists: [String],
+        durationMs: Int64? = nil,
+        aliases: [String] = []
+    ) -> NeteaseSongCandidate {
+        NeteaseSongCandidate(
+            songId: id,
+            title: title,
+            artists: artists,
+            durationMs: durationMs,
+            aliases: aliases
+        )
+    }
+
+    @Test("平假名与片假名歌名和歌手名归一等价")
+    func hiraganaAndKatakanaNormalizeEqually() {
+        #expect(LyricsMatchRanker.normalizeTitle("かわきをあめく") == LyricsMatchRanker.normalizeTitle("カワキヲアメク"))
+        let score = LyricsMatchRanker.score(
+            candidate: candidate(id: 1, title: "カワキヲアメク", artists: ["テストカシュ"], durationMs: 251_000),
+            query: LyricsMatchQuery(title: "かわきをあめく", artist: "てすとかしゅ", durationMs: 251_200)
+        )
+        #expect(score.titleExact)
+        #expect(!score.titleTransliterationMatch)
+        #expect(score.artistExact)
+        #expect(score.isAutoHighEligible)
+    }
+
+    @Test("罗马音 kawakiwoameku 匹配 カワキヲアメク：高分排在翻唱前，且三证齐全可自动落位")
+    func romajiTransliterationRanksAheadOfCoverAndAutoEligibleWithDuration() {
+        let query = LyricsMatchQuery(title: "kawakiwoameku", artist: "虚拟原唱A", durationMs: 251_000)
+        let original = candidate(id: 10, title: "カワキヲアメク", artists: ["虚拟原唱A"], durationMs: 251_800)
+        let romajiCover = candidate(id: 20, title: "kawakiwoameku (Cover)", artists: ["虚拟原唱A"], durationMs: 251_000)
+        let kanaCover = candidate(id: 30, title: "カワキヲアメク（翻唱）", artists: ["虚拟翻唱B"], durationMs: 251_000)
+
+        let ranked = LyricsMatchRanker.rank(candidates: [romajiCover, kanaCover, original], query: query)
+        #expect(ranked.map(\.candidate.songId) == [10, 20, 30])
+
+        let topScore = ranked[0].score
+        #expect(!topScore.titleExact)
+        #expect(topScore.titleTransliterationMatch)
+        #expect(!topScore.titleAliasMatch)
+        #expect(topScore.totalScore == 95)
+        #expect(topScore.confidence == .high)
+        #expect(topScore.isAutoHighEligible)
+
+        let coverScore = ranked[1].score
+        #expect(!coverScore.titleTransliterationMatch)
+        #expect(coverScore.titleContains)
+        #expect(coverScore.totalScore == 75)
+        #expect(!coverScore.isAutoHighEligible)
+    }
+
+    @Test("罗马音音译匹配缺少时长或时长超差时不自动落位，降为疑似匹配")
+    func romajiTransliterationRequiresConfirmedCloseDuration() {
+        let query = LyricsMatchQuery(title: "kawakiwoameku", artist: "虚拟原唱A", durationMs: 251_000)
+        let noDuration = LyricsMatchRanker.score(
+            candidate: candidate(id: 1, title: "カワキヲアメク", artists: ["虚拟原唱A"]),
+            query: query
+        )
+        #expect(noDuration.titleTransliterationMatch)
+        #expect(noDuration.totalScore == 75)
+        #expect(!noDuration.isAutoHighEligible)
+        #expect(noDuration.confidence == .medium)
+
+        let looseDuration = LyricsMatchRanker.score(
+            candidate: candidate(id: 2, title: "カワキヲアメク", artists: ["虚拟原唱A"], durationMs: 256_000),
+            query: query
+        )
+        #expect(looseDuration.titleTransliterationMatch)
+        #expect(!looseDuration.isAutoHighEligible)
+        #expect(looseDuration.confidence == .medium)
+    }
+
+    @Test("反向音译：假名查询匹配罗马音候选标题")
+    func kanaQueryMatchesRomajiCandidateTitle() {
+        let score = LyricsMatchRanker.score(
+            candidate: candidate(id: 1, title: "KawakiwoAmeku", artists: ["虚拟原唱A"], durationMs: 251_000),
+            query: LyricsMatchQuery(title: "カワキヲアメク", artist: "虚拟原唱A", durationMs: 251_500)
+        )
+        #expect(!score.titleExact)
+        #expect(score.titleTransliterationMatch)
+        #expect(score.totalScore == 95)
+        #expect(score.isAutoHighEligible)
+    }
+
+    @Test("别名命中给 +40 且不叠加包含分、不直接触发自动落位")
+    func aliasMatchBoostsScoreWithoutAutoEligibility() {
+        let query = LyricsMatchQuery(title: "星河译名", artist: "虚拟歌手X", durationMs: 220_000)
+        let aliased = candidate(
+            id: 1,
+            title: "星河译名（虚构原题）",
+            artists: ["虚拟歌手X"],
+            durationMs: 220_000,
+            aliases: ["星河译名"]
+        )
+        let score = LyricsMatchRanker.score(candidate: aliased, query: query)
+        #expect(!score.titleExact)
+        #expect(!score.titleTransliterationMatch)
+        #expect(score.titleAliasMatch)
+        #expect(score.titleContains)
+        // 别名 +40 + 歌手 +30 + 时长 +20 = 90（不与包含 +25 叠加）
+        #expect(score.totalScore == 90)
+        #expect(!score.isAutoHighEligible)
+        #expect(score.confidence == .medium)
+    }
+
+    @Test("罗马音查询通过假名音译命中候选别名")
+    func romajiQueryMatchesKanaAlias() {
+        let query = LyricsMatchQuery(title: "kawakiwoameku", artist: "虚拟歌手X", durationMs: 220_000)
+        let aliased = candidate(
+            id: 1,
+            title: "虚构汉字主标题",
+            artists: ["虚拟歌手X"],
+            durationMs: 220_000,
+            aliases: ["カワキヲアメク"]
+        )
+        let score = LyricsMatchRanker.score(candidate: aliased, query: query)
+        #expect(!score.titleExact)
+        #expect(!score.titleTransliterationMatch)
+        #expect(score.titleAliasMatch)
+        #expect(score.totalScore == 90)
+        #expect(!score.isAutoHighEligible)
+        #expect(score.confidence == .medium)
+    }
+
+    @Test("平片假名歌名+日语歌手音译+已知近时长 → 100 分高度匹配且可自动落位")
+    func kanaTitleWithJapaneseArtistTransliterationIsHigh() {
+        let query = LyricsMatchQuery(title: "かわきをあめく", artist: "Minami", durationMs: 251_000)
+        let score = LyricsMatchRanker.score(
+            candidate: candidate(id: 1, title: "カワキヲアメク", artists: ["美波"], durationMs: 251_000),
+            query: query
+        )
+        #expect(score.titleExact)
+        #expect(!score.artistExact)
+        #expect(score.artistTransliterationMatch)
+        #expect(score.totalScore == 100)
+        #expect(score.confidence == .high)
+        #expect(score.isAutoHighEligible)
+    }
+
+    @Test("罗马音歌名+日语歌手音译三证齐全 → 高度匹配并排在罗马音翻唱之前")
+    func romajiTitleAndJapaneseArtistTransliterationBeatsCover() {
+        let query = LyricsMatchQuery(title: "Kawakiwoameku", artist: "Minami", durationMs: 251_000)
+        let original = candidate(id: 10, title: "カワキヲアメク", artists: ["美波"], durationMs: 251_000)
+        let cover = candidate(id: 20, title: "Kawaki wo Ameku", artists: ["Sati Akura"], durationMs: 252_400)
+
+        let ranked = LyricsMatchRanker.rank(candidates: [cover, original], query: query)
+        #expect(ranked.map(\.candidate.songId) == [10, 20])
+        #expect(ranked[0].score.titleTransliterationMatch)
+        #expect(ranked[0].score.artistTransliterationMatch)
+        #expect(ranked[0].score.totalScore == 95)
+        #expect(ranked[0].score.confidence == .high)
+        #expect(ranked[0].score.isAutoHighEligible)
+        #expect(!ranked[1].score.artistTransliterationMatch)
+        #expect(ranked[1].score.confidence != .high)
+        #expect(!ranked[1].score.isAutoHighEligible)
+    }
+
+    @Test("歌手音译匹配缺少时长或时长差 >3s 时不自动落位")
+    func artistTransliterationRequiresConfirmedCloseDuration() {
+        let query = LyricsMatchQuery(title: "かわきをあめく", artist: "Minami", durationMs: 251_000)
+        let noDuration = LyricsMatchRanker.score(
+            candidate: candidate(id: 1, title: "カワキヲアメク", artists: ["美波"]),
+            query: query
+        )
+        #expect(noDuration.artistTransliterationMatch)
+        #expect(!noDuration.isAutoHighEligible)
+        #expect(noDuration.confidence == .medium)
+
+        let looseDuration = LyricsMatchRanker.score(
+            candidate: candidate(id: 2, title: "カワキヲアメク", artists: ["美波"], durationMs: 255_000),
+            query: query
+        )
+        #expect(looseDuration.artistTransliterationMatch)
+        #expect(!looseDuration.isAutoHighEligible)
+        #expect(looseDuration.confidence == .medium)
+    }
+}

@@ -3,8 +3,9 @@ import ShinAppServices
 
 enum FloatingLyricsSettings {
     static let fontSizePreferenceKey = "floatingLyrics.fontSize"
-    // 保留原文 26 点、译文 17 点的默认视觉与比例。
+    // 保留原文 26 点、注音默认 16 点（与主歌词注音共享字号设置）、译文 17 点的默认视觉与比例。
     static let defaultFontSize = 26.0
+    static let defaultPronunciationFontSize = LyricsPronunciationDisplaySettings.defaultFontSize
     static let defaultTranslationFontSize = 17.0
     static let fontSizeRange: ClosedRange<Double> = 16...56
     static let fontSizeStep = 1.0
@@ -32,6 +33,8 @@ enum FloatingLyricsActions {
             || model.isLyricsFetchPresented
             || model.isLyricsEditorPresented
             || model.isLibraryPresented
+            || model.isAIStudyPreviewPresented
+            || model.isAIKeyPointsPresented
     }
 
     static func fetch(_ model: AppModel, presentMainWindow: () -> Void) {
@@ -57,6 +60,8 @@ struct FloatingLyricsSettingsPopover: View {
     private var fontSize = FloatingLyricsSettings.defaultFontSize
     @AppStorage(FloatingLyricsSettings.characterSpacingPreferenceKey)
     private var characterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
+    @AppStorage(LyricsPanelView.pronunciationsSettingKey)
+    private var showsPronunciations = true
 
     private var characterSpacingBinding: Binding<Double> {
         Binding(get: { FloatingLyricsSettings.normalizedCharacterSpacing(characterSpacing) },
@@ -154,6 +159,10 @@ struct FloatingLyricsSettingsPopover: View {
             }
             .accessibilityIdentifier("floating-lyrics-spacing")
             Text("调整字与字之间的距离，仅作用于悬浮歌词。")
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("显示悬浮歌词注音", isOn: $showsPronunciations)
+                .accessibilityIdentifier("floating-lyrics-show-pronunciations")
+            Text("开启后，在悬浮歌词原文与译文之间显示注音。")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

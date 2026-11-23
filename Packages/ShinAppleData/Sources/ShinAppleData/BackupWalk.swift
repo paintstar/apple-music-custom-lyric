@@ -13,14 +13,23 @@ enum WalkLevel {
     /// translations 对象：键是语言代码（开放集合），值是 translation 对象。
     case translations
     case translation
+    case pronunciation
+    case studyNote
+    case studyAnnotationSource
     case binding
     case track
+    case vocabularyEntry
+    case vocabularyExample
+    case vocabularyOccurrence
     case settings
 
     var knownKeys: Set<String> {
         switch self {
         case .root:
-            return ["schemaVersion", "exportedAt", "documents", "bindings", "settings"]
+            return [
+                "schemaVersion", "exportedAt", "documents", "bindings", "settings",
+                "vocabularyEntries", "vocabularyOccurrences"
+            ]
         case .document:
             return [
                 "schemaVersion", "id", "revision", "sourceLanguage", "sourceFormat",
@@ -28,7 +37,7 @@ enum WalkLevel {
                 "lines", "createdAt", "updatedAt"
             ]
         case .line:
-            return ["id", "startMs", "text", "translations"]
+            return ["id", "startMs", "text", "translations", "pronunciation", "studyNote"]
         case .translations:
             // 语言代码是开放集合，任何键都合法。
             return []
@@ -44,6 +53,9 @@ enum WalkLevel {
         case .settings:
             // 设置键是开放集合，白名单在解析层过滤；此处无固定已知键。
             return []
+        case .pronunciation, .studyNote, .studyAnnotationSource,
+             .vocabularyEntry, .vocabularyExample, .vocabularyOccurrence:
+            return studyKnownKeys
         }
     }
 }
@@ -64,7 +76,7 @@ enum BackupWalk {
 
     /// 有状态的遍历器：limits 与 warnings 作为实例状态，
     /// 遍历方法只携带位置参数。
-    private final class Walker {
+    final class Walker {
         let limits: BackupLimits
         var warnings: [BackupWarning] = []
 
@@ -126,6 +138,10 @@ enum BackupWalk {
             level: WalkLevel,
             depth: Int
         ) throws {
+            if level.isStudyLevel {
+                try walkStudyKnownKey(key: key, value: value, path: path, level: level, depth: depth)
+                return
+            }
             switch level {
             case .root:
                 try walkRootKey(key: key, value: value, path: path, depth: depth)
@@ -139,7 +155,7 @@ enum BackupWalk {
                 try walkBindingKey(key: key, value: value, path: path, depth: depth)
             case .track:
                 try requireString(value, path: path, expected: "字符串")
-            case .translations, .settings:
+            default:
                 break // 已提前处理
             }
         }
@@ -165,11 +181,18 @@ enum BackupWalk {
                     value, path: path, elementLevel: .binding,
                     depth: depth, limit: limits.maxBindings
                 )
+            case "vocabularyEntries":
+                try walkArray(
+                    value, path: path, elementLevel: .vocabularyEntry,
+                    depth: depth, limit: limits.maxVocabularyEntries, allowNil: true
+                )
+            case "vocabularyOccurrences":
+                try walkArray(
+                    value, path: path, elementLevel: .vocabularyOccurrence,
+                    depth: depth, limit: limits.maxVocabularyOccurrences, allowNil: true
+                )
             case "settings":
-                guard let dict = value as? [String: Any] else {
-                    throw BackupRejection.wrongType(path: path, expected: "对象")
-                }
-                try walkObject(dict, path: path, level: .settings, depth: depth + 1)
+                try walkNestedObject(value, path: path, level: .settings, depth: depth, allowNil: false)
             default:
                 break // knownKeys 已过滤
             }
@@ -208,13 +231,28 @@ enum BackupWalk {
                 // 数值语义（小数/越界/非有限）由 LyricSchemaValidator 检查。
                 try requireNumberOrNil(value, path: path, expected: "整数毫秒或 null")
             case "translations":
-                guard let dict = value as? [String: Any] else {
-                    throw BackupRejection.wrongType(path: path, expected: "对象")
-                }
-                try walkObject(dict, path: path, level: .translations, depth: depth + 1)
+                try walkNestedObject(value, path: path, level: .translations, depth: depth, allowNil: false)
+            case "pronunciation":
+                try walkNestedObject(value, path: path, level: .pronunciation, depth: depth, allowNil: true)
+            case "studyNote":
+                try walkNestedObject(value, path: path, level: .studyNote, depth: depth, allowNil: true)
             default:
                 break
             }
+        }
+
+        private func walkNestedObject(
+            _ value: Any,
+            path: String,
+            level: WalkLevel,
+            depth: Int,
+            allowNil: Bool
+        ) throws {
+            if allowNil && value is NSNull { return }
+            guard let dict = value as? [String: Any] else {
+                throw BackupRejection.wrongType(path: path, expected: "对象")
+            }
+            try walkObject(dict, path: path, level: level, depth: depth + 1)
         }
 
         private func walkTranslationKey(key: String, value: Any, path: String) throws {
@@ -267,13 +305,15 @@ enum BackupWalk {
         }
 
         /// 已知数组键：条数限制 + 逐元素按层遍历。
-        private func walkArray(
+        func walkArray(
             _ value: Any,
             path: String,
             elementLevel: WalkLevel,
             depth: Int,
-            limit: Int
+            limit: Int,
+            allowNil: Bool = false
         ) throws {
+            if allowNil && value is NSNull { return }
             guard let array = value as? [Any] else {
                 throw BackupRejection.wrongType(path: path, expected: "数组")
             }
@@ -312,14 +352,14 @@ enum BackupWalk {
 
         // MARK: - 标量类型检查
 
-        private func requireInt(_ value: Any, path: String, expected: String) throws -> Int {
+        func requireInt(_ value: Any, path: String, expected: String) throws -> Int {
             guard let number = value as? NSNumber, !isBoolean(number), let int = exactInt(number) else {
                 throw BackupRejection.wrongType(path: path, expected: expected)
             }
             return int
         }
 
-        private func requireIntOrNil(_ value: Any, path: String, expected: String) throws {
+        func requireIntOrNil(_ value: Any, path: String, expected: String) throws {
             if value is NSNull { return }
             _ = try requireInt(value, path: path, expected: expected)
         }
@@ -331,18 +371,18 @@ enum BackupWalk {
             }
         }
 
-        private func requireString(_ value: Any, path: String, expected: String) throws {
+        func requireString(_ value: Any, path: String, expected: String) throws {
             guard value is String else {
                 throw BackupRejection.wrongType(path: path, expected: expected)
             }
         }
 
-        private func requireStringOrNil(_ value: Any, path: String, expected: String) throws {
+        func requireStringOrNil(_ value: Any, path: String, expected: String) throws {
             if value is NSNull { return }
             try requireString(value, path: path, expected: expected)
         }
 
-        private func requireUUID(_ value: Any, path: String) throws {
+        func requireUUID(_ value: Any, path: String) throws {
             guard let text = value as? String, UUID(uuidString: text) != nil else {
                 throw BackupRejection.invalidUUID(
                     path: path, value: (value as? String) ?? String(describing: value)

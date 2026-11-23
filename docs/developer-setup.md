@@ -1,6 +1,6 @@
 # 开发者配置
 
-工程包含一个 macOS App 和六个本地 Swift 包，部署目标为 macOS 14.0。需要完整 Xcode 26 及以上与 Swift 6；安全审计还需要 Python 3，确保 `python3` 命令可用。优先使用当前机器已配置的工具链。XcodeGen 和 SwiftLint 可通过 Homebrew 安装：
+工程包含一个 macOS App 和七个本地 Swift 包（`ShinAppleKit`、`ShinMusicScript`、`ShinLyricsEngine`、`ShinAppleData`、`ShinAppServices`、`ShinLyricsProvider`、`ShinAIProvider`），部署目标为 macOS 14.0。使用系统 SwiftUI、AppKit、Foundation、Security（钥匙串）、CoreServices（`DictionaryServices`）与 NaturalLanguage 等框架，唯一第三方源码依赖为锁定版本 7.7.0 的 GRDB.swift。需要完整 Xcode 26 及以上与 Swift 6；安全审计还需要 Python 3，确保 `python3` 命令可用。优先使用当前机器已配置的工具链。XcodeGen 和 SwiftLint 可通过 Homebrew 安装：
 
 ```bash
 brew install xcodegen swiftlint
@@ -54,7 +54,7 @@ open -n .build/xcode/Build/Products/Debug/ShinApple.app --args --mock
 bash scripts/ci-local.sh
 ```
 
-Mock 使用原创虚构数据和每次新建的临时数据库，不播放音频、不控制 Music、不访问网络。`ci-local.sh` 执行六包测试、纯播放脚本分支检查、App typecheck、SwiftLint、密钥检查、出站审计、工程生成与未签名 Release 构建。
+Mock 使用原创虚构数据和每次新建的临时数据库，不播放音频、不控制 Music、不访问真实网络，也不读写系统钥匙串中的 AI 凭据。`ci-local.sh` 执行七包单元测试（含 `ShinAIProvider`）、纯播放脚本分支检查、App typecheck、SwiftLint（`--strict --quiet`）、密钥检查、出站审计、工程生成与未签名 Release 构建。HTTP 与 AI 客户端测试均通过注入 `URLSession` 与 `URLProtocol` 拦截，默认不访问真实网络。
 
 界面改动按范围运行以下检查。GUI 检查应串行执行，避免窗口焦点冲突；首次执行省略 `--skip-build`，之后可复用已构建的依赖，包装脚本仍会编译检查程序：
 

@@ -1,4 +1,5 @@
 import Foundation
+import ShinAIProvider
 import ShinAppServices
 import ShinLyricsProvider
 
@@ -82,24 +83,51 @@ final class NeteaseLyricsFetchModel: ObservableObject {
     @Published var queryArtist = ""
     /// 可恢复错误说明（中文）；nil = 无错误。
     @Published var alertMessage: String?
+    /// 自动回退补搜说明（如补搜假名或仅搜歌名）；nil = 未触发回退。
+    @Published private(set) var searchFallbackNote: String?
+    /// AI 推测的原曲搜索建议列表（仅用户主动点击触发）。
+    @Published private(set) var aiSuggestions: [AISearchQuerySuggestion] = []
+    @Published private(set) var isSuggestingWithAI = false
+    @Published private(set) var aiSuggestionError: String?
+    @Published private(set) var aiSuggestionNeedsSettings = false
     /// 目标歌曲的本地信息（打分基准；打开时固定，不随播放变化）。
     let matchQuery: LyricsMatchQuery
     /// 导入目标（固定；取词完成后交给 ImportFlowModel 开会话）。
     let target: ImportSessionTarget
+    let isMock: Bool
     /// 取词完成回调：合并文本 + 来源注记 → 宿主转入导入预览。
     var onDelivered: ((NeteaseLyrics, FetchProvenance) -> Void)?
 
+    /// 离线日语罗马音转假名搜索建议（纯本地计算，零网络）。
+    var offlineKanaSuggestions: [String] {
+        JapaneseRomajiTransliterator.suggestedKanaQueries(for: queryTitle)
+    }
+
     private let service: any LyricsFetchServicing
+    private let aiClient: (any AIStudyProviding)?
+    private let settingsStore: AIServiceSettingsStore
+    private let credentialStore: any AICredentialStoring
     private var generation = 0
+    private var aiSuggestionGeneration = 0
+    private var aiSuggestionTask: Task<Void, Never>?
 
     init(
         service: any LyricsFetchServicing,
         matchQuery: LyricsMatchQuery,
-        target: ImportSessionTarget
+        target: ImportSessionTarget,
+        isMock: Bool = false,
+        aiClient: (any AIStudyProviding)? = nil,
+        settingsStore: AIServiceSettingsStore = AIServiceSettingsStore(),
+        credentialStore: (any AICredentialStoring)? = nil
     ) {
         self.service = service
         self.matchQuery = matchQuery
         self.target = target
+        self.isMock = isMock
+        self.aiClient = aiClient
+        self.settingsStore = settingsStore
+        self.credentialStore = credentialStore
+            ?? (isMock ? InMemoryAICredentialStore() : SystemKeychainCredentialStore())
         queryTitle = Self.prefilledTitle(matchQuery.title)
         queryArtist = matchQuery.artist ?? ""
     }
@@ -147,23 +175,85 @@ final class NeteaseLyricsFetchModel: ObservableObject {
         let currentGeneration = generation
         phase = .searching
         alertMessage = nil
+        searchFallbackNote = nil
         do {
-            let keyword = artist.isEmpty ? title : "\(title) \(artist)"
-            let candidates = try await service.searchSongs(query: keyword)
+            let query = LyricsMatchQuery(
+                title: title,
+                artist: artist.isEmpty ? nil : artist,
+                durationMs: matchQuery.durationMs
+            )
+            let outcome = try await searchWithFallback(
+                title: title,
+                artist: artist,
+                query: query,
+                generation: currentGeneration
+            )
             guard currentGeneration == generation else { return }
-            // 用本地信息重打分排序（本地信息含时长；搜索词只是查询用）。
-            let query = LyricsMatchQuery(title: title, artist: artist.isEmpty ? nil : artist,
-                                         durationMs: matchQuery.durationMs)
-            let ranked = LyricsMatchRanker.rank(candidates: candidates, query: query)
-            phase = .candidates(ranked)
-            if ranked.isEmpty {
+            searchFallbackNote = outcome.fallbackNote
+            if outcome.mergedEmpty && outcome.primaryReturnedNoResults {
+                phase = .idle
                 alertMessage = NeteaseLyricsError.noResults.userMessage
+            } else {
+                phase = .candidates(outcome.ranked)
+                if outcome.ranked.isEmpty {
+                    alertMessage = NeteaseLyricsError.noResults.userMessage
+                }
             }
         } catch {
             guard currentGeneration == generation else { return }
             phase = .idle
             alertMessage = (error as? NeteaseLyricsError)?.userMessage
                 ?? "搜索失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 填入建议关键词并立刻搜索。
+    func applySuggestionAndSearch(
+        title: String,
+        artist: String? = nil,
+        replaceArtist: Bool = false
+    ) async {
+        queryTitle = title
+        if let artist {
+            let trimmed = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty || replaceArtist {
+                queryArtist = trimmed
+            }
+        } else if replaceArtist {
+            queryArtist = ""
+        }
+        await search()
+    }
+
+    /// 清空歌手字段，仅按当前歌名重新搜索。
+    func searchTitleOnly() async {
+        queryArtist = ""
+        await search()
+    }
+
+    /// 用户主动触发：调用 AI 推测可能对应的原曲名/歌手搜索词。
+    func requestAISearchSuggestions() {
+        let title = queryTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artist = queryArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            aiSuggestionError = NeteaseLyricsError.emptyQuery.userMessage
+            aiSuggestionNeedsSettings = false
+            return
+        }
+        aiSuggestionTask?.cancel()
+        aiSuggestionGeneration += 1
+        let currentGeneration = aiSuggestionGeneration
+        isSuggestingWithAI = true
+        aiSuggestionError = nil
+        aiSuggestionNeedsSettings = false
+
+        aiSuggestionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runAISearchSuggestions(
+                title: title,
+                artist: artist.isEmpty ? nil : artist,
+                generation: currentGeneration
+            )
         }
     }
 
@@ -200,7 +290,198 @@ final class NeteaseLyricsFetchModel: ObservableObject {
     /// 关闭/取消：丢弃一切进行中的结果。
     func cancel() {
         generation += 1
+        aiSuggestionGeneration += 1
+        aiSuggestionTask?.cancel()
+        aiSuggestionTask = nil
+        isSuggestingWithAI = false
+        aiSuggestionError = nil
+        aiSuggestionNeedsSettings = false
         phase = .idle
         alertMessage = nil
+        searchFallbackNote = nil
+    }
+}
+
+private extension NeteaseLyricsFetchModel {
+    struct SearchOutcome {
+        let ranked: [RankedCandidate]
+        let mergedEmpty: Bool
+        let primaryReturnedNoResults: Bool
+        let fallbackNote: String?
+    }
+
+    func searchWithFallback(
+        title: String,
+        artist: String,
+        query: LyricsMatchQuery,
+        generation currentGeneration: Int
+    ) async throws -> SearchOutcome {
+        let keyword = artist.isEmpty ? title : "\(title) \(artist)"
+        var primaryReturnedNoResults = false
+        let primaryCandidates: [NeteaseSongCandidate]
+        do {
+            primaryCandidates = try await service.searchSongs(query: keyword)
+        } catch NeteaseLyricsError.noResults {
+            primaryCandidates = []
+            primaryReturnedNoResults = true
+        }
+        guard currentGeneration == generation else { return Self.cancelledOutcome }
+
+        var merged = primaryCandidates
+        var seenIds = Set(merged.map(\.songId))
+        var ranked = LyricsMatchRanker.rank(candidates: merged, query: query)
+        var fallbackNote: String?
+
+        if !ranked.contains(where: { $0.score.isAutoHighEligible }),
+           let kana = JapaneseRomajiTransliterator.toHiraganaIfLikelyRomaji(title) {
+            let kanaQueries = Self.kanaFallbackQueries(kana: kana, artist: artist, primaryKeyword: keyword)
+            for fallbackQuery in kanaQueries {
+                guard !ranked.contains(where: { $0.score.isAutoHighEligible }) else { break }
+                guard let added = try await appendFallbackSearch(
+                    queryText: fallbackQuery,
+                    generation: currentGeneration,
+                    merged: &merged,
+                    seenIds: &seenIds
+                ) else { return Self.cancelledOutcome }
+                if added {
+                    fallbackNote = "已自动补充搜索假名「\(fallbackQuery)」的候选"
+                }
+                ranked = LyricsMatchRanker.rank(candidates: merged, query: query)
+            }
+        }
+
+        if !Self.hasTitleHit(ranked),
+           !artist.isEmpty,
+           !ranked.contains(where: { $0.score.artistExact || $0.score.artistTransliterationMatch }) {
+            guard let added = try await appendFallbackSearch(
+                queryText: title,
+                generation: currentGeneration,
+                merged: &merged,
+                seenIds: &seenIds
+            ) else { return Self.cancelledOutcome }
+            if added, fallbackNote == nil {
+                fallbackNote = "已自动补充仅按歌名搜索的候选"
+            }
+            ranked = LyricsMatchRanker.rank(candidates: merged, query: query)
+        }
+
+        return SearchOutcome(
+            ranked: ranked,
+            mergedEmpty: merged.isEmpty,
+            primaryReturnedNoResults: primaryReturnedNoResults,
+            fallbackNote: fallbackNote
+        )
+    }
+
+    static let cancelledOutcome = SearchOutcome(
+        ranked: [], mergedEmpty: true, primaryReturnedNoResults: false, fallbackNote: nil
+    )
+
+    static func kanaFallbackQueries(kana: String, artist: String, primaryKeyword: String) -> [String] {
+        var queries: [String] = []
+        if !artist.isEmpty {
+            let kanaWithArtist = "\(kana) \(artist)"
+            if kanaWithArtist != primaryKeyword { queries.append(kanaWithArtist) }
+        }
+        if kana != primaryKeyword { queries.append(kana) }
+        return queries
+    }
+
+    func appendFallbackSearch(
+        queryText: String,
+        generation currentGeneration: Int,
+        merged: inout [NeteaseSongCandidate],
+        seenIds: inout Set<Int64>
+    ) async throws -> Bool? {
+        let candidates = try await searchAllowingNoResults(query: queryText)
+        guard currentGeneration == generation else { return nil }
+        return Self.appendUnique(candidates, to: &merged, seenIds: &seenIds)
+    }
+
+    func searchAllowingNoResults(query: String) async throws -> [NeteaseSongCandidate] {
+        do {
+            return try await service.searchSongs(query: query)
+        } catch NeteaseLyricsError.noResults {
+            return []
+        }
+    }
+
+    func runAISearchSuggestions(title: String, artist: String?, generation currentGeneration: Int) async {
+        if isMock && aiClient == nil {
+            do {
+                try await Task.sleep(for: .milliseconds(150))
+            } catch {
+                return
+            }
+            guard currentGeneration == aiSuggestionGeneration, !Task.isCancelled else { return }
+            aiSuggestions = Self.mockAISuggestions(for: title, artist: artist)
+            isSuggestingWithAI = false
+            return
+        }
+
+        let client = aiClient ?? OpenAICompatibleClient(credentialStore: credentialStore)
+        let configuration = settingsStore.load()
+        do {
+            let suggestions = try await client.suggestLyricsSearchQueries(
+                title: title,
+                artist: artist,
+                configuration: configuration,
+                apiKey: nil
+            )
+            guard currentGeneration == aiSuggestionGeneration, !Task.isCancelled else { return }
+            aiSuggestions = suggestions
+            isSuggestingWithAI = false
+        } catch is CancellationError {
+            return
+        } catch let error as AIProviderError {
+            guard currentGeneration == aiSuggestionGeneration, !Task.isCancelled else { return }
+            isSuggestingWithAI = false
+            if case .missingAPIKey = error {
+                aiSuggestionNeedsSettings = true
+            }
+            aiSuggestionError = error.userMessage
+        } catch {
+            guard currentGeneration == aiSuggestionGeneration, !Task.isCancelled else { return }
+            isSuggestingWithAI = false
+            aiSuggestionError = "AI 推测失败：\(error.localizedDescription)"
+        }
+    }
+
+    static func hasTitleHit(_ ranked: [RankedCandidate]) -> Bool {
+        ranked.contains { item in
+            item.score.titleExact
+                || item.score.titleContains
+                || item.score.titleTransliterationMatch
+                || item.score.titleAliasMatch
+        }
+    }
+
+    @discardableResult
+    static func appendUnique(
+        _ incoming: [NeteaseSongCandidate],
+        to target: inout [NeteaseSongCandidate],
+        seenIds: inout Set<Int64>
+    ) -> Bool {
+        var added = false
+        for candidate in incoming where seenIds.insert(candidate.songId).inserted {
+            target.append(candidate)
+            added = true
+        }
+        return added
+    }
+
+    static func mockAISuggestions(for title: String, artist: String?) -> [AISearchQuerySuggestion] {
+        let mockArtist = artist?.isEmpty == false ? artist : "演示歌手一"
+        let kanaList = JapaneseRomajiTransliterator.suggestedKanaQueries(for: title)
+        if kanaList.count >= 2 {
+            return [
+                AISearchQuerySuggestion(title: kanaList[1], artist: mockArtist, reason: "片假名模拟示例"),
+                AISearchQuerySuggestion(title: kanaList[0], artist: mockArtist, reason: "平假名模拟示例")
+            ]
+        }
+        return [
+            AISearchQuerySuggestion(title: "模拟原曲名", artist: mockArtist, reason: "原曲名模拟示例"),
+            AISearchQuerySuggestion(title: "模拟别名曲", artist: "演示歌手一", reason: "别名模拟示例")
+        ]
     }
 }

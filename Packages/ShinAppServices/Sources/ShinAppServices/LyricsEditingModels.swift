@@ -20,6 +20,30 @@ public struct LyricsEditingSnapshot: Equatable, Sendable {
 
     /// 提交时将写入的 revision（基线 + 1；store 的乐观并发要求）。
     public var pendingRevision: Int { baseRevision + 1 }
+
+    /// 已包含注音标注的行数。
+    public var pronunciationLineCount: Int {
+        lines.filter { $0.pronunciation != nil }.count
+    }
+
+    /// 已包含学习讲解笔记的行数。
+    public var studyNoteLineCount: Int {
+        lines.filter { $0.studyNote != nil }.count
+    }
+
+    /// 包含待复核标注（译文、注音或笔记）的行数。
+    public var needsReviewLineCount: Int {
+        lines.filter { line in
+            line.translations.values.contains { $0.needsReview }
+                || line.pronunciation?.needsReview == true
+                || line.studyNote?.needsReview == true
+        }.count
+    }
+
+    /// 按稳定行 id 查找对应行。
+    public func line(id: UUID) -> LyricLine? {
+        lines.first { $0.id == id }
+    }
 }
 
 /// 行移动方向（编辑器列表内）。

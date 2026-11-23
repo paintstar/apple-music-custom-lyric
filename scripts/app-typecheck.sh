@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PACKAGES=(ShinAppleKit ShinMusicScript ShinLyricsEngine ShinAppleData ShinAppServices ShinLyricsProvider)
+PACKAGES=(ShinAppleKit ShinMusicScript ShinLyricsEngine ShinAppleData ShinAppServices ShinLyricsProvider ShinAIProvider)
 ARCH="$(uname -m)"
 SWIFT_COMPILER="${SWIFT_EXEC:-$(xcrun --find swiftc)}"
 

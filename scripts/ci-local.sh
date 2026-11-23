@@ -1,12 +1,12 @@
 #!/bin/bash
-# 本地与 GitHub Actions 共用：六包测试、类型检查、lint、安全审计、Release 构建。
+# 本地与 GitHub Actions 共用：七包测试、类型检查、lint、安全审计、Release 构建。
 # 真实 Music 授权与播放、需要窗口焦点的 GUI 回归单独人工执行。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 START="$(date +%s)"
-PACKAGES=(ShinAppleKit ShinMusicScript ShinLyricsEngine ShinAppleData ShinAppServices ShinLyricsProvider)
+PACKAGES=(ShinAppleKit ShinMusicScript ShinLyricsEngine ShinAppleData ShinAppServices ShinLyricsProvider ShinAIProvider)
 
 for tool in git python3 swiftlint xcodegen; do
   command -v "$tool" >/dev/null || { echo "错误：缺少 $tool。" >&2; exit 1; }

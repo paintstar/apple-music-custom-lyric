@@ -1,20 +1,28 @@
 import SwiftUI
 
-// 设置页：播放权限、显示偏好、本地数据位置与自动获取。
-// - 播放来源与授权状态（含「打开自动化权限设置」出口，语义同原状态区）；
-// - 显示偏好：「显示译文」与歌词面板互通，悬浮字号和字距与浮窗设置互通；
-// - 减少动态效果：跟随系统辅助功能设置（动效实现处均已遵守），只读呈现；
-// - 本地数据：保存位置、歌词资源和备份与导出；
-// - 播放诊断：默认收起的只读播放快照。
+// 设置页：按分类标签快速定位播放与来源、歌词获取、AI 与学习、歌词显示和本地数据。
+// - 播放与来源：授权状态（含「打开自动化权限设置」出口）、退出清理及播放诊断；
+// - 歌词获取：网易云音乐自动获取总开关、列表勾选、待确认队列与记录；
+// - AI 与学习：AI 服务商、钥匙串密钥、注音偏好与划词窗口尺寸；
+// - 歌词显示：「显示译文」「显示注音」与注音字号与主歌词和浮窗互通，悬浮字号和字距与浮窗设置互通，减少动态效果跟随系统；
+// - 本地数据：保存位置、歌词资源和备份与导出。
 
 struct SettingsPageView: View {
     @EnvironmentObject private var model: AppModel
-    var bottomContentInset: CGFloat = 100
+    private let initialCategory: SettingsCategory?
+    var bottomContentInset: CGFloat
+    @AppStorage(SettingsCategory.preferenceKey)
+    private var storedCategoryRawValue = SettingsCategory.playback.rawValue
     @AppStorage(PlaybackCleanupSettings.preferenceKey)
     private var cleanupManagedPlaylistsOnQuit = PlaybackCleanupSettings.defaultEnabled
     /// 与歌词面板共享同一键（LyricsPanelView.translationsSettingKey）。
     @AppStorage(LyricsPanelView.translationsSettingKey)
     private var showTranslations = true
+    /// 与歌词面板、AI 设置页及悬浮歌词共享同一键。
+    @AppStorage(LyricsPanelView.pronunciationsSettingKey)
+    private var showPronunciations = true
+    @AppStorage(LyricsPronunciationDisplaySettings.fontSizePreferenceKey)
+    private var pronunciationFontSize = LyricsPronunciationDisplaySettings.defaultFontSize
     @AppStorage(FloatingLyricsUnlockSettings.delayPreferenceKey)
     private var floatingLyricsUnlockDelay = FloatingLyricsUnlockSettings.defaultDelay
     @AppStorage(LyricsReadingSettings.resumeDelayPreferenceKey)
@@ -24,29 +32,55 @@ struct SettingsPageView: View {
     @AppStorage(FloatingLyricsSettings.characterSpacingPreferenceKey)
     private var floatingLyricsCharacterSpacing = FloatingLyricsSettings.defaultCharacterSpacing
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var selectedCategory: SettingsCategory
     @State private var isDiagnosticsExpanded = false
     @State private var isResourceManagementPresented = false
-    /// 待确认切换的目标目录（NSOpenPanel 结果；nil = 无待确认操作）。
-    @State private var pendingSwitchDirectory: URL?
-    @State private var isRestoreDefaultConfirmVisible = false
+
+    init(initialCategory: SettingsCategory? = nil, bottomContentInset: CGFloat = 100) {
+        self.initialCategory = initialCategory
+        self.bottomContentInset = bottomContentInset
+        let persisted = SettingsCategory(
+            rawValue: UserDefaults.standard.string(forKey: SettingsCategory.preferenceKey) ?? ""
+        ) ?? .playback
+        _selectedCategory = State(initialValue: initialCategory ?? persisted)
+    }
+
+    private static let sidebarLayoutMinWidth: CGFloat = 580
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                sourceSection
-                autoFetchSection
-                displaySection
-                dataSection
-                diagnosticsSection
+        GeometryReader { geometry in
+            if geometry.size.width >= Self.sidebarLayoutMinWidth {
+                HStack(alignment: .top, spacing: 0) {
+                    SettingsNavigationSidebar(
+                        selectedCategory: selectedCategory,
+                        bottomContentInset: bottomContentInset,
+                        onSelect: selectCategory
+                    )
+                    Divider()
+                    settingsScrollContent(showsDetailHeader: true)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    SettingsCompactNavigationBar(
+                        selectedCategory: selectedCategory,
+                        onSelect: selectCategory
+                    )
+                    settingsScrollContent(showsDetailHeader: false)
+                }
             }
-            .padding(24)
-            .frame(maxWidth: 640, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .top)
-            // 底部留出悬浮播放条空间。
-            .padding(.bottom, bottomContentInset)
         }
         .task {
             await model.autoFetch?.reloadState()
+        }
+        .onAppear {
+            if initialCategory == nil,
+               let persisted = SettingsCategory(rawValue: storedCategoryRawValue) {
+                selectedCategory = persisted
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .shinSelectSettingsPage)) { notification in
+            let target = notification.object as? SettingsCategory ?? .aiStudy
+            selectCategory(target)
         }
         .sheet(isPresented: $isResourceManagementPresented) {
             if let library = model.library {
@@ -59,10 +93,69 @@ struct SettingsPageView: View {
         }
     }
 
+    private func settingsScrollContent(showsDetailHeader: Bool) -> some View {
+        ScrollViewReader { scrollProxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if showsDetailHeader {
+                        SettingsCategoryDetailHeader(category: selectedCategory)
+                    }
+                    categoryContent
+                }
+                .padding(.horizontal, 28)
+                .padding(.top, 24)
+                .frame(maxWidth: 680, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                // 底部留出悬浮播放条空间。
+                .padding(.bottom, max(24, bottomContentInset))
+                .id("settings.scrollTop")
+            }
+            .onChange(of: selectedCategory) { _, _ in
+                scrollProxy.scrollTo("settings.scrollTop", anchor: .top)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var categoryContent: some View {
+        switch selectedCategory {
+        case .playback:
+            sourceSection
+            diagnosticsSection
+        case .autoFetch:
+            autoFetchSection
+        case .aiStudy:
+            aiStudySection
+            wordStudyWindowSection
+        case .display:
+            displaySection
+        case .data:
+            SettingsDataSectionView(isResourceManagementPresented: $isResourceManagementPresented)
+        }
+    }
+
+    private func selectCategory(_ category: SettingsCategory) {
+        guard selectedCategory != category else {
+            if storedCategoryRawValue != category.rawValue {
+                storedCategoryRawValue = category.rawValue
+            }
+            return
+        }
+        let apply = {
+            selectedCategory = category
+            storedCategoryRawValue = category.rawValue
+        }
+        if reduceMotion {
+            apply()
+        } else {
+            withAnimation(.easeInOut(duration: 0.16), apply)
+        }
+    }
+
     // MARK: - 播放来源与授权
 
     private var sourceSection: some View {
-        section(title: "播放来源") {
+        SettingsSectionCard(title: "播放来源") {
             switch model.setup {
             case .loading:
                 HStack(spacing: 8) {
@@ -101,7 +194,7 @@ struct SettingsPageView: View {
     /// 自动获取区：总开关 + 播放列表勾选 + 待确认队列 + 审计摘要。
     @ViewBuilder
     private var autoFetchSection: some View {
-        section(title: "歌词自动获取（网易云音乐）") {
+        SettingsSectionCard(title: "歌词自动获取（网易云音乐）") {
             if let autoFetch = model.autoFetch {
                 AutoFetchSettingsContent(model: autoFetch)
             } else {
@@ -111,12 +204,42 @@ struct SettingsPageView: View {
         }
     }
 
+    // MARK: - AI 学习服务
+
+    private var aiStudySection: some View {
+        SettingsSectionCard(title: "AI 学习服务") {
+            AISettingsSectionView()
+        }
+    }
+
     // MARK: - 显示
 
     private var displaySection: some View {
-        section(title: "显示") {
+        let normalizedPronunciationSize = LyricsPronunciationDisplaySettings.normalizedFontSize(pronunciationFontSize)
+        return SettingsSectionCard(title: "显示") {
             Toggle("显示简体中文译文", isOn: $showTranslations)
                 .help("开启后，在歌词下方显示简体中文译文；「待复核」标记原文修改后尚未核对的译文")
+            Toggle("显示歌词注音", isOn: $showPronunciations)
+                .help("开启后，在主歌词面板与悬浮歌词原文下方显示逐行注音")
+            HStack(spacing: 10) {
+                Stepper(value: Binding(
+                    get: { LyricsPronunciationDisplaySettings.normalizedFontSize(pronunciationFontSize) },
+                    set: { pronunciationFontSize = LyricsPronunciationDisplaySettings.normalizedFontSize($0) }
+                ), in: LyricsPronunciationDisplaySettings.fontSizeRange,
+                   step: LyricsPronunciationDisplaySettings.fontSizeStep) {
+                    Text("注音字体大小：\(formattedSetting(normalizedPronunciationSize)) 点")
+                }
+                .help("调节主歌词面板与悬浮歌词的逐行注音字号，调整立即生效")
+                if normalizedPronunciationSize != LyricsPronunciationDisplaySettings.defaultFontSize {
+                    Button("恢复默认") {
+                        pronunciationFontSize = LyricsPronunciationDisplaySettings.defaultFontSize
+                    }
+                    .controlSize(.small)
+                }
+            }
+            Text("作用于主歌词面板与悬浮歌词的逐行注音，调整立即生效。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Stepper(value: Binding(
                 get: { LyricsReadingSettings.normalized(lyricsResumeDelay) },
                 set: { lyricsResumeDelay = LyricsReadingSettings.normalized($0) }
@@ -155,167 +278,16 @@ struct SettingsPageView: View {
         value.formatted(.number.precision(.fractionLength(0...1)))
     }
 
-    // MARK: - 本地数据（含保存位置切换）
-
-    private var dataSection: some View {
-        let usesCustomLocation = !model.isMock && LyricsDatabase.storedOverrideDirectory() != nil
-        return section(title: "本地数据") {
-            VStack(alignment: .leading, spacing: 12) {
-                dataRow("保存位置", symbol: "folder") {
-                    storageLocationDetails(usesCustomLocation: usesCustomLocation)
-                } actions: {
-                    if !model.isMock {
-                        storageLocationControls(usesCustomLocation: usesCustomLocation)
-                    }
-                }
-                Divider()
-                dataRow("本地歌词资源", symbol: "tray.full") {
-                    Text("查看或清理本机保存的歌词与译文。")
-                } actions: {
-                    Button("管理资源…") { isResourceManagementPresented = true }
-                        .disabled(model.library == nil || model.isSwitchingStorage)
-                }
-                Divider()
-                dataRow("备份与导出", symbol: "archivebox") {
-                    Text("导入或导出完整 JSON 备份，也可导出 LRC 歌词。")
-                } actions: {
-                    Button("打开学习歌曲") {
-                        NotificationCenter.default.post(name: .shinSelectLibraryPage, object: nil)
-                    }
-                }
-            }
-            Text("学习资料与备份都保存在本机。卸载 App 后，数据文件仍保留。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 4)
+    private var wordStudyWindowSection: some View {
+        SettingsSectionCard(title: "划词窗口") {
+            WordStudyWindowSettingsControls()
         }
-        .alert("切换保存位置", isPresented: Binding(
-            get: { pendingSwitchDirectory != nil },
-            set: { if !$0 { pendingSwitchDirectory = nil } }
-        )) {
-            Button("切换", role: .destructive) {
-                let target = pendingSwitchDirectory
-                pendingSwitchDirectory = nil
-                guard let target else { return }
-                Task { await model.switchLyricsStorage(to: target) }
-            }
-            Button("取消", role: .cancel) {
-                pendingSwitchDirectory = nil
-            }
-        } message: {
-            Text(Self.storageSwitchExplanation)
-        }
-        .alert("恢复默认位置", isPresented: $isRestoreDefaultConfirmVisible) {
-            Button("恢复", role: .destructive) {
-                Task { await model.switchLyricsStorage(to: nil) }
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text(Self.storageSwitchExplanation)
-        }
-    }
-
-    private func dataRow<Details: View, Actions: View>(
-        _ title: String,
-        symbol: String,
-        @ViewBuilder details: () -> Details,
-        @ViewBuilder actions: () -> Actions
-    ) -> some View {
-        let heading = Text(title).font(.callout.weight(.semibold))
-        return HStack(alignment: .top, spacing: 10) {
-            Image(systemName: symbol)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-                .padding(.top, 3)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 6) {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) {
-                        heading
-                        Spacer(minLength: 0)
-                        actions().fixedSize()
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        heading
-                        actions()
-                    }
-                }
-                details()
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private static let storageSwitchExplanation =
-        "目标位置没有歌词库时会复制当前资料。已有歌词库时会直接打开该库，两个库各自保留。"
-        + "切换立即生效，原位置的数据保留。打开的导入和编辑窗口会关闭，未保存的内容将丢失。"
-
-    private func storageLocationControls(usesCustomLocation: Bool) -> some View {
-        HStack(spacing: 8) {
-            Button("更改位置…", action: chooseStorageDirectory)
-                .help("选择要使用的歌词库文件夹")
-            if usesCustomLocation {
-                Button("恢复默认位置") { isRestoreDefaultConfirmVisible = true }
-            }
-        }
-        .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
-    }
-
-    @ViewBuilder
-    private func storageLocationDetails(usesCustomLocation: Bool) -> some View {
-        if let directory = model.lyricsDatabaseDirectory {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(model.isMock ? "模拟模式 · 临时目录" : usesCustomLocation ? "自定义位置" : "默认位置")
-                Text((directory.path as NSString).abbreviatingWithTildeInPath)
-                    .font(.caption.monospaced())
-                    .textSelection(.enabled)
-                    .help(directory.path)
-                    .contextMenu {
-                        Button("复制完整路径") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(directory.path, forType: .string)
-                        }
-                    }
-            }
-        } else {
-            Text(model.lyricsDatabaseNote)
-                .textSelection(.enabled)
-        }
-        if !model.isMock {
-            if model.isSwitchingStorage {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("正在切换保存位置……")
-                }
-            }
-            if let message = model.storageSwitchMessage {
-                Text(message)
-                    .textSelection(.enabled)
-            }
-        }
-    }
-
-    /// 打开系统目录选择面板（AppKit NSOpenPanel；项目允许局部增强）。
-    private func chooseStorageDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "选择歌词数据库的保存文件夹"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        pendingSwitchDirectory = url
     }
 
     // MARK: - 播放诊断（默认收起）
 
     private var diagnosticsSection: some View {
-        section(title: "播放诊断") {
+        SettingsSectionCard(title: "播放诊断") {
             Text("用于排查播放异常和歌词不同步，查看「音乐」上报的播放状态、进度和错误码。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -329,23 +301,6 @@ struct SettingsPageView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 4)
             }
-        }
-    }
-
-    /// 分区容器（标题 + 内容卡片）。
-    private func section(
-        title: String,
-        @ViewBuilder content: () -> some View
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.headline)
-            VStack(alignment: .leading, spacing: 8) {
-                content()
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(14)
-            .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
         }
     }
 }

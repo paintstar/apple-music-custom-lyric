@@ -54,6 +54,17 @@ public struct LyricsWaitingInterval: Equatable, Sendable {
     }
 }
 
+/// 单句或 AB 句段在当前偏移下的生效播放区间 `[startMs, endMs)`（整数毫秒）。
+public struct LyricsPlaybackSegment: Equatable, Sendable {
+    public let startMs: Int64
+    public let endMs: Int64
+
+    public init(startMs: Int64, endMs: Int64) {
+        self.startMs = startMs
+        self.endMs = endMs
+    }
+}
+
 /// 时间轴查询结果。三种情形互斥，用于区分「清屏边界」与「无歌词/未知时间」。
 public enum LyricsTimelineQueryResult: Equatable, Sendable {
     /// 无当前行：首组之前、文档无可打轴行、playbackMs 为 nil 或负数、

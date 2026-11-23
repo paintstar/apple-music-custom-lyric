@@ -316,6 +316,23 @@ public final class PlaybackLyricsCoordinator: @unchecked Sendable {
         }
     }
 
+    /// 查询单句或 AB 句段在当前偏移下的生效播放区间 `[startMs, endMs)`。
+    /// 按当前已装载索引与最近快照时长实时计算，不写入数据库；
+    /// 无歌词、任一行未打轴/未知、顺序倒置、或末句缺少已知时长边界时返回 nil。
+    public func playbackSegment(
+        fromLineId startLineId: UUID,
+        toLineId endLineId: UUID
+    ) -> LyricsPlaybackSegment? {
+        state.withLock { s -> LyricsPlaybackSegment? in
+            guard let load = s.load else { return nil }
+            return load.index.playbackSegment(
+                fromLineId: startLineId,
+                toLineId: endLineId,
+                durationMs: s.lastSnapshot?.durationMs
+            )
+        }
+    }
+
     // MARK: - 内部（recompute 为静态纯函数：要求调用方持有锁）
 
     /// 整查索引并与上次通知比较；只有显示状态变化才标记 changed（组变化去抖）。

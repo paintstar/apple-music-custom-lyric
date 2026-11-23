@@ -2,10 +2,23 @@ import SwiftUI
 import ShinAppleKit
 
 // 同步歌词视图组件：歌词面板与播放器页面共用同一套同步渲染。
-// - SyncLyricsMenu：右上角「···」菜单，提供偏移、双语、编辑与解除关联；
+// - SyncLyricsMenu：右上角「···」菜单，提供回到当前歌词、偏移、双语、编辑与解除关联；
 // - SyncLyricsArea：FOLLOW/MANUAL 滚动区 + Apple Music 歌词页排版
 //   （固定行字号消除切行抖动，当前行以亮度强调，原生文本准确定位；
 //   窄窗口缩 15%，当前行锚定视口上 1/3，减少动态效果时直接定位）。
+
+/// 歌词注音显示字号偏好：主歌词面板与悬浮歌词共享同一配置。
+enum LyricsPronunciationDisplaySettings {
+    static let fontSizePreferenceKey = "lyrics.pronunciationFontSize"
+    /// 默认 16pt（窄栏缩 15% 后为 13.6pt），兼顾清晰度与行间留白。
+    static let defaultFontSize = 16.0
+    static let fontSizeRange: ClosedRange<Double> = 12...32
+    static let fontSizeStep = 1.0
+
+    static func normalizedFontSize(_ value: Double) -> Double {
+        value.isFinite ? min(max(value, fontSizeRange.lowerBound), fontSizeRange.upperBound) : defaultFontSize
+    }
+}
 
 /// 歌词行排版档位（对标 Apple Music 歌词页）：
 /// 数值为项目默认排版参数，随用户文字大小设置缩放
@@ -13,13 +26,17 @@ import ShinAppleKit
 struct LyricsTypography {
     /// 固定原文字号：切换高亮不会改变行高。
     let lineSize: CGFloat
+    /// 注音行：默认 16pt（可在设置中调整）。
+    let pronunciationSize: CGFloat
     /// 译文行：15pt。
     let translationSize: CGFloat
     /// 行内多行时的紧凑行距系数（~1.1）。
     static let lineSpacingFactor: CGFloat = 0.12
     /// 大字歌词组间留白；强调变化不改动间距。
     static let groupSpacing: CGFloat = 30
-    /// 原文与译文的间距（紧贴原文行下 4~6pt）。
+    /// 原文与注音的间距。
+    static let pronunciationSpacing: CGFloat = 3
+    /// 原文/注音与译文的间距（紧贴原文或注音行下 4~6pt）。
     static let translationSpacing: CGFloat = 4
     /// 非当前行透明度分层：相邻 0.65，线性衰减到 0.35 封底。
     static func opacity(distance: Int) -> Double {
@@ -29,11 +46,15 @@ struct LyricsTypography {
 
     /// 按可用宽度生成的实际档位：窄窗口（mini 形态）整体缩 15%。
     static func resolved(
-        line: CGFloat, translation: CGFloat, width: CGFloat
+        line: CGFloat,
+        pronunciation: CGFloat = CGFloat(LyricsPronunciationDisplaySettings.defaultFontSize),
+        translation: CGFloat,
+        width: CGFloat
     ) -> LyricsTypography {
         let factor: CGFloat = width < 520 ? 0.85 : 1.0
         return LyricsTypography(
             lineSize: line * factor,
+            pronunciationSize: pronunciation * factor,
             translationSize: translation * factor
         )
     }
@@ -69,17 +90,28 @@ extension EnvironmentValues {
 @MainActor
 enum LyricsMenuActions {
     static func items(
-        panel: LyricsPanelModel?, showTranslations: Binding<Bool>,
-        onUnlink: @escaping () -> Void, onEdit: @escaping () -> Void
+        panel: LyricsPanelModel?,
+        showTranslations: Binding<Bool>,
+        showPronunciations: Binding<Bool> = .constant(true),
+        isClozeMode: Binding<Bool> = .constant(false),
+        onToggleCurrentLineLoop: (() -> Void)? = nil,
+        onAIStudy: (() -> Void)? = nil,
+        onAIKeyPoints: (() -> Void)? = nil,
+        onUnlink: @escaping () -> Void,
+        onEdit: @escaping () -> Void
     ) -> [PlaybackMenu.Item] {
         let hasDocument = panel?.currentDocumentId != nil && panel?.isAutoScrollSuspended != true
+        let canReturnToCurrentLine = hasDocument && panel?.canReturnToCurrentLine == true
         let canAdjust = panel?.canAdjustDelay == true && hasDocument
         let delay = canAdjust ? panel?.syncDisplay.delayDescription ?? "不可用" : "不可用"
-        return [
-            .init(title: "偏移：\(delay)"),
-            .init(title: "延后 0.1 秒", symbol: "goforward.100", isEnabled: canAdjust,
+        var result: [PlaybackMenu.Item] = [
+            .init(title: "回到当前歌词", symbol: "scope", isEnabled: canReturnToCurrentLine,
+                  action: { panel?.resumeFollowing() }),
+            .separator,
+            .init(title: "偏移：\(delay)", isSectionHeader: true),
+            .init(title: "延后 0.1 秒", symbol: "goforward.plus", isEnabled: canAdjust,
                   action: { panel?.adjustDelay(byMs: LyricsPanelModel.delayStepMs) }),
-            .init(title: "提前 0.1 秒", symbol: "gobackward.100", isEnabled: canAdjust,
+            .init(title: "提前 0.1 秒", symbol: "gobackward.minus", isEnabled: canAdjust,
                   action: { panel?.adjustDelay(byMs: -LyricsPanelModel.delayStepMs) }),
             .init(title: "归零", symbol: "arrow.counterclockwise",
                   isEnabled: canAdjust && panel?.syncDisplay.userDelayMs != 0,
@@ -87,10 +119,85 @@ enum LyricsMenuActions {
             .separator,
             .init(title: "显示译文", symbol: "text.bubble", isEnabled: hasDocument,
                   isChecked: showTranslations.wrappedValue, action: { showTranslations.wrappedValue.toggle() }),
-            .separator,
-            .init(title: "编辑歌词", symbol: "square.and.pencil", isEnabled: hasDocument, action: onEdit),
-            .init(title: "解除关联", symbol: "link.slash", isEnabled: hasDocument, action: onUnlink)
+            .init(title: "显示注音", symbol: "captions.bubble", isEnabled: hasDocument,
+                  isChecked: showPronunciations.wrappedValue, action: { showPronunciations.wrappedValue.toggle() }),
+            .init(title: "盲听生词挖空", symbol: "eye.slash", isEnabled: hasDocument,
+                  isChecked: isClozeMode.wrappedValue, action: { isClozeMode.wrappedValue.toggle() }),
+            .separator
         ]
+        result.append(contentsOf: loopItems(
+            panel: panel,
+            hasDocument: hasDocument,
+            onToggleCurrentLineLoop: onToggleCurrentLineLoop
+        ))
+        result.append(.separator)
+        let aiSectionItems = aiItems(
+            hasDocument: hasDocument,
+            onAIStudy: onAIStudy,
+            onAIKeyPoints: onAIKeyPoints
+        )
+        if !aiSectionItems.isEmpty {
+            result.append(contentsOf: aiSectionItems)
+            result.append(.separator)
+        }
+        result.append(contentsOf: [
+            .init(title: "编辑歌词", symbol: "square.and.pencil", isEnabled: hasDocument, action: onEdit),
+            .init(title: "解除关联", symbol: "xmark.circle", isEnabled: hasDocument, action: onUnlink)
+        ])
+        return result
+    }
+
+    private static func loopItems(
+        panel: LyricsPanelModel?,
+        hasDocument: Bool,
+        onToggleCurrentLineLoop: (() -> Void)?
+    ) -> [PlaybackMenu.Item] {
+        let currentLineId = panel?.syncDisplay.currentLineIds?.first
+        let canLoopCurrent = hasDocument
+            && currentLineId.map { panel?.canToggleSingleLineLoop(lineId: $0) == true } == true
+            && onToggleCurrentLineLoop != nil
+        let isLoopingCurrent = currentLineId.map { panel?.isSingleLineLooping(lineId: $0) == true } == true
+        let hasLoop = hasDocument && (panel?.activeABLoop != nil || panel?.pendingLoopAnchorLineId != nil)
+        return [
+            .init(
+                title: "循环当前句",
+                symbol: "repeat.1",
+                isEnabled: canLoopCurrent,
+                isChecked: isLoopingCurrent,
+                action: { onToggleCurrentLineLoop?() }
+            ),
+            .init(
+                title: "退出 AB 循环",
+                symbol: "stop.circle",
+                isEnabled: hasLoop,
+                action: { panel?.clearABLoop() }
+            )
+        ]
+    }
+
+    private static func aiItems(
+        hasDocument: Bool,
+        onAIStudy: (() -> Void)?,
+        onAIKeyPoints: (() -> Void)?
+    ) -> [PlaybackMenu.Item] {
+        var items: [PlaybackMenu.Item] = []
+        if let onAIStudy {
+            items.append(.init(
+                title: "AI 生成注音 / 译文…",
+                symbol: "sparkles",
+                isEnabled: hasDocument,
+                action: onAIStudy
+            ))
+        }
+        if let onAIKeyPoints {
+            items.append(.init(
+                title: "提炼本曲重点词汇…",
+                symbol: "book.closed",
+                isEnabled: hasDocument,
+                action: onAIKeyPoints
+            ))
+        }
+        return items
     }
 }
 
@@ -98,17 +205,30 @@ enum LyricsMenuActions {
 struct SyncLyricsMenu: View {
     @ObservedObject var panel: LyricsPanelModel
     @Binding var showTranslations: Bool
+    @Binding var showPronunciations: Bool
+    @Binding var isClozeMode: Bool
+    var onToggleCurrentLineLoop: (() -> Void)?
+    var onAIStudy: (() -> Void)?
+    var onAIKeyPoints: (() -> Void)?
     let onUnlink: () -> Void
     let onEdit: () -> Void
     var leadingItems: [PlaybackMenu.Item] = []
     var trailingItems: [PlaybackMenu.Item] = []
     var compact = false
     var accessibilityLabel = "歌词选项"
-    var help = "偏移调整、显示译文、编辑歌词与解除关联"
+    var help = "回到当前歌词、偏移调整、显示译文、显示注音、盲听挖空、AB 循环、AI 学习、编辑与解除关联"
 
     var body: some View {
         PlaybackMenu(items: leadingItems + LyricsMenuActions.items(
-            panel: panel, showTranslations: $showTranslations, onUnlink: onUnlink, onEdit: onEdit
+            panel: panel,
+            showTranslations: $showTranslations,
+            showPronunciations: $showPronunciations,
+            isClozeMode: $isClozeMode,
+            onToggleCurrentLineLoop: onToggleCurrentLineLoop,
+            onAIStudy: onAIStudy,
+            onAIKeyPoints: onAIKeyPoints,
+            onUnlink: onUnlink,
+            onEdit: onEdit
         ) + trailingItems, iconSize: compact ? 14 : PlaybackControlSizing.iconSize,
                      width: compact ? 28 : PlaybackControlSizing.optionSide,
                      height: compact ? 30 : PlaybackControlSizing.optionSide,
@@ -172,33 +292,58 @@ struct SyncLyricsArea<MenuContent: View>: View {
     let document: LyricDocument
     @ObservedObject var panel: LyricsPanelModel
     let showTranslations: Bool
+    var showPronunciations = true
+    var isClozeMode = false
     let reduceMotion: Bool
     let onTapLine: (UUID) -> Void
     var canSeek = false
     var interactionIdentity = ""
     var waitingPosition: (() -> Int64?)?
     var waitingIsPlaying = false
+    var studyModel: LyricsStudyModel?
+    var onToggleSingleLineLoop: ((UUID) -> Void)?
+    var onSetABLoopAnchor: ((UUID) -> Void)?
+    var onCompleteABLoop: ((UUID) -> Void)?
     @ViewBuilder let menu: () -> MenuContent
     @State private var areaId = UUID()
+    @State private var isDraggingLyrics = false
+    @State private var isStudyPopoverOpen = false
+    @State private var clearSelectionToken = 0
+    @AppStorage(LyricsPronunciationDisplaySettings.fontSizePreferenceKey)
+    private var pronunciationFontSize = LyricsPronunciationDisplaySettings.defaultFontSize
     @ScaledMetric(relativeTo: .largeTitle) private var lineSize: CGFloat = 30
+    @ScaledMetric(relativeTo: .subheadline)
+    private var pronunciationScaleBase: CGFloat = CGFloat(LyricsPronunciationDisplaySettings.defaultFontSize)
     @ScaledMetric(relativeTo: .subheadline) private var translationLineSize: CGFloat = 15
 
     var body: some View {
         GeometryReader { geometry in
+            let pronunciationScale = pronunciationScaleBase
+                / CGFloat(LyricsPronunciationDisplaySettings.defaultFontSize)
+            let resolvedPronunciationSize =
+                CGFloat(LyricsPronunciationDisplaySettings.normalizedFontSize(pronunciationFontSize))
+                * pronunciationScale
             let typography = LyricsTypography.resolved(
                 line: lineSize,
-                translation: translationLineSize, width: geometry.size.width
+                pronunciation: resolvedPronunciationSize,
+                translation: translationLineSize,
+                width: geometry.size.width
             )
             NativeLyricsScrollView(
                 document: document,
                 typography: typography,
                 showTranslations: showTranslations,
+                showPronunciations: showPronunciations,
                 currentLineIds: Set(panel.syncDisplay.currentLineIds ?? []),
                 request: panel.scrollRequest,
                 followsPlayback: panel.browseMode == .follow && !panel.isAutoScrollSuspended && !panel.isTransitioning,
                 reduceMotion: reduceMotion,
                 onInteraction: { panel.enterManualBrowsing() },
-                onDragStateChange: { panel.setManualInteractionActive($0, in: areaId) },
+                onDragStateChange: { active in
+                    guard isDraggingLyrics != active else { return }
+                    isDraggingLyrics = active
+                    panel.setManualInteractionActive(active || isStudyPopoverOpen, in: areaId)
+                },
                 onTapLine: onTapLine,
                 canSeek: canSeek,
                 interactionIdentity: interactionIdentity,
@@ -206,7 +351,22 @@ struct SyncLyricsArea<MenuContent: View>: View {
                 waitingInterval: panel.syncDisplay.waitingInterval,
                 waitingPosition: waitingPosition,
                 waitingIsPlaying: waitingIsPlaying,
-                userDelayMs: panel.syncDisplay.userDelayMs
+                userDelayMs: panel.syncDisplay.userDelayMs,
+                vocabularyOccurrences: panel.documentOccurrences,
+                isClozeMode: isClozeMode,
+                onWordSelection: { selection in studyModel?.updateSelection(selection) },
+                onRequestWordStudy: { selection in studyModel?.openWordStudy(from: selection) },
+                onRequestLineStudy: { lineId, rect in
+                    studyModel?.openLineStudy(document: document, lineId: lineId, anchorRect: rect)
+                },
+                onRequestLineEdit: { lineId, rect in
+                    studyModel?.openLineQuickEdit(document: document, lineId: lineId, anchorRect: rect)
+                },
+                resolveLineLoopMenuState: { lineId in panel.lineLoopMenuState(for: lineId) },
+                onToggleSingleLineLoop: onToggleSingleLineLoop,
+                onSetABLoopAnchor: onSetABLoopAnchor,
+                onCompleteABLoop: onCompleteABLoop,
+                clearSelectionToken: clearSelectionToken
             )
             .mask {
                 let edgeHeight = min(LyricsSyncConstants.edgeFadeHeight, geometry.size.height / 6)
@@ -216,6 +376,23 @@ struct SyncLyricsArea<MenuContent: View>: View {
                     Rectangle().fill(.white)
                     LinearGradient(colors: [.white, .clear], startPoint: .top, endPoint: .bottom)
                         .frame(height: edgeHeight)
+                }
+            }
+            .overlay {
+                if let studyModel {
+                    LyricsStudyOverlayLayer(
+                        studyModel: studyModel,
+                        document: document,
+                        containerSize: geometry.size,
+                        onStudyPopoverPresentedChange: { open in
+                            guard isStudyPopoverOpen != open else { return }
+                            isStudyPopoverOpen = open
+                            panel.setManualInteractionActive(isDraggingLyrics || open, in: areaId)
+                        },
+                        lineLoopMenuState: { lineId in panel.lineLoopMenuState(for: lineId) },
+                        onToggleSingleLineLoop: onToggleSingleLineLoop,
+                        onClearTextSelection: { clearSelectionToken += 1 }
+                    )
                 }
             }
             .overlay(alignment: .topTrailing) {

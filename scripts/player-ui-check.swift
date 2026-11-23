@@ -269,6 +269,7 @@ private struct PlayerUICheck {
         func items(_ current: LyricsPanelModel?) -> [PlaybackMenu.Item] {
             LyricsMenuActions.items(
                 panel: current, showTranslations: Binding(get: { showsTranslations }, set: { showsTranslations = $0 }),
+                onToggleCurrentLineLoop: {}, onAIStudy: {}, onAIKeyPoints: {},
                 onUnlink: { unlinkRequests += 1 }, onEdit: { edits += 1 }
             )
         }
@@ -278,10 +279,31 @@ private struct PlayerUICheck {
             }
             return item
         }
-        precondition(items(nil).filter { $0.action != nil }.allSatisfy { !$0.isEnabled },
+        let nilItems = items(nil)
+        precondition(nilItems.filter { $0.action != nil }.allSatisfy { !$0.isEnabled },
                      "歌词未载入时保留菜单的歌词动作应禁用")
-        precondition(["延后 0.1 秒", "提前 0.1 秒", "显示译文", "编辑歌词", "解除关联"].allSatisfy { action($0).isEnabled },
+        precondition(nilItems.first(where: { $0.title == "回到当前歌词" })?.isEnabled == false,
+                     "歌词未载入时「回到当前歌词」应禁用")
+        let readyItems = items(panel)
+        precondition(readyItems.allSatisfy { !$0.title.contains("✨") }, "菜单标题不应包含多余表情符号")
+        precondition(action("显示注音").symbol != "textformat.abc", "显示注音不应使用会被中文化为汉字的符号")
+        for item in readyItems {
+            if let symbol = item.symbol {
+                precondition(NSImage(systemSymbolName: symbol, accessibilityDescription: nil) != nil,
+                             "菜单项「\(item.title)」使用了无法加载的 SF Symbol：\(symbol)")
+            }
+        }
+        let returnItem = action("回到当前歌词")
+        precondition(returnItem.symbol != nil, "「回到当前歌词」应配置清晰图标")
+        precondition(["回到当前歌词", "延后 0.1 秒", "提前 0.1 秒", "显示译文", "编辑歌词", "解除关联"].allSatisfy { action($0).isEnabled },
                      "歌词就绪时迁移到保留菜单的动作应可用")
+        panel.enterManualBrowsing()
+        precondition(panel.browseMode == .manual && panel.scrollRequest == nil, "进入手动浏览后应暂停自动跟随")
+        let manualReturnItem = action("回到当前歌词")
+        precondition(manualReturnItem.isEnabled, "手动浏览期间「回到当前歌词」应保持可用")
+        manualReturnItem.action?()
+        precondition(panel.browseMode == .follow && panel.scrollRequest != nil,
+                     "点击「回到当前歌词」后应恢复跟随并发出滚动定位请求")
         action("延后 0.1 秒").action?()
         precondition(coordinator.currentDisplay().userDelayMs == LyricsPanelModel.delayStepMs,
                      "保留菜单的偏移动作必须仍实际生效")
@@ -298,8 +320,11 @@ private struct PlayerUICheck {
         let retainedDocument = try await store.document(id: document.id)
         precondition(retainedDocument != nil, "请求解除确认不能直接删除歌词文档")
         panel.setAutoScrollSuspended(true)
-        precondition(items(panel).filter { $0.action != nil }.allSatisfy { !$0.isEnabled },
+        let suspendedItems = items(panel)
+        precondition(suspendedItems.filter { $0.action != nil }.allSatisfy { !$0.isEnabled },
                      "导入或编辑期间歌词动作应禁用")
+        precondition(suspendedItems.first(where: { $0.title == "回到当前歌词" })?.isEnabled == false,
+                     "导入或编辑期间「回到当前歌词」应禁用")
         panel.setAutoScrollSuspended(false)
 
         let model = AppModel(isMock: true, controller: MockPlaybackController(), searchService: nil)
@@ -352,15 +377,20 @@ private struct PlayerUICheck {
             text.beginPointerInteraction(at: position, clickCount: count)
             text.endPointerInteraction(at: position, hasSelection: selected)
         }
+        let blankPoint = NSPoint(x: row.interactionFrame.maxX - 2, y: row.frame.midY)
+        click(point)
         click(translationPoint)
+        click(blankPoint)
+        click(point, count: 1, selected: true)
         try await Task.sleep(for: clickDelay)
-        precondition(replays == [row.id], "单击原文或译文只重听一次")
+        precondition(replays.isEmpty, "单击原文、译文或同行空白均不得触发重听")
 
         click(point)
         click(point, count: 2, selected: true)
-        try await Task.sleep(for: clickDelay)
-        precondition(replays == [row.id, row.id], "完整双击只重听一次，原生选词不能阻止第二次点击重听")
-        let blankPoint = NSPoint(x: row.interactionFrame.maxX - 2, y: row.frame.midY)
+        precondition(replays == [row.id], "完整双击原文只重听一次，原生选词不能阻止双击重听")
+        click(translationPoint)
+        click(translationPoint, count: 2, selected: true)
+        precondition(replays == [row.id, row.id], "双击译文只重听一次")
         click(blankPoint)
         click(blankPoint, count: 2)
         text.endPointerInteraction(at: blankPoint, hasSelection: false)
@@ -377,7 +407,6 @@ private struct PlayerUICheck {
         precondition(text.writeSelection(to: pasteboard, types: copyTypes), "应能使用原生支持的格式复制到专用测试剪贴板")
         precondition(pasteboard.string(forType: .string) == "Morning", "原生文本选择与复制必须保留")
         pasteboard.releaseGlobally()
-        try await Task.sleep(for: clickDelay)
         text.beginPointerInteraction(at: point, clickCount: 2)
         text.pointerDragged()
         text.endPointerInteraction(at: point, hasSelection: true)
@@ -389,20 +418,16 @@ private struct PlayerUICheck {
         text.setSelectedRange(NSRange(location: 0, length: 0))
 
         text.updateHover(at: point)
-        click(point)
+        text.beginPointerInteraction(at: point, clickCount: 2)
         view.contentView.scroll(to: NSPoint(x: 0, y: view.contentView.bounds.minY + 20))
         precondition(text.hoveredLineId == nil, "滚动时应清理旧行悬停")
-        try await Task.sleep(for: clickDelay)
-        precondition(replays.count == 3, "滚动也应取消延迟单击")
-        click(point)
-        configure(identity: "original-track-2")
-        try await Task.sleep(for: clickDelay)
-        precondition(replays.count == 3 && text.hoveredLineId == nil, "切歌后不得执行上一首延迟单击")
-
-        text.beginPointerInteraction(at: point, clickCount: 2)
-        configure(identity: "original-track-3")
         text.endPointerInteraction(at: point, hasSelection: true)
-        precondition(replays.count == 3, "双击按住时切歌，松手不得执行旧行跳转")
+        precondition(replays.count == 3, "滚动应清理进行中的双击交互")
+        text.beginPointerInteraction(at: point, clickCount: 2)
+        configure(identity: "original-track-2")
+        text.endPointerInteraction(at: point, hasSelection: true)
+        precondition(replays.count == 3 && text.hoveredLineId == nil, "切歌后不得执行旧曲目双击跳转")
+
         let untimed = view.textLayout.rows[1].interactionFrame
         text.updateHover(at: NSPoint(x: untimed.midX, y: untimed.midY))
         precondition(text.hoveredLineId == nil, "无时间行不显示可点击高亮")
@@ -417,7 +442,13 @@ private struct PlayerUICheck {
         try await Task.sleep(for: clickDelay)
         precondition(replays.count == 3 && text.hoveredLineId == nil, "无 seek 能力或手势中禁用时不伪造交互")
         configure()
-        try await checkNativeLyricsClicks(view: view, points: [point, translationPoint, blankPoint], replayCount: { replays.count })
+        let untimedWordPoint = NSPoint(x: 12, y: view.textLayout.rows[1].frame.midY)
+        try await checkNativeLyricsClicks(
+            view: view,
+            points: [point, translationPoint, blankPoint],
+            untimedPoint: untimedWordPoint,
+            replayCount: { replays.count }
+        )
         let replaysBeforeAccessibility = replays.count
         let accessibleRows = view.documentView?.accessibilityChildren()?.compactMap { $0 as? NSAccessibilityElement } ?? []
         precondition(accessibleRows.allSatisfy { $0.isAccessibilityEnabled() }, "可重听歌词的 VoiceOver 动作必须处于启用状态")
@@ -425,11 +456,14 @@ private struct PlayerUICheck {
         precondition(replays.count == replaysBeforeAccessibility + 1)
         view.prepareForRemoval()
         precondition(!accessibleRows[0].accessibilityPerformPress(), "卸载后旧 VoiceOver 动作不可重听")
-        print("PASS 歌词单击/双击各一次重听、原文译文与同行空白、原生鼠标选词/拖选与复制、未知禁用、切歌清理和 VoiceOver")
+        print("PASS 歌词单击不跳转/双击重听、原文译文与同行空白、原生鼠标选词/拖选与复制、未知禁用、切歌清理和 VoiceOver")
     }
 
     @MainActor private static func checkNativeLyricsClicks(
-        view: LyricsScrollView, points: [NSPoint], replayCount: @escaping @MainActor () -> Int
+        view: LyricsScrollView,
+        points: [NSPoint],
+        untimedPoint: NSPoint,
+        replayCount: @escaping @MainActor () -> Int
     ) async throws {
         let window = NSWindow(contentRect: NSRect(x: -10_000, y: -10_000, width: 340, height: 300),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -447,6 +481,13 @@ private struct PlayerUICheck {
         view.contentView.scroll(to: .zero)
         view.layoutSubtreeIfNeeded()
         let text = view.textLayout.textView
+        let previousSelectionChanged = text.onSelectionChanged
+        var lastPublishedSelection: NSRange?
+        text.onSelectionChanged = { range in
+            lastPublishedSelection = range
+            previousSelectionChanged?(range)
+        }
+        defer { text.onSelectionChanged = previousSelectionChanged }
         text.setSelectedRange(NSRange(location: 0, length: 0))
         for point in points {
             let windowPoint = text.convert(point, to: nil)
@@ -464,52 +505,135 @@ private struct PlayerUICheck {
             precondition(value.window === window, "歌词鼠标事件必须属于测试自身窗口")
             return value
         }
-        func click(_ point: NSPoint, count: Int, drag: Bool = false) async throws {
+        func click(_ point: NSPoint, count: Int, drag: Bool = false, returnToStart: Bool = true) async throws {
             let before = replayCount()
             let end = drag ? NSPoint(x: point.x + 60, y: point.y) : point
+            let releasePoint = (drag && !returnToStart) ? end : point
             let release = Timer(timeInterval: hold * 2, repeats: false) { _ in
                 MainActor.assumeIsolated {
-                    precondition(replayCount() == before, "真正松手前不得从mouseDown返回提前seek")
-                    NSApplication.shared.postEvent(event(.leftMouseUp, point, count), atStart: false)
+                    if count == 1 {
+                        precondition(replayCount() == before, "真正松手前不得从mouseDown返回提前seek")
+                    }
+                    NSApplication.shared.postEvent(event(.leftMouseUp, releasePoint, count), atStart: false)
                 }
             }
             RunLoop.main.add(release, forMode: .common)
             RunLoop.main.add(release, forMode: .eventTracking)
             if drag {
                 let dragging = Timer(timeInterval: hold, repeats: false) { _ in
-                    MainActor.assumeIsolated { NSApplication.shared.postEvent(event(.leftMouseDragged, end, count), atStart: false) }
+                    MainActor.assumeIsolated {
+                        NSApplication.shared.postEvent(event(.leftMouseDragged, end, count), atStart: false)
+                    }
                 }
                 RunLoop.main.add(dragging, forMode: .common)
                 RunLoop.main.add(dragging, forMode: .eventTracking)
-                let returning = Timer(timeInterval: hold * 1.5, repeats: false) { _ in
-                    MainActor.assumeIsolated { NSApplication.shared.postEvent(event(.leftMouseDragged, point, count), atStart: false) }
+                if returnToStart {
+                    let returning = Timer(timeInterval: hold * 1.5, repeats: false) { _ in
+                        MainActor.assumeIsolated {
+                            NSApplication.shared.postEvent(event(.leftMouseDragged, point, count), atStart: false)
+                        }
+                    }
+                    RunLoop.main.add(returning, forMode: .common)
+                    RunLoop.main.add(returning, forMode: .eventTracking)
                 }
-                RunLoop.main.add(returning, forMode: .common)
-                RunLoop.main.add(returning, forMode: .eventTracking)
             }
             NSApplication.shared.postEvent(event(.leftMouseDown, point, count), atStart: false)
             try await Task.sleep(for: .milliseconds(Int64(hold * 3_000) + 10))
         }
+        let singleWait = Duration.milliseconds(Int64(max(NSEvent.doubleClickInterval * 2, 0.15) * 1_000))
         let beforeSingle = replayCount()
         try await click(points[0], count: 1)
-        try await Task.sleep(for: clickDelay)
-        try await eventually("NSTextView真实单击应重听一次", diagnostic: {
-            "expected=\(beforeSingle + 1) actual=\(replayCount()) visible=\(window.isVisible) key=\(window.isKeyWindow)"
-        }) { replayCount() == beforeSingle + 1 }
+        try await Task.sleep(for: singleWait)
+        precondition(
+            replayCount() == beforeSingle,
+            "NSTextView真实单击不应跳转：expected=\(beforeSingle) actual=\(replayCount())"
+        )
+        for point in points.dropFirst() {
+            let before = replayCount()
+            try await click(point, count: 1)
+            try await Task.sleep(for: clickDelay)
+            precondition(replayCount() == before, "真实单击译文或同行空白均不得触发重听")
+        }
         for point in points {
             let before = replayCount()
+            lastPublishedSelection = nil
+            text.setSelectedRange(NSRange(location: 0, length: 0))
             try await click(point, count: 1)
             try await click(point, count: 2)
             try await Task.sleep(for: clickDelay)
             precondition(replayCount() == before + 1, "原文、译文或同行空白的真实双击各只能重听一次")
-            precondition(text.selectedRange().length > 0, "真实双击应经过NSTextView原生选词")
+            precondition(text.selectedRange().length == 0, "无修饰键真实双击只触发重听，不得选中单词")
+            precondition(lastPublishedSelection?.length == 0, "真实双击不得向划词浮条发布非空选区")
         }
-        for count in [1, 2] {
-            let before = replayCount()
-            try await click(NSPoint(x: 8, y: points[0].y), count: count, drag: true)
-            try await Task.sleep(for: clickDelay)
-            precondition(replayCount() == before, "原生单击或双击拖选即使回到起点也不得重听")
+        let timedWordPoint = NSPoint(x: 12, y: points[0].y)
+        let beforeTimedDirect = replayCount()
+        lastPublishedSelection = nil
+        text.setSelectedRange(NSRange(location: 0, length: 7))
+        text.mouseDown(with: event(.leftMouseDown, timedWordPoint, 2))
+        precondition(replayCount() == beforeTimedDirect + 1, "mouseDown 无修饰键双击有时间歌词行应触发重听")
+        precondition(text.selectedRange().length == 0, "mouseDown 无修饰键双击有时间歌词行不应选中单词并应清除旧选区")
+        precondition(lastPublishedSelection?.length == 0, "mouseDown 无修饰键双击有时间歌词行应发布空选区")
+
+        let beforeUntimedDirect = replayCount()
+        lastPublishedSelection = nil
+        text.setSelectedRange(NSRange(location: 0, length: 0))
+        text.mouseDown(with: event(.leftMouseDown, untimedPoint, 2))
+        precondition(replayCount() == beforeUntimedDirect, "mouseDown 无修饰键双击无时间歌词行不得触发重听")
+        precondition(text.selectedRange().length == 0, "mouseDown 无修饰键双击无时间歌词行同样不得选中单词")
+        precondition(lastPublishedSelection?.length == 0, "mouseDown 无修饰键双击无时间歌词行应发布空选区")
+
+        let beforeTripleClick = replayCount()
+        lastPublishedSelection = nil
+        text.mouseDown(with: event(.leftMouseDown, timedWordPoint, 3))
+        precondition(replayCount() == beforeTripleClick, "mouseDown 无修饰键三击不得触发重听")
+        precondition(text.selectedRange().length == 0, "mouseDown 无修饰键三击不得触发原生选段高亮")
+        precondition(lastPublishedSelection?.length == 0, "mouseDown 无修饰键三击应发布空选区")
+
+        let beforeReturnDrag = replayCount()
+        try await click(NSPoint(x: 8, y: points[0].y), count: 1, drag: true)
+        try await Task.sleep(for: clickDelay)
+        precondition(replayCount() == beforeReturnDrag, "原生单击拖选即使回到起点也不得重听")
+        let beforeDragSelect = replayCount()
+        lastPublishedSelection = nil
+        try await click(NSPoint(x: 8, y: points[0].y), count: 1, drag: true, returnToStart: false)
+        try await Task.sleep(for: clickDelay)
+        precondition(replayCount() == beforeDragSelect, "单次拖动划词不得触发重听")
+        precondition((lastPublishedSelection?.length ?? 0) > 0, "单次拖动划词应向划词浮条发布非空选区")
+
+        text.setSelectedRange(NSRange(location: 0, length: 0))
+        let rightClickWord = event(.rightMouseDown, timedWordPoint, 1)
+        guard let menuWithoutSelection = text.menu(for: rightClickWord) else {
+            preconditionFailure("无选区右键歌词单词应返回整句右键菜单")
         }
+        let titlesWithoutSelection = menuWithoutSelection.items.map(\.title)
+        precondition(
+            titlesWithoutSelection.contains("解析这句歌词（语法 / 唱法 / 笔记）")
+                && titlesWithoutSelection.contains("编辑这句歌词 / 注音 / 译文…"),
+            "无选区右键歌词单词应包含整句解析与编辑菜单项"
+        )
+        precondition(
+            !titlesWithoutSelection.contains("划词解析…") && !titlesWithoutSelection.contains("拷贝"),
+            "无选区右键歌词单词不应包含划词解析与拷贝菜单项"
+        )
+        precondition(text.selectedRange().length == 0, "无选区右键歌词单词不得自动选中单词")
+
+        let morningRange = NSRange(location: view.textLayout.rows[0].originalRange.location, length: 7)
+        text.setSelectedRange(morningRange)
+        let otherLinePoint = NSPoint(x: 12, y: view.textLayout.rows[2].frame.midY)
+        let rightClickOther = event(.rightMouseDown, otherLinePoint, 1)
+        guard let menuWithSelection = text.menu(for: rightClickOther) else {
+            preconditionFailure("已有拖选选区右键歌词应返回右键菜单")
+        }
+        precondition(text.selectedRange() == morningRange, "已有拖选选区时右键另一位置不得改写原选区")
+        let titlesWithSelection = menuWithSelection.items.map(\.title)
+        precondition(
+            titlesWithSelection.contains("划词解析…") && titlesWithSelection.contains("拷贝"),
+            "已有拖选选区时右键菜单应包含划词解析与拷贝"
+        )
+        if let copyItem = menuWithSelection.items.first(where: { $0.title == "拷贝" }) {
+            precondition(text.validateMenuItem(copyItem), "有选区时右键菜单中的拷贝项应处于可用状态")
+        }
+        text.setSelectedRange(NSRange(location: 0, length: 0))
     }
 
     /// 持续发布权威采样，覆盖真实滚动动画；播放时钟不靠 UI 自行累加。
@@ -1257,8 +1381,120 @@ private struct PlayerUICheck {
         try await checkPlaybackDragging(store: store, snapshot: initial)
         try await ArtworkUICheck.runChecks()
         try await checkAudioLinkImport(store: store)
+        try await checkLineQuickEditFlow(store: store)
         fflush(nil)
         print("App player UI checks: AUTOMATED_PASS（未执行真实 Music 验证）")
+    }
+
+    @MainActor static func checkLineQuickEditFlow(store: GRDBLyricsStore) async throws {
+        let initialLine = LyricLine(
+            startMs: 12_340,
+            text: "Wind carries paper boats across the harbor",
+            translations: ["zh-Hans": Translation(text: "微风载着纸船驶过港湾", source: .imported, needsReview: false)],
+            pronunciation: LinePronunciation(
+                style: .romaji,
+                text: "windo kyariizu peipaa booto",
+                source: .ai(model: "mock-study"),
+                needsReview: false
+            )
+        )
+        let originalDoc = LyricDocument(lines: [initialLine])
+        try await store.save(document: originalDoc, binding: SongBinding(persistentID: "ABCDEF1001", lyricDocumentId: originalDoc.id))
+
+        var savedCallbacks = 0
+        let studyModel = LyricsStudyModel(
+            store: store,
+            isMock: true,
+            trackHintProvider: { ("music-script:persistent:ABCDEF1001", "港湾纸船", "原创歌手") },
+            onDocumentNoteSaved: { savedCallbacks += 1 }
+        )
+        defer { studyModel.invalidate() }
+
+        // 1. 同时编辑原文、注音（含切换样式）与译文，保存后落库成功
+        let anchor = CGRect(x: 20, y: 80, width: 220, height: 32)
+        studyModel.openLineQuickEdit(document: originalDoc, lineId: initialLine.id, anchorRect: anchor)
+        guard var editState = studyModel.lineEditPopover else {
+            preconditionFailure("openLineQuickEdit 应打开快捷编辑状态")
+        }
+        precondition(!editState.hasChanges, "刚打开且未修改时 hasChanges 应为 false")
+        editState.draftText = "Evening wind guides paper boats home"
+        editState.draftPronunciation = "iːvnɪŋ wɪnd ɡaɪdz peɪpər boʊts hoʊm"
+        editState.draftPronunciationStyle = .ipa
+        editState.draftTranslation = "晚风引领纸船归航"
+        studyModel.lineEditPopover = editState
+        precondition(editState.hasChanges && editState.textChanged && editState.pronunciationChanged && editState.translationChanged)
+
+        studyModel.saveLineQuickEdit()
+        try await eventually("单句快捷编辑保存完成后应触发刷新并关闭弹窗") {
+            savedCallbacks == 1 && studyModel.lineEditPopover == nil
+        }
+
+        guard let docAfterEdit = try await store.document(id: originalDoc.id),
+              let updatedLine = docAfterEdit.lines.first(where: { $0.id == initialLine.id }) else {
+            preconditionFailure("保存后应能读回更新文档与稳定行")
+        }
+        precondition(docAfterEdit.revision == originalDoc.revision + 1, "保存后 revision 应加 1")
+        precondition(updatedLine.text == "Evening wind guides paper boats home", "原文应更新")
+        precondition(updatedLine.pronunciation?.style == .ipa, "注音样式应更新为 IPA")
+        precondition(updatedLine.pronunciation?.text == "iːvnɪŋ wɪnd ɡaɪdz peɪpər boʊts hoʊm", "注音文本应更新")
+        precondition(updatedLine.pronunciation?.source.kind == .manual && updatedLine.pronunciation?.needsReview == false,
+                     "修改后的注音应为人工来源且清除待复核")
+        precondition(updatedLine.translations[LyricsSyncConstants.translationLanguage]?.text == "晚风引领纸船归航", "译文应更新")
+        precondition(updatedLine.translations[LyricsSyncConstants.translationLanguage]?.source == .manual
+                     && updatedLine.translations[LyricsSyncConstants.translationLanguage]?.needsReview == false,
+                     "修改后的译文应为人工来源且清除待复核")
+
+        // 2. 仅修改原文（不改译文与注音），既有译文与注音自动标记待复核
+        studyModel.openLineQuickEdit(document: docAfterEdit, lineId: initialLine.id, anchorRect: anchor)
+        guard var textOnlyState = studyModel.lineEditPopover else {
+            preconditionFailure("二次打开快捷编辑应成功")
+        }
+        textOnlyState.draftText = "Starlight guides paper boats home"
+        studyModel.lineEditPopover = textOnlyState
+        precondition(textOnlyState.textChanged && !textOnlyState.translationChanged && !textOnlyState.pronunciationChanged)
+
+        studyModel.saveLineQuickEdit()
+        try await eventually("仅改原文保存后应触发回调并关闭弹窗") {
+            savedCallbacks == 2 && studyModel.lineEditPopover == nil
+        }
+        guard let docAfterTextOnly = try await store.document(id: originalDoc.id),
+              let textOnlyLine = docAfterTextOnly.lines.first(where: { $0.id == initialLine.id }) else {
+            preconditionFailure("仅改原文后应能读回文档")
+        }
+        precondition(docAfterTextOnly.revision == docAfterEdit.revision + 1, "仅改原文后 revision 应再加 1")
+        precondition(textOnlyLine.text == "Starlight guides paper boats home", "原文应为最新文本")
+        precondition(textOnlyLine.translations[LyricsSyncConstants.translationLanguage]?.needsReview == true,
+                     "仅改原文不改译文时，既有译文应标为待复核")
+        precondition(textOnlyLine.pronunciation?.needsReview == true,
+                     "仅改原文不改注音时，既有注音应标为待复核")
+
+        // 3. 打开弹窗后底层 revision 变化，保存触发乐观并发保护，保留草稿且不覆盖较新文档
+        studyModel.openLineQuickEdit(document: docAfterTextOnly, lineId: initialLine.id, anchorRect: anchor)
+        let concurrentEditor = LyricsEditingService(store: store)
+        _ = try await concurrentEditor.openEditor(documentId: originalDoc.id)
+        _ = try await concurrentEditor.setLineText(lineId: initialLine.id, text: "Concurrent newer line")
+        _ = try await concurrentEditor.commitChanges()
+        await concurrentEditor.closeEditor()
+
+        guard var staleState = studyModel.lineEditPopover else {
+            preconditionFailure("冲突测试前弹窗应保持打开")
+        }
+        staleState.draftText = "Stale draft that must not overwrite"
+        studyModel.lineEditPopover = staleState
+        studyModel.saveLineQuickEdit()
+        try await eventually("发生 revision 冲突时应停止保存并显示错误提示") {
+            studyModel.lineEditPopover?.isSaving == false
+                && !(studyModel.lineEditPopover?.errorMessage ?? "").isEmpty
+        }
+        precondition(studyModel.lineEditPopover?.draftText == "Stale draft that must not overwrite",
+                     "冲突失败后必须保留用户草稿")
+        guard let latestDoc = try await store.document(id: originalDoc.id),
+              let latestLine = latestDoc.lines.first(where: { $0.id == initialLine.id }) else {
+            preconditionFailure("冲突后应能读回较新文档")
+        }
+        precondition(latestDoc.revision == docAfterTextOnly.revision + 1 && latestLine.text == "Concurrent newer line",
+                     "冲突保护绝不能覆盖较新文档内容")
+        print("PASS 单句歌词/注音/译文快捷编辑、仅改原文待复核标记与 revision 乐观并发保护")
     }
 
     @MainActor static func checkAudioLinkImport(store: GRDBLyricsStore) async throws {
