@@ -43,10 +43,16 @@ public enum MatchConfidence: Int, Comparable, Equatable, Sendable {
 public struct LyricsMatchScore: Equatable, Sendable {
     /// 归一化后歌名完全一致。
     public let titleExact: Bool
+    /// 查询标题与候选标题经罗马音↔假名音译后完全一致。
+    public let titleTransliterationMatch: Bool
+    /// 查询标题或其假名音译与候选别名完全一致。
+    public let titleAliasMatch: Bool
     /// 歌名归一化后一方包含另一方（且非完全一致）。
     public let titleContains: Bool
     /// 任一歌手归一化完全一致。
     public let artistExact: Bool
+    /// 任一歌手经日语读音跨文字音译匹配。
+    public let artistTransliterationMatch: Bool
     /// 任一歌手归一化后一方包含另一方。
     public let artistContains: Bool
     /// 双方时长都已知时的差值绝对值（毫秒）；任一未知为 nil。
@@ -55,8 +61,8 @@ public struct LyricsMatchScore: Equatable, Sendable {
     public let totalScore: Int
     /// 置信分级。
     public let confidence: MatchConfidence
-    /// 自动落位门槛：歌名精确 + 歌手精确 +（若可比）时长差 ≤3s。
-    /// durationMs 任一未知时时长项按通过处理（文本双证已够，不硬卡）。
+    /// 自动落位门槛：歌名精确 + 歌手精确 +（若可比）时长差 ≤3s；
+    /// 或标题/歌手任一经跨文字音译匹配（另一项精确或音译）+ 双方时长均已知且差值 ≤3s。
     public let isAutoHighEligible: Bool
 }
 
@@ -118,34 +124,15 @@ public enum LyricsMatchRanker {
 
     /// 单个候选打分。
     public static func score(candidate: NeteaseSongCandidate, query: LyricsMatchQuery) -> LyricsMatchScore {
-        let queryTitle = normalizeTitle(query.title)
-        let candidateTitle = normalizeTitle(candidate.title)
-        let titleExact = !queryTitle.isEmpty && queryTitle == candidateTitle
-        let titleContains = !titleExact
-            && !queryTitle.isEmpty && !candidateTitle.isEmpty
-            && (queryTitle.contains(candidateTitle) || candidateTitle.contains(queryTitle))
-
-        let queryArtists = artistTokens(query.artist)
-        let candidateArtists = candidate.artists.flatMap(artistTokens)
-        let artistExact = !queryArtists.isEmpty
-            && !candidateArtists.isEmpty
-            && !Set(queryArtists).isDisjoint(with: candidateArtists)
-        let artistContains = !artistExact
-            && !queryArtists.isEmpty && !candidateArtists.isEmpty
-            && queryArtists.contains { queryArtist in
-                candidateArtists.contains { $0.contains(queryArtist) || queryArtist.contains($0) }
-            }
+        let titleMatch = evaluateTitleMatch(candidate: candidate, query: query)
+        let artistMatch = evaluateArtistMatch(candidate: candidate, query: query)
 
         var durationDelta: Int64?
         if let local = query.durationMs, let remote = candidate.durationMs {
             durationDelta = abs(local - remote)
         }
 
-        var total = 0
-        total += titleExact ? 50 : 0
-        total += titleContains ? 25 : 0
-        total += artistExact ? 30 : 0
-        total += artistContains ? 15 : 0
+        var total = titleMatch.score + artistMatch.score
         if let delta = durationDelta {
             if delta <= closeDurationToleranceMs {
                 total += 20
@@ -156,9 +143,16 @@ public enum LyricsMatchRanker {
             }
         }
 
-        // 自动落位门槛：歌名精确 + 歌手精确 + 时长不冲突（未知视为通过）。
+        // 自动落位门槛：
+        // 1) 歌名精确 + 歌手精确 + 时长不冲突（未知视为通过）；
+        // 2) 标题或歌手任一使用跨文字音译匹配（另一项精确或音译）+ 双方时长均已知且差值 ≤3s。
         let durationConflicts = durationDelta.map { $0 > closeDurationToleranceMs } ?? false
-        let autoEligible = titleExact && artistExact && !durationConflicts
+        let durationCloseConfirmed = durationDelta.map { $0 <= closeDurationToleranceMs } ?? false
+        let exactAutoEligible = titleMatch.exact && artistMatch.exact && !durationConflicts
+        let transliterationAutoEligible = (titleMatch.exact || titleMatch.transliteration)
+            && (artistMatch.exact || artistMatch.transliteration)
+            && durationCloseConfirmed
+        let autoEligible = exactAutoEligible || transliterationAutoEligible
 
         let confidence: MatchConfidence
         if autoEligible {
@@ -170,10 +164,13 @@ public enum LyricsMatchRanker {
         }
 
         return LyricsMatchScore(
-            titleExact: titleExact,
-            titleContains: titleContains,
-            artistExact: artistExact,
-            artistContains: artistContains,
+            titleExact: titleMatch.exact,
+            titleTransliterationMatch: titleMatch.transliteration,
+            titleAliasMatch: titleMatch.alias,
+            titleContains: titleMatch.contains,
+            artistExact: artistMatch.exact,
+            artistTransliterationMatch: artistMatch.transliteration,
+            artistContains: artistMatch.contains,
             durationDeltaMs: durationDelta,
             totalScore: total,
             confidence: confidence,
@@ -181,29 +178,173 @@ public enum LyricsMatchRanker {
         )
     }
 
+    private struct ArtistMatchResult {
+        let exact: Bool
+        let transliteration: Bool
+        let contains: Bool
+
+        var score: Int {
+            if exact || transliteration { return 30 }
+            if contains { return 15 }
+            return 0
+        }
+    }
+
+    private static func evaluateArtistMatch(
+        candidate: NeteaseSongCandidate,
+        query: LyricsMatchQuery
+    ) -> ArtistMatchResult {
+        let queryArtists = artistTokens(query.artist)
+        let candidateArtists = candidate.artists.flatMap(artistTokens)
+        let artistExact = !queryArtists.isEmpty
+            && !candidateArtists.isEmpty
+            && !Set(queryArtists).isDisjoint(with: candidateArtists)
+
+        let artistTransliteration: Bool
+        if !artistExact {
+            let queryRaw = rawArtistSegments(query.artist)
+            let candidateRaw = candidate.artists.flatMap(rawArtistSegments)
+            artistTransliteration = !queryRaw.isEmpty
+                && !candidateRaw.isEmpty
+                && queryRaw.contains { querySegment in
+                    candidateRaw.contains { candidateSegment in
+                        JapaneseRomajiTransliterator.artistsMatchByJapaneseReading(querySegment, candidateSegment)
+                    }
+                }
+        } else {
+            artistTransliteration = false
+        }
+
+        let artistContains = !artistExact
+            && !queryArtists.isEmpty && !candidateArtists.isEmpty
+            && queryArtists.contains { queryArtist in
+                candidateArtists.contains { $0.contains(queryArtist) || queryArtist.contains($0) }
+            }
+
+        return ArtistMatchResult(
+            exact: artistExact,
+            transliteration: artistTransliteration,
+            contains: artistContains
+        )
+    }
+
+    private struct TitleMatchResult {
+        let exact: Bool
+        let transliteration: Bool
+        let alias: Bool
+        let contains: Bool
+
+        var score: Int {
+            if exact { return 50 }
+            if transliteration { return 45 }
+            if alias { return 40 }
+            if contains { return 25 }
+            return 0
+        }
+    }
+
+    private static func evaluateTitleMatch(
+        candidate: NeteaseSongCandidate,
+        query: LyricsMatchQuery
+    ) -> TitleMatchResult {
+        let queryTitle = normalizeTitle(query.title)
+        let candidateTitle = normalizeTitle(candidate.title)
+        let titleExact = !queryTitle.isEmpty && queryTitle == candidateTitle
+        let titleContains = !titleExact
+            && !queryTitle.isEmpty && !candidateTitle.isEmpty
+            && (queryTitle.contains(candidateTitle) || candidateTitle.contains(queryTitle))
+
+        guard !titleExact else {
+            return TitleMatchResult(exact: true, transliteration: false, alias: false, contains: false)
+        }
+
+        let queryKana = JapaneseRomajiTransliterator
+            .toHiraganaIfLikelyRomaji(query.title)
+            .map(normalizeTitle)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let candidateKana = JapaneseRomajiTransliterator
+            .toHiraganaIfLikelyRomaji(candidate.title)
+            .map(normalizeTitle)
+            .flatMap { $0.isEmpty ? nil : $0 }
+
+        let titleTransliteration = (!candidateTitle.isEmpty && queryKana == candidateTitle)
+            || (!queryTitle.isEmpty && candidateKana == queryTitle)
+
+        let titleAlias = candidate.aliases.contains { alias in
+            let normalizedAlias = normalizeTitle(alias)
+            guard !normalizedAlias.isEmpty else { return false }
+            if normalizedAlias == queryTitle || queryKana == normalizedAlias {
+                return true
+            }
+            if !queryTitle.isEmpty,
+               let aliasKana = JapaneseRomajiTransliterator
+                .toHiraganaIfLikelyRomaji(alias)
+                .map(normalizeTitle),
+               aliasKana == queryTitle {
+                return true
+            }
+            return false
+        }
+
+        return TitleMatchResult(
+            exact: false,
+            transliteration: titleTransliteration,
+            alias: titleAlias,
+            contains: titleContains
+        )
+    }
+
     // MARK: - 归一化
 
-    /// 歌名归一化：NFKC（全半角统一）→ 小写 → 去空白与标点。
+    /// 歌名归一化：NFKC（全半角统一）→ 片假名转平假名 → 小写 → 去空白与标点。
     /// 保留括号内文本，让伴奏、翻唱、Live、语言版本等信息参与匹配。
     /// 这是打分专用归一化，不改写任何用户可见数据。
     public static func normalizeTitle(_ value: String) -> String {
-        let text = value.precomposedStringWithCompatibilityMapping.lowercased()
+        let nfkc = value.precomposedStringWithCompatibilityMapping
+        let text = JapaneseRomajiTransliterator.katakanaToHiragana(nfkc).lowercased()
         return text.filter { !$0.isWhitespace && !$0.isPunctuation }
     }
 
-    /// 歌手归一化：NFKC + 小写后，按分隔符（`, / 、 + &`）与常见合作连接词
+    private static let artistJoiners = [" feat. ", " ft. ", " feat ", " ft ", " with ", " vs. ", " vs "]
+
+    /// 歌手归一化：NFKC + 片假名转平假名 + 小写后，按分隔符（`, / 、 + &`）与常见合作连接词
     /// （feat. / ft. / with / vs.，需前后空格的词形）切分为 token 集合，每段
     /// 再去空白与标点。「A feat. B」「A / B & C」→ {a, b, c}。
     public static func artistTokens(_ value: String?) -> [String] {
         guard let value, !value.isEmpty else { return [] }
-        let lowered = value.precomposedStringWithCompatibilityMapping.lowercased()
+        let nfkc = value.precomposedStringWithCompatibilityMapping
+        let lowered = JapaneseRomajiTransliterator.katakanaToHiragana(nfkc).lowercased()
         var pieces = lowered.components(separatedBy: CharacterSet(charactersIn: ",/、+&"))
-        for joiner in [" feat. ", " ft. ", " feat ", " ft ", " with ", " vs. ", " vs "] {
+        for joiner in artistJoiners {
             pieces = pieces.flatMap { $0.components(separatedBy: joiner) }
         }
         return pieces
             .map { $0.filter { !$0.isWhitespace && !$0.isPunctuation } }
             .filter { !$0.isEmpty }
+    }
+
+    /// 保留大小写、词内空格与假名/汉字的歌手段切分，供跨文字日语读音分词使用。
+    private static func rawArtistSegments(_ value: String?) -> [String] {
+        guard let value, !value.isEmpty else { return [] }
+        let nfkc = value.precomposedStringWithCompatibilityMapping
+        var pieces = nfkc.components(separatedBy: CharacterSet(charactersIn: ",/、+&"))
+        for joiner in artistJoiners {
+            pieces = pieces.flatMap { splitCaseInsensitive($0, separator: joiner) }
+        }
+        return pieces
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func splitCaseInsensitive(_ text: String, separator: String) -> [String] {
+        var result: [String] = []
+        var searchStart = text.startIndex
+        while let range = text.range(of: separator, options: .caseInsensitive, range: searchStart..<text.endIndex) {
+            result.append(String(text[searchStart..<range.lowerBound]))
+            searchStart = range.upperBound
+        }
+        result.append(String(text[searchStart..<text.endIndex]))
+        return result
     }
 }
 

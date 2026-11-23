@@ -91,6 +91,12 @@ final class AppModel: ObservableObject {
     @Published var isLyricsEditorPresented = false {
         didSet { updateLyricsScrollSuspension() }
     }
+    /// AI 学习预览弹窗开关与状态模型。
+    @Published var isAIStudyPreviewPresented = false { didSet { updateLyricsScrollSuspension() } }
+    @Published var aiStudyPreviewModel: AIStudyPreviewModel?
+    @Published var isAIKeyPointsPresented = false { didSet { updateLyricsScrollSuspension() } }
+    @Published var aiKeyPointsModel: AIKeyPointsModel?
+    @Published var lyricsStudy: LyricsStudyModel?
     /// 上一次由播放快照触发歌词查询的曲目键与 epoch。
     private var lastLyricsTrackKey: String?
     private var lastLyricsEpoch: Int?
@@ -191,6 +197,7 @@ final class AppModel: ObservableObject {
         applyAutomationState(snapshot: snapshot)
         lyricsCoordinator?.update(snapshot: snapshot)
         handleLyricsTrackChange(snapshot)
+        evaluateABLoopIfNeeded(for: snapshot)
     }
 
     /// 快照驱动的自动化权限状态（仅真实模式）。
@@ -450,6 +457,11 @@ extension AppModel {
         autoFetch?.invalidateCurrentRun()
         lyricsFetchModel?.cancel()
         audioLinkImportModel?.cancelImport()
+        aiStudyPreviewModel?.invalidate()
+        aiStudyPreviewModel = nil
+        aiKeyPointsModel?.invalidate()
+        aiKeyPointsModel = nil
+        lyricsStudy?.invalidate()
         lyricsPanel?.setAutoScrollSuspended(true)
         artworkStore.handleTrackChange(PlaybackSnapshot(), controller: controller)
         musicLibraryBrowser.cancelForTermination()
@@ -469,22 +481,5 @@ extension AppModel {
             guard !Task.isCancelled, self?.isTerminating == false else { return }
             await operation()
         }
-    }
-}
-/// 目录搜索错误的中文文案（AppModel 类型体外，约束类型长度）。
-private func searchErrorText(_ error: CatalogSearchError) -> String {
-    switch error {
-    case .unauthorized:
-        return "尚未授权 Apple Music 访问。"
-    case .network(let detail):
-        return "网络失败：\(detail)"
-    case .rateLimited:
-        return "请求过于频繁，请稍后再试。"
-    case .trackUnavailable:
-        return "目录暂不可用。"
-    case .unknown(let detail):
-        return "搜索失败：\(detail)"
-    case .emptyTerm:
-        return "请输入搜索关键词。"
     }
 }

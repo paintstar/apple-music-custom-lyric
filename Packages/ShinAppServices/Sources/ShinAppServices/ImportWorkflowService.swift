@@ -27,15 +27,15 @@ public actor ImportWorkflowService {
     }
 
     /// 一次成功 ingest 的完整内存结果：文档 + 解析诊断。
-    private struct IngestedFile: Sendable {
+    struct IngestedFile: Sendable {
         let document: LyricDocument
         let diagnostics: [LyricDiagnostic]
     }
 
     private let store: GRDBLyricsStore
-    private var phase: Phase = .idle
+    var phase: Phase = .idle
     private var target: ImportSessionTarget?
-    private var ingested: IngestedFile?
+    var ingested: IngestedFile?
     /// 在线获取来源注记：打开会话时固定，确认时写入文档
     /// metadata；nil = 手动导入（不产生任何注记，享有手动优先保护）。
     private var provenance: FetchProvenance?
@@ -44,11 +44,15 @@ public actor ImportWorkflowService {
     // 双语映射结果单独缓存，确认时按 mode 组合，重复应用不累积。
     private var bilingualMode: BilingualMode = .off
     /// 最近一次提交的双语映射结果；mode == .off 时为 nil。
-    private var bilingualOutcome: BilingualMappingOutcome?
+    var bilingualOutcome: BilingualMappingOutcome?
     /// 双语重算代序号：重新 ingest 或再次切换模式使旧重算结果失效。
     private var bilingualGeneration = 0
     /// 测试专用：重算提交前的挂起点（生产路径为 nil），供并发时序测试注入。
     private var bilingualRecomputePause: (@Sendable (BilingualMode) async -> Void)?
+
+    // AI 学习注解预览缓存（导入确认前暂存于内存；重新 ingest 或切换双语模式时重置）。
+    var studyPronunciations: [UUID: LinePronunciation] = [:]
+    var studyTranslationsByLanguage: [String: [UUID: Translation]] = [:]
 
     public init(store: GRDBLyricsStore) {
         self.store = store
@@ -65,10 +69,10 @@ public actor ImportWorkflowService {
         target
     }
 
-    /// 最近一次成功 ingest 的预览；无则为 nil。包含已提交的双语映射结果（若有）。
+    /// 最近一次成功 ingest 的预览；无则为 nil。包含已提交的双语映射及 AI 注解结果（若有）。
     public func currentPreview() -> ImportPreview? {
         guard let file = ingested else { return nil }
-        return Self.makePreview(for: file, bilingualOutcome: bilingualOutcome)
+        return makeCurrentPreview(for: file)
     }
 
     /// 当前生效的双语模式（默认 .off；重新 ingest 后回到 .off）。
@@ -122,6 +126,7 @@ public actor ImportWorkflowService {
             result = try LyricsParser.parse(fileData, filename: filename)
         } catch let error as LyricParseError {
             ingested = nil
+            resetBilingualState()
             throw ImportWorkflowError.parseFailure(error)
         }
         // 防御性 schema 校验：解析产物理论上有稳定 UUID，不会重复，
@@ -129,13 +134,14 @@ public actor ImportWorkflowService {
         let issues = LyricSchemaValidator.issues(in: result.document)
         guard issues.isEmpty else {
             ingested = nil
+            resetBilingualState()
             throw ImportWorkflowError.schemaRejected(issues)
         }
         let file = IngestedFile(document: result.document, diagnostics: result.diagnostics)
         ingested = file
-        // 新文件 = 新的原始解析产物：双语模式回到默认 .off，旧映射结果作废。
+        // 新文件 = 新的原始解析产物：双语模式回到默认 .off，旧映射结果及 AI 注解作废。
         resetBilingualState()
-        return Self.makePreview(for: file, bilingualOutcome: nil)
+        return makeCurrentPreview(for: file)
     }
 
     /// 切换双语模式：用最近一次 ingest 的「原始解析产物」重新应用策略
@@ -151,6 +157,7 @@ public actor ImportWorkflowService {
         bilingualMode = mode
         bilingualGeneration &+= 1
         let myGeneration = bilingualGeneration
+        resetStudyAnnotations()
         guard let file = ingested else {
             bilingualOutcome = nil
             return nil
@@ -169,7 +176,8 @@ public actor ImportWorkflowService {
             return nil
         }
         bilingualOutcome = mode == .off ? nil : outcome
-        return Self.makePreview(for: file, bilingualOutcome: bilingualOutcome)
+        resetStudyAnnotations()
+        return makeCurrentPreview(for: file)
     }
 
     /// 测试专用：注入重算提交前的挂起点（传 nil 恢复生产路径）。
@@ -226,7 +234,7 @@ public actor ImportWorkflowService {
         guard let file = ingested else {
             throw ImportWorkflowError.nothingIngested
         }
-        let preview = Self.makePreview(for: file, bilingualOutcome: bilingualOutcome)
+        let preview = makeCurrentPreview(for: file)
         guard preview.isImportable else {
             throw ImportWorkflowError.previewHasErrors
         }
@@ -234,11 +242,12 @@ public actor ImportWorkflowService {
             throw ImportWorkflowError.noOpenSession
         }
         // 双语译文已在映射时挂到文档行上（source = .imported）；确认走同一条
-        // 提交路径，文档未启用双语时与原始解析产物相同。
+        // 提交路径，并合并导入预览期确认的 AI 注音与译文。
         // 在线获取路径：来源注记随文档一同落库（手动导入不产生注记）。
         let baseDocument = bilingualOutcome?.document ?? file.document
+        let studiedDocument = mergingStudyAnnotations(into: baseDocument)
         let effectiveDocument = Self.annotatedDocument(
-            provenance: provenance, for: baseDocument
+            provenance: provenance, for: studiedDocument
         )
         let binding = try importBinding(target: fixedTarget, document: effectiveDocument)
         do {
@@ -339,13 +348,30 @@ public actor ImportWorkflowService {
         bilingualOutcome = nil
         bilingualGeneration &+= 1
         bilingualRecomputePause = nil
+        resetStudyAnnotations()
+    }
+
+    func makeCurrentPreview(for file: IngestedFile) -> ImportPreview {
+        let baseDocument = bilingualOutcome?.document ?? file.document
+        let studiedDocument = mergingStudyAnnotations(into: baseDocument)
+        let aiTranslatedLineIDs = Set(studyTranslationsByLanguage.values.flatMap(\.keys))
+        let aiTranslationCount = baseDocument.lines.filter { aiTranslatedLineIDs.contains($0.id) }.count
+        let pronunciationCount = studiedDocument.lines.filter { $0.pronunciation != nil }.count
+        return Self.makePreview(
+            for: file,
+            bilingualOutcome: bilingualOutcome,
+            pronunciationLineCount: pronunciationCount,
+            aiTranslationLineCount: aiTranslationCount
+        )
     }
 
     /// 由 ingest 结果构建预览模型（统计、元信息、offset、诊断直传；
     /// 双语映射结果存在时附双语统计与对照区数据）。
     private static func makePreview(
         for file: IngestedFile,
-        bilingualOutcome: BilingualMappingOutcome?
+        bilingualOutcome: BilingualMappingOutcome?,
+        pronunciationLineCount: Int,
+        aiTranslationLineCount: Int
     ) -> ImportPreview {
         let document = file.document
         let timed = document.lines.filter { $0.startMs != nil }.count
@@ -369,7 +395,9 @@ public actor ImportWorkflowService {
             metadata: document.metadata,
             sourceOffsetMs: document.sourceOffsetMs,
             pairedTimestampsAvailable: BilingualImportMapper.hasPairableGroups(document),
-            bilingual: bilingual
+            bilingual: bilingual,
+            pronunciationLineCount: pronunciationLineCount,
+            aiTranslationLineCount: aiTranslationLineCount
         )
     }
 }

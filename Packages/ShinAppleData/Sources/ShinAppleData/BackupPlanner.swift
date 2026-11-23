@@ -23,6 +23,8 @@ public enum BackupPlanner {
         previewDocumentChanges(parsed, currentState, into: &preview)
         previewBindingChanges(parsed, currentState, into: &preview)
         previewSettingChanges(parsed, currentState, into: &preview)
+        previewVocabularyEntryChanges(parsed, currentState, into: &preview)
+        previewVocabularyOccurrenceChanges(parsed, currentState, into: &preview)
         return preview
     }
 
@@ -77,6 +79,44 @@ public enum BackupPlanner {
             case .some(let existing) where existing != incoming:
                 preview.settingsToReplace[key] = BackupSettingReplacement(
                     existing: existing, incoming: incoming
+                )
+            case .some:
+                break
+            }
+        }
+    }
+
+    private static func previewVocabularyEntryChanges(
+        _ parsed: BackupParseResult,
+        _ currentState: BackupStoreSnapshot,
+        into preview: inout BackupConflictPreview
+    ) {
+        for entry in parsed.file.vocabularyEntries ?? [] {
+            switch currentState.vocabularyEntries[entry.id] {
+            case .none:
+                preview.vocabularyEntriesToAdd.append(entry)
+            case .some(let existing) where existing != entry:
+                preview.vocabularyEntriesToReplace.append(
+                    BackupVocabularyEntryReplacement(existing: existing, incoming: entry)
+                )
+            case .some:
+                break
+            }
+        }
+    }
+
+    private static func previewVocabularyOccurrenceChanges(
+        _ parsed: BackupParseResult,
+        _ currentState: BackupStoreSnapshot,
+        into preview: inout BackupConflictPreview
+    ) {
+        for occurrence in parsed.file.vocabularyOccurrences ?? [] {
+            switch currentState.vocabularyOccurrences[occurrence.id] {
+            case .none:
+                preview.vocabularyOccurrencesToAdd.append(occurrence)
+            case .some(let existing) where existing != occurrence:
+                preview.vocabularyOccurrencesToReplace.append(
+                    BackupVocabularyOccurrenceReplacement(existing: existing, incoming: occurrence)
                 )
             case .some:
                 break

@@ -13,9 +13,14 @@ struct NeteaseLyricsFetchView: View {
     @State private var selectedSongId: Int64?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             header
             searchFields
+            NeteaseLyricsFetchSuggestionsView(
+                model: model,
+                canSearch: canSearch,
+                onClose: onClose
+            )
             switch model.phase {
             case .idle, .searching:
                 idleContent
@@ -34,7 +39,17 @@ struct NeteaseLyricsFetchView: View {
             }
         }
         .padding(20)
-        .frame(width: 520, height: 480)
+        .frame(width: 540, height: 520)
+        .onChange(of: model.phase) { _, newPhase in
+            if case let .candidates(ranked) = newPhase {
+                if let current = selectedSongId,
+                   !ranked.contains(where: { $0.candidate.songId == current }) {
+                    selectedSongId = nil
+                }
+            } else if case .searching = newPhase {
+                selectedSongId = nil
+            }
+        }
         .onDisappear { model.cancel() }
     }
 
@@ -68,11 +83,13 @@ struct NeteaseLyricsFetchView: View {
                 Text("歌名").font(.caption).foregroundStyle(.secondary)
                 TextField("歌名", text: $model.queryTitle)
                     .textFieldStyle(.roundedBorder)
+                    .onSubmit { Task { await model.search() } }
             }
             VStack(alignment: .leading, spacing: 3) {
                 Text("歌手（可选）").font(.caption).foregroundStyle(.secondary)
                 TextField("歌手", text: $model.queryArtist)
                     .textFieldStyle(.roundedBorder)
+                    .onSubmit { Task { await model.search() } }
             }
             Button {
                 Task { await model.search() }
@@ -117,6 +134,14 @@ struct NeteaseLyricsFetchView: View {
 
     private func candidateList(_ ranked: [RankedCandidate]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let note = model.searchFallbackNote {
+                HStack(spacing: 4) {
+                    Image(systemName: "info.circle")
+                    Text(note)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             Text("候选（按匹配度排序，请核对歌手与时长）")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -169,6 +194,12 @@ struct NeteaseLyricsFetchView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                if let aliasLine = item.candidate.aliasLine {
+                    Text(aliasLine)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
             Spacer(minLength: 0)
         }

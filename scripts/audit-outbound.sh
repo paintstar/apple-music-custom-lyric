@@ -40,11 +40,11 @@ FORBIDDEN_OUTBOUND=(
   "${FORBIDDEN_SUBPROCESS[@]}"
 )
 
-echo "== 1) App 与所有包的网络/子进程禁令（ShinLyricsProvider 与 AudioLinkImportService.swift 例外分别单审）=="
+echo "== 1) App 与所有包的网络/子进程禁令（ShinLyricsProvider、ShinAIProvider 与 AudioLinkImportService.swift 例外分别单审）=="
 FOUND=0
 while IFS= read -r file; do
   case "$file" in
-    Packages/ShinLyricsProvider/*|"$AUDIO_IMPORT_SERVICE") continue ;;
+    Packages/ShinLyricsProvider/*|Packages/ShinAIProvider/*|"$AUDIO_IMPORT_SERVICE") continue ;;
   esac
   hits="$(grep -nE "${FORBIDDEN_OUTBOUND[@]}" "$file" | grep -vE ':[[:space:]]*//' || true)"
   if [ -n "$hits" ]; then
@@ -145,6 +145,77 @@ else
   fi
 fi
 
+echo "== 1d) ShinAIProvider：受控 AI 出站与密钥边界 =="
+if python3 - <<'AUDIT_AI_PY'
+from pathlib import Path
+import re
+
+root = Path("Packages/ShinAIProvider")
+client = root / "Sources/ShinAIProvider/OpenAICompatibleClient.swift"
+keychain_store = root / "Sources/ShinAIProvider/AIKeychainStore.swift"
+config_file = root / "Sources/ShinAIProvider/AIProviderConfiguration.swift"
+failures = 0
+
+def fail(path, number, reason):
+    global failures
+    failures += 1
+    print(f"  FAIL {path}:{number} {reason}")
+
+if not client.is_file():
+    fail(client, 0, "缺少唯一允许 URLSession 的客户端文件")
+if not keychain_store.is_file():
+    fail(keychain_store, 0, "缺少钥匙串凭据存储文件")
+if not config_file.is_file():
+    fail(config_file, 0, "缺少配置与端点校验文件")
+
+if keychain_store.is_file():
+    kc_text = keychain_store.read_text()
+    if 'serviceName = "com.shinapple.ai-credentials"' not in kc_text:
+        fail(keychain_store, 0, "缺少统一钥匙串 Service 常量 com.shinapple.ai-credentials")
+    if "UserDefaults" in kc_text:
+        fail(keychain_store, 0, "钥匙串存储文件禁止引用 UserDefaults")
+
+if config_file.is_file() and "validatedEndpointURL(" not in config_file.read_text():
+    fail(config_file, 0, "缺少端点协议安全校验函数 validatedEndpointURL")
+
+forbidden_primitives = re.compile(
+    r"NSURLConnection|downloadTask|uploadTask|import\s+Network|NWConnection|NWListener|NWPathMonitor|"
+    r"\b(?:NSTask|posix_spawn|popen|URLCredential)\b|"
+    r"\bProcess\s*(?:\(|\.)|(?<![\w.])system\s*\(|(?:Darwin|Glibc)\.system\s*\(|"
+    r"\b(?:NSAppleScript|NSUserAppleScriptTask|NSAppleEventDescriptor|NSAppleEventManager|"
+    r"SBApplication|SBObject|AESend|AESendMessage|AECreateAppleEvent|AECreateDesc|OSAExecute)\b|"
+    r"import\s+ScriptingBridge|executeAndReturnError|sendEventWithClass|"
+    r"tell\s+(?:application|app)\s|com\.apple\.Music|/usr/bin/osascript"
+)
+hardcoded_secret = re.compile(
+    r"(?:sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[A-Za-z0-9-]{16,}|"
+    r"ghp_[A-Za-z0-9]{20,}|Bearer\s+[A-Za-z0-9_+/.-]{20,})"
+)
+
+for path in sorted(root.rglob("*.swift")):
+    if ".build" in path.parts or ".swiftpm" in path.parts:
+        continue
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            continue
+        if "URLSession" in line and path != client:
+            fail(path, number, "URLSession 仅允许出现在 OpenAICompatibleClient.swift")
+        if forbidden_primitives.search(line):
+            fail(path, number, "出现 AI HTTP 例外之外的出站、子进程或 Apple Events 原语")
+        if hardcoded_secret.search(line):
+            fail(path, number, "出现疑似硬编码第三方 API Key")
+
+if failures:
+    raise SystemExit(1)
+print("  通过：URLSession 限于 OpenAICompatibleClient.swift，未发现禁止原语或硬编码 API Key。")
+AUDIT_AI_PY
+then
+  :
+else
+  FAILURES=$((FAILURES + 1))
+fi
+
 echo "== 2) 废弃 SDK 与私有播放 API 禁令 =="
 FORBIDDEN_PLAYBACK=(
   -e 'MusicKit|MediaRemote|MRMediaRemote|MPMusicPlayerController'
@@ -215,7 +286,8 @@ fi
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
   echo "audit-outbound：通过。播放集成限于 ShinMusicScript → 本机 Music.app 公开脚本；"
-  echo "网络出站限于 ShinLyricsProvider → music.163.com / interface3.music.163.com（搜索与歌词文本）；"
+  echo "网络出站限于 ShinLyricsProvider → music.163.com / interface3.music.163.com（搜索与歌词文本），"
+  echo "以及 ShinAIProvider/OpenAICompatibleClient.swift → 用户配置的 HTTPS/本地回环 OpenAI 兼容端点；"
   echo "本地子进程限于 AudioLinkImportService.swift → 本机 yt-dlp / ffmpeg 参数数组调用；"
   echo "其余源码未发现网络/子进程原语。静态检查不替代真实 Music 人工验证。"
   exit 0

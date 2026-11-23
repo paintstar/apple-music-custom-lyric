@@ -16,6 +16,7 @@ enum Schema {
         registerV1Schema(on: &migrator)
         registerV2TrackKeyNamespace(on: &migrator)
         registerV3DocumentSummary(on: &migrator)
+        registerV4LearningAndVocabulary(on: &migrator)
         return migrator
     }
 
@@ -33,6 +34,16 @@ enum Schema {
         var migrator = DatabaseMigrator()
         registerV1Schema(on: &migrator)
         registerV2TrackKeyNamespace(on: &migrator)
+        return migrator
+    }
+
+    /// v1 + v2 + v3 的迁移器。internal：供测试构造真实 v3 库，
+    /// 验证 v3→v4 升级路径（原有歌词与绑定数据不丢失）。
+    static func v3Migrator() -> DatabaseMigrator {
+        var migrator = DatabaseMigrator()
+        registerV1Schema(on: &migrator)
+        registerV2TrackKeyNamespace(on: &migrator)
+        registerV3DocumentSummary(on: &migrator)
         return migrator
     }
 
@@ -184,6 +195,67 @@ enum Schema {
             )
         }
     }
+
+    /// v4：学习功能与生词本表（vocabularyEntry / vocabularyOccurrence）。
+    /// lyricDocumentId 外键使用 ON DELETE SET NULL，删除歌词文档时保留历史生词快照。
+    private static func registerV4LearningAndVocabulary(on migrator: inout DatabaseMigrator) {
+        migrator.registerMigration("v4.learningAndVocabulary") { db in
+            try db.create(table: "vocabularyEntry") { t in
+                t.primaryKey("id", .text).notNull()
+                t.column("surface", .text).notNull()
+                t.column("lemma", .text).notNull()
+                t.column("reading", .text)
+                t.column("language", .text)
+                t.column("partOfSpeech", .text)
+                t.column("generalMeaning", .text).notNull()
+                t.column("examplesJSON", .text).notNull()
+                t.column("userNote", .text)
+                t.column("mastery", .text).notNull()
+                t.column("createdAt", .text).notNull()
+                t.column("updatedAt", .text).notNull()
+            }
+            try db.create(
+                index: "vocabularyEntry.on.lemma",
+                on: "vocabularyEntry",
+                columns: ["language", "lemma"]
+            )
+            try db.create(
+                index: "vocabularyEntry.on.updatedAt",
+                on: "vocabularyEntry",
+                columns: ["updatedAt"]
+            )
+
+            try db.create(table: "vocabularyOccurrence") { t in
+                t.primaryKey("id", .text).notNull()
+                t.column("entryId", .text).notNull()
+                    .references("vocabularyEntry", onDelete: .cascade)
+                t.column("lyricDocumentId", .text)
+                    .references("lyricDocument", onDelete: .setNull)
+                t.column("lineId", .text)
+                t.column("utf16Location", .integer).notNull()
+                t.column("utf16Length", .integer).notNull()
+                t.column("surfaceInLine", .text).notNull()
+                t.column("contextualMeaning", .text).notNull()
+                t.column("lineTextSnapshot", .text).notNull()
+                t.column("lineTranslationSnapshot", .text)
+                t.column("startMsSnapshot", .integer)
+                t.column("trackKeyHint", .text)
+                t.column("trackTitleHint", .text)
+                t.column("artistHint", .text)
+                t.column("createdAt", .text).notNull()
+            }
+            try db.create(
+                index: "vocabularyOccurrence.on.entryId",
+                on: "vocabularyOccurrence",
+                columns: ["entryId"]
+            )
+            try db.create(
+                index: "vocabularyOccurrence.on.documentAndLine",
+                on: "vocabularyOccurrence",
+                columns: ["lyricDocumentId", "lineId"]
+            )
+        }
+    }
 }
 
 /// lyricDocument 行。payload 是文档的权威 JSON（sortedKeys 规范化）。
@@ -315,4 +387,17 @@ struct SettingRow: Codable, FetchableRecord, MutablePersistableRecord {
 /// 行损坏（库能打开但内容不可解码）。
 struct CorruptRowError: Error, Sendable {
     let reason: String
+}
+
+/// 文档摘要（v3 摘要列；库总览不解码 payload 全文）。
+public struct DocumentSummary: Equatable, Sendable {
+    public let id: UUID
+    public let revision: Int
+    public let updatedAt: String
+    public let lineCount: Int
+    public let timedLineCount: Int
+    public var untimedLineCount: Int { lineCount - timedLineCount }
+    public let sourceOffsetMs: Int64
+    public let titleHint: String?
+    public let originalFilename: String?
 }

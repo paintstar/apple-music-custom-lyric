@@ -178,6 +178,44 @@ public struct LyricsTimelineIndex: Equatable, Sendable {
         return min(nonNegative, durationMs)
     }
 
+    /// 查询从 `startLineId` 到 `endLineId`（含单句或同组起止）的生效播放区间 `[startMs, endMs)`。
+    ///
+    /// - 起始点按 `seekPositionMs(forLineId:durationMs:)` 计算（含偏移换算与 `[0, durationMs]` 裁剪）。
+    /// - 结束点取 `endLineId` 所属时间组之后下一个严格晚于它的时间组的有效起点（不超出 `durationMs`）；
+    ///   若 `endLineId` 已在最后一组，使用 `durationMs`；`durationMs == nil` 时返回 nil（不盲猜终点）。
+    /// - 任一行不存在、未打轴、起止顺序倒置（`startEffective > endEffective`）或无合法正区间（`endMs <= startMs`）返回 nil。
+    public func playbackSegment(
+        fromLineId startLineId: UUID,
+        toLineId endLineId: UUID,
+        durationMs: Int64?
+    ) -> LyricsPlaybackSegment? {
+        if let durationMs, durationMs <= 0 {
+            return nil
+        }
+        guard let startEffective = effectiveStartById[startLineId],
+              let endEffective = effectiveStartById[endLineId],
+              startEffective <= endEffective,
+              let startMs = seekPositionMs(forLineId: startLineId, durationMs: durationMs),
+              let endGroupIndex = groupIndex(atOrBefore: endEffective),
+              groups[endGroupIndex].startMs == endEffective
+        else {
+            return nil
+        }
+
+        let rawEndMs: Int64
+        if endGroupIndex + 1 < groups.count {
+            rawEndMs = groups[endGroupIndex + 1].startMs
+        } else if let durationMs {
+            rawEndMs = durationMs
+        } else {
+            return nil
+        }
+
+        let endMs = durationMs.map { min(rawEndMs, $0) } ?? rawEndMs
+        guard endMs > startMs else { return nil }
+        return LyricsPlaybackSegment(startMs: startMs, endMs: endMs)
+    }
+
     // MARK: - 私有实现
 
     /// 二分查找：最右一个 `startMs <= playbackMs` 的组；首组之前返回 nil。

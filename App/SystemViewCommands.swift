@@ -181,20 +181,40 @@ struct MusicLibraryNavigationMenu: View {
     let onImport: () -> Void
     let onEdit: () -> Void
     @AppStorage(LyricsPanelView.translationsSettingKey) private var showTranslations = true
+    @AppStorage(LyricsPanelView.pronunciationsSettingKey) private var showPronunciations = true
+    @AppStorage(LyricsPanelView.clozeModeSettingKey) private var isClozeMode = false
     @State private var unlinkRequest: LyricsUnlinkRequest?
 
     var body: some View {
         Group {
             if let panel {
                 SyncLyricsMenu(
-                    panel: panel, showTranslations: $showTranslations,
-                    onUnlink: requestUnlink, onEdit: onEdit,
-                    leadingItems: navigationItems, trailingItems: settingsItems, compact: compact,
-                    accessibilityLabel: "播放器菜单", help: "资料库、歌词选项、学习与设置"
+                    panel: panel,
+                    showTranslations: $showTranslations,
+                    showPronunciations: $showPronunciations,
+                    isClozeMode: $isClozeMode,
+                    onToggleCurrentLineLoop: { model.toggleCurrentLineLoop() },
+                    onAIStudy: { model.beginAIStudyPreview() },
+                    onAIKeyPoints: { model.beginAIKeyPoints() },
+                    onUnlink: requestUnlink,
+                    onEdit: onEdit,
+                    leadingItems: navigationItems,
+                    trailingItems: settingsItems,
+                    compact: compact,
+                    accessibilityLabel: "播放器菜单",
+                    help: "资料库、歌词选项、学习与设置"
                 )
             } else {
                 PlaybackMenu(items: navigationItems + LyricsMenuActions.items(
-                    panel: nil, showTranslations: $showTranslations, onUnlink: requestUnlink, onEdit: onEdit
+                    panel: nil,
+                    showTranslations: $showTranslations,
+                    showPronunciations: $showPronunciations,
+                    isClozeMode: $isClozeMode,
+                    onToggleCurrentLineLoop: { model.toggleCurrentLineLoop() },
+                    onAIStudy: { model.beginAIStudyPreview() },
+                    onAIKeyPoints: { model.beginAIKeyPoints() },
+                    onUnlink: requestUnlink,
+                    onEdit: onEdit
                 ) + settingsItems, iconSize: compact ? 14 : PlaybackControlSizing.iconSize,
                              width: compact ? 28 : PlaybackControlSizing.optionSide,
                              height: compact ? 30 : PlaybackControlSizing.optionSide,
@@ -222,6 +242,7 @@ struct MusicLibraryNavigationMenu: View {
             .init(title: "完整播放器", symbol: "play.rectangle", action: onNowPlaying),
             .separator,
             .init(title: "学习"),
+            .init(title: "单词本与笔记", symbol: "character.book.closed", action: { onSelect(.vocabulary) }),
             .init(title: "学习歌曲与备份", symbol: "books.vertical", action: { onSelect(.library) }),
             .init(title: "导入本地歌词", symbol: "square.and.arrow.down", isEnabled: canImport, action: onImport),
             .separator,

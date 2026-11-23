@@ -10,7 +10,9 @@ final class LyricsTextLayout {
         let id: UUID
         let timed: Bool
         let isBlank: Bool
+        let hasStudyNote: Bool
         let originalRange: NSRange
+        let pronunciationRange: NSRange?
         let translationRange: NSRange?
         var frame: NSRect = .zero
         var interactionFrame: NSRect = .zero
@@ -27,20 +29,23 @@ final class LyricsTextLayout {
     private(set) var preludeFrame: NSRect?
     private var preludeRange: NSRange?
     private var waitingSlotLineIds: Set<UUID> = []
-    private var emphasizedIndices: Set<Int> = []
-    private var activeIds: Set<UUID> = []
-    private var hoveredId: UUID?
+    var emphasizedIndices: Set<Int> = []
+    var activeIds: Set<UUID> = []
+    var hoveredId: UUID?
+    var clozeEnabled = false
+    var clozeRangesByLine: [UUID: [NSRange]] = [:]
     /// 是否为亮度渐变（由宿主随 reduceMotion 配置；false 时直接应用终值）。
     var animatesEmphasis = true
 
     // 滚动宿主统一驱动每帧提亮；这里不再拥有独立的 Timer。
     var onNeedsAnimation: (() -> Void)?
-    private struct EmphasisMotion {
+    struct EmphasisMotion {
         var original: LyricsScalarMotion
+        var pronunciation: LyricsScalarMotion?
         var translation: LyricsScalarMotion?
     }
-    private var emphasisMotions: [Int: EmphasisMotion] = [:]
-    private(set) var hasActiveEmphasis = false
+    var emphasisMotions: [Int: EmphasisMotion] = [:]
+    var hasActiveEmphasis = false
 
     init() {
         storage.addLayoutManager(manager)
@@ -56,12 +61,19 @@ final class LyricsTextLayout {
         textView.textContainerInset = .zero
         textView.isVerticallyResizable = false
         textView.isHorizontallyResizable = false
-        textView.setAccessibilityLabel("同步歌词；单击或双击重听，拖动选择文字")
+        textView.setAccessibilityLabel("同步歌词；双击重听，拖动选择文字")
     }
 
-    func rebuild(document: LyricDocument, typography: LyricsTypography, showTranslations: Bool, userDelayMs: Int64 = 0) {
+    func rebuild(
+        document: LyricDocument,
+        typography: LyricsTypography,
+        showTranslations: Bool,
+        showPronunciations: Bool = true,
+        userDelayMs: Int64 = 0
+    ) {
         let text = NSMutableAttributedString(string: "")
         resetEmphasis()
+        clearStudyMarks()
         rows = []
         rowIndices = [:]
         let times = Array(Set(document.lines.compactMap(\.startMs))).sorted()
@@ -85,6 +97,11 @@ final class LyricsTextLayout {
             if line.id == preludeLineId {
                 preludeRange = appendWaitingSlot(to: text)
             }
+            let pronunciation: LinePronunciation? = (!isBlank && showPronunciations)
+                ? line.pronunciation.flatMap {
+                    $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+                }
+                : nil
             let translation = showTranslations ? line.translations[LyricsSyncConstants.translationLanguage] : nil
             let originalRange: NSRange
             if isBlank, waitingSlotLineIds.contains(line.id) {
@@ -94,12 +111,24 @@ final class LyricsTextLayout {
                 originalRange = NSRange(location: text.length, length: 0)
             } else {
                 let compactBlank = isBlank && line.startMs != nil
+                let afterOriginalSpacing = pronunciation != nil
+                    ? LyricsTypography.pronunciationSpacing
+                    : (translation != nil ? LyricsTypography.translationSpacing : LyricsTypography.groupSpacing)
                 originalRange = append(
                     isBlank ? "\u{00a0}" : line.text, to: text,
                     style: (.systemFont(ofSize: compactBlank ? 1 : typography.lineSize, weight: .bold),
                             line.startMs == nil ? 0.3 : 0.35),
-                    spacing: translation == nil ? LyricsTypography.groupSpacing : LyricsTypography.translationSpacing,
+                    spacing: afterOriginalSpacing,
                     lineSpacing: compactBlank ? 0 : typography.lineSize * LyricsTypography.lineSpacingFactor
+                )
+            }
+            var pronunciationRange: NSRange?
+            if let pronunciation {
+                pronunciationRange = append(
+                    pronunciation.text + (pronunciation.needsReview ? "  · 待复核" : ""), to: text,
+                    style: (.systemFont(ofSize: typography.pronunciationSize, weight: .medium), 0.60),
+                    spacing: translation == nil ? LyricsTypography.groupSpacing : LyricsTypography.translationSpacing,
+                    lineSpacing: 2
                 )
             }
             var translationRange: NSRange?
@@ -114,7 +143,10 @@ final class LyricsTextLayout {
             rows.append(Row(
                 id: line.id, timed: line.startMs != nil,
                 isBlank: isBlank,
-                originalRange: originalRange, translationRange: translationRange
+                hasStudyNote: !isBlank && line.studyNote != nil,
+                originalRange: originalRange,
+                pronunciationRange: pronunciationRange,
+                translationRange: translationRange
             ))
         }
         storage.setAttributedString(text)
@@ -163,6 +195,10 @@ final class LyricsTextLayout {
                 ? manager.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
                 : manager.boundingRect(forGlyphRange: glyphs, in: container)
             var groupFrame = rows[index].frame
+            if let range = rows[index].pronunciationRange {
+                let pronounced = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+                groupFrame = groupFrame.union(manager.boundingRect(forGlyphRange: pronounced, in: container))
+            }
             if let range = rows[index].translationRange {
                 let translated = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
                 groupFrame = groupFrame.union(manager.boundingRect(forGlyphRange: translated, in: container))
@@ -180,12 +216,6 @@ final class LyricsTextLayout {
         return height
     }
 
-    func highlight(lineIds: Set<UUID>) {
-        guard lineIds != activeIds else { return }
-        activeIds = lineIds
-        refreshEmphasis()
-    }
-
     /// 同时间组和相邻时间组是普通推进，长句的高度不能把换句误判成远距离 seek。
     /// 合并等待段内的连续打轴空白可跨过；含实词的时间组不能跳过。
     func areNeighboringAnchors(_ previous: UUID?, _ next: UUID) -> Bool {
@@ -193,105 +223,6 @@ final class LyricsTextLayout {
         let lower = min(from, to)
         let upper = max(from, to)
         return upper - lower <= 1 || ((lower + 1)..<upper).allSatisfy { blankTimeGroups.contains($0) }
-    }
-
-    func hover(lineId: UUID?) {
-        guard hoveredId != lineId else { return }
-        hoveredId = lineId
-        refreshEmphasis()
-    }
-
-    /// 计算目标亮度并启动过渡（或直接应用终值）。
-    private func refreshEmphasis() {
-        let currentIndices = activeIds.compactMap { rowIndices[$0] }
-        var next: Set<Int> = []
-        if let anchor = currentIndices.min() {
-            // 超过四行的远端维持底色；只更新前后少量范围，不重建整首文本。
-            next = Set(max(0, anchor - 4)...min(rows.count - 1, anchor + 4))
-        }
-        next.formUnion(currentIndices)
-        if let hoveredId, let index = rowIndices[hoveredId] { next.insert(index) }
-
-        // 移出邻近范围的行回到底色；保留正在呈现的亮度和速度以接续快速换句。
-        for index in emphasizedIndices.union(next).union(emphasisMotions.keys) {
-            let row = rows[index]
-            let current = activeIds.contains(row.id)
-            let hovered = row.id == hoveredId
-            let distance = currentIndices.map { abs(index - $0) }.min() ?? Int.max
-            let original: Double = next.contains(index)
-                ? (current ? 1 : max(hovered ? 0.88 : 0, LyricsTypography.opacity(distance: distance)))
-                : (row.timed ? 0.35 : 0.3)
-            let translation = next.contains(index) ? (current ? 0.8 : (hovered ? 0.75 : 0.5)) : 0.45
-            var motion = emphasisMotions[index] ?? EmphasisMotion(
-                original: LyricsScalarMotion(position: row.timed ? 0.35 : 0.3),
-                translation: row.translationRange == nil ? nil : LyricsScalarMotion(position: 0.45)
-            )
-            motion.original.retarget(original, omega: LyricsMotionStyle.omega)
-            motion.translation?.retarget(translation, omega: LyricsMotionStyle.omega)
-            emphasisMotions[index] = motion
-        }
-        emphasizedIndices = next
-        if animatesEmphasis {
-            hasActiveEmphasis = true
-            onNeedsAnimation?()
-        } else {
-            finishEmphasis()
-        }
-    }
-
-    /// 与滚动共用 displayLink 和阻尼参数；只更新临时颜色，字形和行高保持不变。
-    func advanceEmphasis(by delta: TimeInterval, omega: Double) {
-        guard hasActiveEmphasis else { return }
-        var running = false
-        for index in Array(emphasisMotions.keys) {
-            guard var motion = emphasisMotions[index] else { continue }
-            motion.original.advance(by: delta, omega: omega, tolerance: 0.002)
-            motion.translation?.advance(by: delta, omega: omega, tolerance: 0.002)
-            running = running || !motion.original.isSettled || motion.translation?.isSettled == false
-            emphasisMotions[index] = motion
-            paint(index: index, motion: motion)
-        }
-        hasActiveEmphasis = running
-        if !running { emphasisMotions = emphasisMotions.filter { emphasizedIndices.contains($0.key) } }
-        textView.needsDisplay = true
-    }
-
-    func finishEmphasis() {
-        for index in Array(emphasisMotions.keys) {
-            guard var motion = emphasisMotions[index] else { continue }
-            motion.original.finish()
-            motion.translation?.finish()
-            emphasisMotions[index] = motion
-            paint(index: index, motion: motion)
-        }
-        hasActiveEmphasis = false
-        emphasisMotions = emphasisMotions.filter { emphasizedIndices.contains($0.key) }
-        textView.needsDisplay = true
-    }
-
-    private func paint(index: Int, motion: EmphasisMotion) {
-        let row = rows[index]
-        manager.addTemporaryAttribute(
-            .foregroundColor,
-            value: NSColor.white.withAlphaComponent(motion.original.position),
-            forCharacterRange: row.originalRange
-        )
-        if let range = row.translationRange, let translation = motion.translation {
-            manager.addTemporaryAttribute(
-                .foregroundColor,
-                value: NSColor.white.withAlphaComponent(translation.position),
-                forCharacterRange: range
-            )
-        }
-    }
-
-    private func resetEmphasis() {
-        hasActiveEmphasis = false
-        manager.removeTemporaryAttribute(
-            .foregroundColor, forCharacterRange: NSRange(location: 0, length: storage.length)
-        )
-        emphasisMotions = [:]
-        emphasizedIndices = []
     }
 
     func row(at point: NSPoint) -> Row? {
@@ -313,19 +244,32 @@ final class LyricsTextLayout {
 
 }
 
-/// 保留 NSTextView 原生选词/拖选；单击与双击均重听，完整双击只触发一次。
+/// 保留 NSTextView 原生拖选划词；无修饰键双击歌词行只触发重听跳转且不选中文字，单击用于拖选或取消选区。
 @MainActor
 final class LyricsInteractiveTextView: NSTextView {
     var lineAtPoint: ((NSPoint) -> UUID?)?
+    var hoverLineAtPoint: ((NSPoint) -> UUID?)?
     var onReplayLine: ((UUID) -> Void)?
     var onHoverLine: ((UUID?) -> Void)?
     var replayCursorRects: (() -> [NSRect])?
+    var onSelectionChanged: ((NSRange) -> Void)?
+    var resolveContextMenuWord: (() -> LyricsWordSelection?)?
+    var resolveContextMenuLine: ((NSPoint) -> (lineId: UUID, anchorRect: CGRect)?)?
+    var resolveLineLoopMenuState: ((UUID) -> LyricsLineLoopMenuState?)?
+    var onRequestWordStudy: ((LyricsWordSelection) -> Void)?
+    var onRequestLineStudy: ((UUID, CGRect) -> Void)?
+    var onRequestLineEdit: ((UUID, CGRect) -> Void)?
+    var onToggleSingleLineLoop: ((UUID) -> Void)?
+    var onSetABLoopAnchor: ((UUID) -> Void)?
+    var onCompleteABLoop: ((UUID) -> Void)?
+    var drawStudyIndicators: ((NSRect) -> Void)?
+    var pendingMenuWordSelection: LyricsWordSelection?
+    var pendingMenuLineTarget: (lineId: UUID, anchorRect: CGRect)?
     private(set) var hoveredLineId: UUID?
-    private var clickCandidate: (id: UUID, isDoubleClick: Bool)?
+    private var clickCandidate: UUID?
+    private var didDragDuringMouseDown = false
     private var releasePoint: NSPoint?
     private var hoverTracking: NSTrackingArea?
-    private var pendingReplay: ((UUID) -> Void)?
-    nonisolated(unsafe) private var clickTimer: Timer?
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -351,11 +295,18 @@ final class LyricsInteractiveTextView: NSTextView {
         }
     }
 
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        drawStudyIndicators?(dirtyRect)
+    }
+
     override func mouseMoved(with event: NSEvent) { updateHover(at: convert(event.locationInWindow, from: nil)) }
     override func mouseEntered(with event: NSEvent) { updateHover(at: convert(event.locationInWindow, from: nil)) }
     override func mouseExited(with event: NSEvent) { setHoveredLine(nil) }
 
-    func updateHover(at point: NSPoint) { setHoveredLine(lineAtPoint?(point)) }
+    func updateHover(at point: NSPoint) {
+        setHoveredLine((hoverLineAtPoint ?? lineAtPoint)?(point))
+    }
 
     private func setHoveredLine(_ id: UUID?) {
         guard hoveredLineId != id else { return }
@@ -364,8 +315,22 @@ final class LyricsInteractiveTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        beginPointerInteraction(at: convert(event.locationInWindow, from: nil),
-                                clickCount: event.clickCount, modifiers: event.modifierFlags)
+        let point = convert(event.locationInWindow, from: nil)
+        didDragDuringMouseDown = false
+        beginPointerInteraction(at: point, clickCount: event.clickCount, modifiers: event.modifierFlags)
+        let selectionModifiers: NSEvent.ModifierFlags = [.shift, .control, .option, .command]
+        if event.clickCount >= 2, event.modifierFlags.isDisjoint(with: selectionModifiers) {
+            if selectedRange().length > 0 {
+                setSelectedRange(NSRange(location: 0, length: 0))
+            }
+            if event.clickCount == 2 {
+                endPointerInteraction(at: point, hasSelection: false)
+            } else {
+                clickCandidate = nil
+            }
+            onSelectionChanged?(NSRange(location: 0, length: 0))
+            return
+        }
         // NSTextView 的 mouseDown 内部消费整个拖选事件循环；局部观察其拖动/松手，不截断原生选择。
         let monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] next in
             guard let self, next.window === self.window else { return next }
@@ -376,20 +341,25 @@ final class LyricsInteractiveTextView: NSTextView {
         defer { if let monitor { NSEvent.removeMonitor(monitor) } }
         super.mouseDown(with: event)
         let endpoint = releasePoint ?? convert(event.locationInWindow, from: nil)
+        let selectionRange = selectedRange()
         endPointerInteraction(at: endpoint, hasSelection: selectedRanges.contains { $0.rangeValue.length > 0 })
+        let publishesStudySelection = event.clickCount == 1 || didDragDuringMouseDown
+        onSelectionChanged?(publishesStudySelection ? selectionRange : NSRange(location: 0, length: 0))
     }
 
     func beginPointerInteraction(at point: NSPoint, clickCount: Int, modifiers: NSEvent.ModifierFlags = []) {
-        cancelPendingClick()
         releasePoint = nil
         clickCandidate = nil
         let selectionModifiers: NSEvent.ModifierFlags = [.shift, .control, .option, .command]
-        guard clickCount == 1 || clickCount == 2, modifiers.isDisjoint(with: selectionModifiers),
+        guard clickCount == 2, modifiers.isDisjoint(with: selectionModifiers),
               let id = lineAtPoint?(point) else { return }
-        clickCandidate = (id, clickCount == 2)
+        clickCandidate = id
     }
 
-    func pointerDragged() { clickCandidate = nil }
+    func pointerDragged() {
+        clickCandidate = nil
+        didDragDuringMouseDown = true
+    }
 
     override func selectionRange(forProposedRange range: NSRange, granularity: NSSelectionGranularity) -> NSRange {
         // NSTextView 内部的拖选不一定经过局部事件监视器；保留原生选区，只取消重听候选。
@@ -398,39 +368,15 @@ final class LyricsInteractiveTextView: NSTextView {
     }
 
     func endPointerInteraction(at point: NSPoint, hasSelection: Bool) {
+        _ = hasSelection
         defer { clickCandidate = nil }
-        guard let candidate = clickCandidate, candidate.isDoubleClick || !hasSelection,
-              lineAtPoint?(point) == candidate.id else { return }
-        if candidate.isDoubleClick {
-            onReplayLine?(candidate.id)
-            return
-        }
-        pendingReplay = onReplayLine
-        // 等待系统双击窗口；第二次按下会取消此任务，并在双击松手时只重听一次。
-        let timer = Timer(timeInterval: NSEvent.doubleClickInterval, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.clickTimer = nil
-                let replay = self.pendingReplay
-                self.pendingReplay = nil
-                replay?(candidate.id)
-            }
-        }
-        clickTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        guard let candidateId = clickCandidate, lineAtPoint?(point) == candidateId else { return }
+        onReplayLine?(candidateId)
     }
 
     func clearInteraction() {
-        cancelPendingClick()
         clickCandidate = nil
+        didDragDuringMouseDown = false
         setHoveredLine(nil)
     }
-
-    private func cancelPendingClick() {
-        clickTimer?.invalidate()
-        clickTimer = nil
-        pendingReplay = nil
-    }
-
-    deinit { clickTimer?.invalidate() }
 }

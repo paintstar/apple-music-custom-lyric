@@ -20,6 +20,9 @@ struct ImportFlowView: View {
     @ObservedObject var flow: ImportFlowModel
     @Environment(\.dismiss) private var dismiss
     @State private var showFilePicker = false
+    @State private var aiStudyPreviewModel: AIStudyPreviewModel?
+    @State private var isAIStudyPresented = false
+    @State private var isPreparingAIStudy = false
     @FocusState private var isPastedTextFocused: Bool
 
     /// 模式单选的 UI 标签（区分「成对/分隔符」两个选项）。
@@ -55,6 +58,20 @@ struct ImportFlowView: View {
             allowsMultipleSelection: false
         ) { result in
             handleFilePick(result)
+        }
+        .sheet(isPresented: $isAIStudyPresented, onDismiss: {
+            aiStudyPreviewModel?.invalidate()
+            aiStudyPreviewModel = nil
+        }, content: {
+            if let previewModel = aiStudyPreviewModel {
+                AIStudyPreviewView(model: previewModel)
+            }
+        })
+        .onChange(of: flow.phase) { _, phase in
+            if case .ready = phase {
+                return
+            }
+            isAIStudyPresented = false
         }
     }
 
@@ -174,6 +191,7 @@ struct ImportFlowView: View {
             VStack(alignment: .leading, spacing: 10) {
                 statsRow(preview)
                 ImportBilingualSection(flow: flow, preview: preview)
+                studyEnhancementSection(preview)
                 metadataRow(preview)
                 offsetNote(preview)
                 diagnosticsList(preview)
@@ -364,5 +382,68 @@ struct ImportFlowView: View {
     private static func formatDuration(_ ms: Int64) -> String {
         let totalSeconds = ms / 1_000
         return String(format: "%d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+private extension ImportFlowView {
+    func studyEnhancementSection(_ preview: ImportPreview) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Label("学习增强（可选）", systemImage: "sparkles")
+                    .font(.callout.weight(.semibold))
+                Spacer(minLength: 0)
+                Button("✨ AI 生成注音 / 译文…") {
+                    Task { await openAIStudyPreview() }
+                }
+                .disabled(!preview.isImportable || flow.isRecomputingBilingual || isPreparingAIStudy)
+            }
+            Text(studyEnhancementSummary(preview))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    func studyEnhancementSummary(_ preview: ImportPreview) -> String {
+        if preview.pronunciationLineCount == 0 && preview.aiTranslationLineCount == 0 {
+            return "尚未附带逐行注音或 AI 译文；确认导入前可按需生成并预览合入。"
+        }
+        return "已附带注音 \(preview.pronunciationLineCount) 行 · AI 译文 \(preview.aiTranslationLineCount) 行"
+            + "（确认导入后随歌词一并保存到本机）。"
+    }
+
+    func openAIStudyPreview() async {
+        guard !isPreparingAIStudy else { return }
+        isPreparingAIStudy = true
+        defer { isPreparingAIStudy = false }
+        let expectedGeneration = flow.operationGeneration
+        guard let draft = await flow.currentDraftDocumentForStudy(),
+              flow.operationGeneration == expectedGeneration,
+              case .ready = flow.phase else {
+            return
+        }
+        let previewModel = AIStudyPreviewModel(
+            store: flow.store,
+            document: draft,
+            songTitle: flow.target?.titleHint ?? draft.metadata["ti"]?.first,
+            artist: flow.target?.artistHint ?? draft.metadata["ar"]?.first,
+            commitTarget: .importDraft { items, task, modelName in
+                await flow.applyAIStudyPreview(
+                    items: items,
+                    task: task,
+                    modelName: modelName,
+                    expectedGeneration: expectedGeneration
+                )
+            },
+            isMock: flow.isMock,
+            onApplied: {
+                isAIStudyPresented = false
+            }
+        )
+        aiStudyPreviewModel = previewModel
+        isAIStudyPresented = true
     }
 }

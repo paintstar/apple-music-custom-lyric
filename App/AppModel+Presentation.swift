@@ -154,4 +154,22 @@ extension AppModel {
     var canBeginImport: Bool {
         importFlow != nil && currentTrackKey != nil
     }
+
+    /// 目录搜索错误的中文文案（从 AppModel 主体拆出，控制主体文件长度）。
+    func searchErrorText(_ error: CatalogSearchError) -> String {
+        switch error {
+        case .unauthorized:
+            return "尚未授权 Apple Music 访问。"
+        case .network(let detail):
+            return "网络失败：\(detail)"
+        case .rateLimited:
+            return "请求过于频繁，请稍后再试。"
+        case .trackUnavailable:
+            return "目录暂不可用。"
+        case .unknown(let detail):
+            return "搜索失败：\(detail)"
+        case .emptyTerm:
+            return "请输入搜索关键词。"
+        }
+    }
 }

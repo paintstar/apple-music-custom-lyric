@@ -2,6 +2,7 @@ import Foundation
 import ShinAppleKit
 import ShinAppleData
 import ShinAppServices
+import ShinLyricsEngine
 
 // 歌词面板状态机：关联查询、空态与同步显示。
 // - 关联查询只经 LyricsAssociationService：快照式刷新，序号防旧结果覆盖新状态；
@@ -56,6 +57,11 @@ final class LyricsPanelModel: ObservableObject {
     @Published private(set) var syncDisplay: PlaybackLyricsDisplay = .empty
     @Published private(set) var browseMode: BrowseMode = .follow
     @Published private(set) var scrollRequest: ScrollAnchorRequest?
+    @Published var documentOccurrences: [VocabularyOccurrence] = []
+    var abLoopEvaluator = LyricsABLoopEvaluator()
+    @Published private(set) var activeABLoop: LyricsABLoopTarget?
+    @Published private(set) var pendingLoopAnchorLineId: UUID?
+    var onABLoopActivated: ((LyricsPlaybackSegment) -> Void)?
     /// 编辑器打开期间为 true：同步视图挂起自动定位，不与编辑器抢焦点
     private(set) var isAutoScrollSuspended = false
     /// 当前展示内容所属的曲目键（nil = 尚未展示任何曲目内容）。
@@ -64,11 +70,14 @@ final class LyricsPanelModel: ObservableObject {
     /// 已应用关联结果的曲目生命周期；查询开始时不提前更新，避免旧文档被当作新结果。
     private(set) var displayedTrackEpoch: Int?
 
+    let store: GRDBLyricsStore?
     private let service: LyricsAssociationService?
     /// 宿主（AppModel）持有的同步协调器；nil = 歌词库初始化失败。
     private(set) var coordinator: PlaybackLyricsCoordinator?
     /// 请求序号：切歌或重复刷新时，旧查询结果不得覆盖新状态。
     private var sequence = 0
+    var marksSequence = 0
+    var marksTask: Task<Void, Never>?
     private var requestedTrackEpoch: Int?
     private var visibleAreas: Set<UUID> = []
     private var activeGestures: Set<UUID> = []
@@ -85,6 +94,7 @@ final class LyricsPanelModel: ObservableObject {
 
     init(store: GRDBLyricsStore?, manualResumeDelay: Duration? = nil, defaults: UserDefaults = .standard,
          monotonicTime: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.store = store
         self.defaults = defaults
         manualResumeDelayOverride = manualResumeDelay
         self.monotonicTime = monotonicTime
@@ -124,6 +134,7 @@ final class LyricsPanelModel: ObservableObject {
             browseMode = isAutoScrollSuspended ? .manual : .follow
             scrollRequest = nil
             scrollableLineIds = []
+            clearABLoop()
         }
         requestedTrackEpoch = trackEpoch
         let decision = LyricsPanelTransition.decide(
@@ -135,10 +146,14 @@ final class LyricsPanelModel: ObservableObject {
             state = .noTrack
             displayedTrackKey = nil
             displayedTrackEpoch = nil
+            clearStudyMarks()
+            clearABLoop()
             return
         }
         guard let service else {
             state = .unavailable("本地歌词库不可用，无法读写歌词。")
+            clearStudyMarks()
+            clearABLoop()
             return
         }
         switch decision {
@@ -147,9 +162,11 @@ final class LyricsPanelModel: ObservableObject {
                 retained: content.document,
                 retainedUntimedOnly: content.isUntimedOnly
             )
+            clearStudyMarks()
         case let .loadDirectly(keepCurrentWhileLoading):
             if !keepCurrentWhileLoading {
                 state = .loading
+                clearStudyMarks()
             }
         }
         await coordinator?.waitForPendingDelayWrites()
@@ -166,6 +183,8 @@ final class LyricsPanelModel: ObservableObject {
             guard currentSequence == sequence, !Task.isCancelled else { return }
             state = .unavailable(ErrorText.describe(error))
             displayedTrackKey = trackKey
+            clearStudyMarks()
+            clearABLoop()
         }
     }
 
@@ -183,6 +202,8 @@ final class LyricsPanelModel: ObservableObject {
             scrollableLineIds = []
             state = .unbound
             displayedTrackKey = trackKey
+            clearStudyMarks()
+            clearABLoop()
             coordinator?.applyLyrics(
                 trackKey: trackKey, trackEpoch: trackEpoch, document: nil, userDelayMs: 0
             )
@@ -190,6 +211,8 @@ final class LyricsPanelModel: ObservableObject {
             scrollableLineIds = []
             state = .untimedOnly(document: document)
             displayedTrackKey = trackKey
+            reloadStudyMarks()
+            clearABLoop()
             // 全未打轴：协调器归一为「无同步内容」，面板负责静态展示。
             coordinator?.applyLyrics(
                 trackKey: trackKey, trackEpoch: trackEpoch, document: document,
@@ -199,11 +222,13 @@ final class LyricsPanelModel: ObservableObject {
             scrollableLineIds = Set(document.lines.map(\.id))
             state = .ready(document: document)
             displayedTrackKey = trackKey
+            reloadStudyMarks()
             coordinator?.applyLyrics(
                 trackKey: trackKey, trackEpoch: trackEpoch, document: document,
                 userDelayMs: binding.userDelayMs, binding: binding,
                 expectedDelaySequence: expectedDelaySequence
             )
+            reconcileABLoopWithCurrentDocument(previousDocumentId: previousDocumentId)
         }
         if currentDocumentId != previousDocumentId, !isAutoScrollSuspended {
             browseMode = .follow
@@ -295,12 +320,6 @@ final class LyricsPanelModel: ObservableObject {
 
     // MARK: - 切歌过渡
 
-    /// 是否处于切歌过渡态（旧内容置灰展示 + 提示条）。
-    var isTransitioning: Bool {
-        if case .transitioning = state { return true }
-        return false
-    }
-
     /// 当前状态可保留展示的内容（过渡决策输入；transitioning 保留其旧文档）。
     private var currentRetainedContent: LyricsPanelTransition.RetainedContent? {
         switch state {
@@ -317,27 +336,6 @@ final class LyricsPanelModel: ObservableObject {
         }
     }
 
-    /// 内容变化动画键（视图淡入用）：文档集合变化时改变，纯组内高亮变化不改变。
-    /// 值类型字符串便于 SwiftUI `.animation(value:)` 直接观察。
-    var contentChangeKey: String {
-        switch state {
-        case let .ready(document):
-            return "ready:\(document.id):\(document.revision)"
-        case let .untimedOnly(document):
-            return "untimed:\(document.id):\(document.revision)"
-        case let .transitioning(retained, _):
-            return "transitioning:\(retained.id)"
-        case .unavailable:
-            return "unavailable"
-        case .noTrack:
-            return "noTrack"
-        case .loading:
-            return "loading"
-        case .unbound:
-            return "unbound"
-        }
-    }
-
     /// 滚轮、惯性、滚动条拖动与文本选择都延长手动阅读时间。
     func enterManualBrowsing() {
         guard !isTransitioning, !isAutoScrollSuspended else { return }
@@ -345,6 +343,13 @@ final class LyricsPanelModel: ObservableObject {
         scrollRequest = nil
         lastReadingActivityAt = monotonicTime()
         scheduleManualResume()
+    }
+
+    /// 当前是否具备可跳转的播放锚点行（当前句或间奏等待锚点）。
+    var canReturnToCurrentLine: Bool {
+        guard currentDocumentId != nil, !isAutoScrollSuspended, !isTransitioning,
+              let anchor = scrollAnchor(for: syncDisplay) else { return false }
+        return scrollableLineIds.contains(anchor)
     }
 
     /// 恢复跟随并立即定位当前组；编辑期间不抢焦点。
@@ -368,51 +373,6 @@ final class LyricsPanelModel: ObservableObject {
             return waiting.anchorLineId ?? waiting.nextLineId
         }
         return display.currentLineIds?.first
-    }
-
-    /// 偏移调整（正数延后 / 负数提前，0.1 秒步进）。
-    /// 立即按新偏移重算当前组；持久化由协调器异步完成（失败经 AppModel 提示）。
-    func adjustDelay(byMs deltaMs: Int64) {
-        guard canAdjustDelay, let coordinator else { return }
-        _ = coordinator.setDelay(syncDisplay.userDelayMs + deltaMs)
-    }
-
-    /// 偏移归零。
-    func resetDelay() {
-        guard let coordinator else { return }
-        _ = coordinator.setDelay(0)
-    }
-
-    /// 偏移控制是否可用：仅在「已关联且有打轴行」时提供。
-    var canAdjustDelay: Bool {
-        guard case .ready = state else { return false }
-        return coordinator != nil
-    }
-
-    /// 点击歌词行 → 应请求的播放位置（毫秒；引擎已按 [0,duration] 裁剪）。
-    /// 无歌词/未知行/未打轴行返回 nil，调用方不发起跳转。
-    func seekPosition(forLineId id: UUID) -> Int64? {
-        coordinator?.seekPositionMs(forLineId: id)
-    }
-
-    /// 当前展示的歌词文档 id（ready / untimedOnly 状态下非空）。
-    /// 编辑器打开入口使用（编辑对象在打开时固定为该文档）。
-    /// 过渡期间为 nil：置灰展示的旧文档不作为编辑/解除关联目标。
-    var currentDocumentId: UUID? { currentDocument?.id }
-
-    var currentDocument: LyricDocument? {
-        switch state {
-        case let .ready(document), let .untimedOnly(document):
-            return document
-        case .unavailable, .noTrack, .loading, .unbound, .transitioning:
-            return nil
-        }
-    }
-
-    /// 前台恢复（scenePhase → active）：立即按最近权威快照重算。
-    /// 协调器从不用计时器累加，重算即从真实位置重新出发。
-    func refreshSyncFromForeground() {
-        coordinator?.refresh()
     }
 
     private func requestScroll(to lineId: UUID) {
@@ -455,8 +415,16 @@ final class LyricsPanelModel: ObservableObject {
         if browseMode == .manual { scheduleManualResume() }
     }
 
+    func syncABLoopPublishedState() {
+        let target = abLoopEvaluator.activeTarget
+        if activeABLoop != target { activeABLoop = target }
+        let anchor = abLoopEvaluator.pendingAnchorLineId
+        if pendingLoopAnchorLineId != anchor { pendingLoopAnchorLineId = anchor }
+    }
+
     isolated deinit {
         manualResumeTask?.cancel()
+        marksTask?.cancel()
         if let readingSettingsObserver { NotificationCenter.default.removeObserver(readingSettingsObserver) }
     }
 }

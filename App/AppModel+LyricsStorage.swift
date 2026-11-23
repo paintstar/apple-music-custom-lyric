@@ -41,16 +41,19 @@ extension AppModel {
         // 初始化期间可能没有新采样（例如暂停）；先补齐已有快照，关联结果才有效。
         coordinator.update(snapshot: snapshot)
         panel.attach(coordinator: coordinator)
+        panel.onABLoopActivated = { [weak self] segment in
+            self?.seekToABLoopStartIfNeeded(segment)
+        }
         lyricsPanel = panel
         updateLyricsScrollSuspension()
-        let flow = ImportFlowModel(store: store)
+        let flow = ImportFlowModel(store: store, isMock: isMock)
         flow.onDidConfirm = { [weak self, weak flow] confirmation in
             guard let self, let flow else { return }
             self.finishLyricsImport(confirmation, from: flow)
         }
         importFlow = flow
         // 编辑器：保存成功后同样刷新面板，译文/待复核即时生效。
-        let editor = LyricsEditorModel(store: store)
+        let editor = LyricsEditorModel(store: store, isMock: isMock)
         editor.onDidCommit = { [weak self] in
             self?.refreshLyricsPanel()
         }
@@ -59,6 +62,7 @@ extension AppModel {
         let libraryModel = LyricsLibraryModel(store: store)
         libraryModel.onLibraryChanged = { [weak self] in
             self?.refreshLyricsPanel()
+            NotificationCenter.default.post(name: .shinVocabularyDidChange, object: store)
         }
         libraryModel.canDeleteResources = { [weak self, weak libraryModel] in
             guard let self, let libraryModel else { return false }
@@ -84,6 +88,7 @@ extension AppModel {
             self?.refreshLyricsPanel()
         }
         autoFetch = autoFetchModel
+        installLyricsStudy(store: store)
         observeLyricsStoreChanges(store, panel: panel)
     }
 
@@ -96,6 +101,8 @@ extension AppModel {
                 guard let self, let panel, !Task.isCancelled, !self.isTerminating,
                       self.lyricsPanel === panel else { return }
                 self.refreshLyricsPanel()
+                panel.reloadStudyMarks()
+                NotificationCenter.default.post(name: .shinVocabularyDidChange, object: store)
             }
         }
     }
@@ -137,6 +144,17 @@ extension AppModel {
         library?.cancelResourceDeletion()
         library?.cancelDeletion()
         return true
+    }
+
+    private func dismissPresentedStudySheetsForStorageSwitch() {
+        isImportPresented = false
+        isLyricsEditorPresented = false
+        isAIStudyPreviewPresented = false
+        aiStudyPreviewModel?.invalidate()
+        aiStudyPreviewModel = nil
+        isAIKeyPointsPresented = false
+        aiKeyPointsModel?.invalidate()
+        aiKeyPointsModel = nil
     }
 
     /// 切换歌词库保存位置。directory = nil 表示恢复默认目录。
@@ -218,8 +236,7 @@ extension AppModel {
 
         // 关闭可能打开的导入/编辑窗口（其中的未保存草稿会随旧模型释放），
         // 然后在新库上重建服务全家并强制当前歌曲重新装载。
-        isImportPresented = false
-        isLyricsEditorPresented = false
+        dismissPresentedStudySheetsForStorageSwitch()
         lyricsStore = newStore
         lyricsDatabaseDirectory = targetDirectory
         installLyricsServiceGraph(store: newStore, note: LyricsDatabase.locationNote(

@@ -280,12 +280,28 @@ public actor NeteaseLyricsClient {
         let album = (song["album"] as? [String: Any])?["name"] as? String
         let duration = (song["duration"] as? Int).map(Int64.init)
             ?? song["duration"] as? Int64
+        let aliases = decodeAliases(in: song, primaryTitle: name)
         return NeteaseSongCandidate(
             songId: id,
             title: name,
             artists: artists,
             album: (album?.isEmpty == true) ? nil : album,
-            durationMs: duration
+            durationMs: duration,
+            aliases: aliases
         )
+    }
+
+    private static func decodeAliases(in song: [String: Any], primaryTitle: String) -> [String] {
+        let rawAliases = (song["alias"] as? [String] ?? [])
+            + (song["transNames"] as? [String] ?? [])
+        let trimmedPrimary = primaryTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        var seen: Set<String> = [trimmedPrimary]
+        var result: [String] = []
+        for raw in rawAliases {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+            result.append(trimmed)
+        }
+        return result
     }
 }

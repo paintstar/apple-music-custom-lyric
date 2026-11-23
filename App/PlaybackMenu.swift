@@ -12,6 +12,7 @@ struct PlaybackMenu: NSViewRepresentable {
         var isChecked = false
         var action: (() -> Void)?
         var isSeparator = false
+        var isSectionHeader = false
 
         static let separator = Item(title: "", isSeparator: true)
     }
@@ -73,13 +74,25 @@ struct PlaybackMenu: NSViewRepresentable {
                     menu.addItem(.separator())
                     continue
                 }
+                if item.isSectionHeader {
+                    if #available(macOS 14.0, *) {
+                        menu.addItem(.sectionHeader(title: item.title))
+                    } else {
+                        let header = NSMenuItem(title: item.title, action: nil, keyEquivalent: "")
+                        header.isEnabled = false
+                        menu.addItem(header)
+                    }
+                    continue
+                }
                 let native = NSMenuItem(title: item.title, action: #selector(performAction(_:)), keyEquivalent: "")
                 native.target = self
                 native.tag = index
                 native.isEnabled = item.isEnabled && item.action != nil
                 native.state = item.isChecked ? .on : .off
-                if let symbol = item.symbol {
-                    native.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+                if let symbol = item.symbol,
+                   let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+                    image.isTemplate = true
+                    native.image = image
                 }
                 actions[index] = item.action
                 menu.addItem(native)

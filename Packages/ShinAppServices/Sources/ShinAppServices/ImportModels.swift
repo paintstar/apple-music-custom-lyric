@@ -81,6 +81,40 @@ public struct ImportPreview: Equatable, Sendable {
     public let pairedTimestampsAvailable: Bool
     /// 双语映射结果；未启用（.off）时为 nil。
     public let bilingual: BilingualPreviewInfo?
+    /// 预览文档中已包含注音的行数（含导入预览期合入的 AI 注音）。
+    public let pronunciationLineCount: Int
+    /// 导入预览期合入的 AI 译文行数。
+    public let aiTranslationLineCount: Int
+
+    public init(
+        documentId: UUID,
+        filename: String?,
+        sourceFormat: LyricSourceFormat,
+        diagnostics: [LyricDiagnostic],
+        totalLineCount: Int,
+        timedLineCount: Int,
+        untimedLineCount: Int,
+        metadata: [String: [String]],
+        sourceOffsetMs: Int64,
+        pairedTimestampsAvailable: Bool,
+        bilingual: BilingualPreviewInfo?,
+        pronunciationLineCount: Int = 0,
+        aiTranslationLineCount: Int = 0
+    ) {
+        self.documentId = documentId
+        self.filename = filename
+        self.sourceFormat = sourceFormat
+        self.diagnostics = diagnostics
+        self.totalLineCount = totalLineCount
+        self.timedLineCount = timedLineCount
+        self.untimedLineCount = untimedLineCount
+        self.metadata = metadata
+        self.sourceOffsetMs = sourceOffsetMs
+        self.pairedTimestampsAvailable = pairedTimestampsAvailable
+        self.bilingual = bilingual
+        self.pronunciationLineCount = pronunciationLineCount
+        self.aiTranslationLineCount = aiTranslationLineCount
+    }
 
     /// 诊断中存在 error 时不可确认保存。
     public var isImportable: Bool {

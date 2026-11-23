@@ -7,12 +7,13 @@ ShinApple 使用 SwiftUI 构建界面，局部使用 AppKit 管理窗口和歌�
 | 模块 | 职责 |
 |---|---|
 | `App/` | 界面、窗口、界面状态及服务接线 |
-| `ShinAppleKit` | 领域模型、播放和存储协议、LRC 解析、Mock |
-| `ShinLyricsEngine` | 纯时间轴查询、歌词分组和偏移换算 |
-| `ShinAppleData` | GRDB/SQLite 存储、事务、迁移、备份校验与恢复 |
-| `ShinAppServices` | 导入、关联、编辑、播放与歌词协调、导出和备份工作流，以及本机链接音频下载与标签封装服务 |
+| `ShinAppleKit` | 领域模型（歌词与生词模型）、播放和存储协议、LRC 解析、Mock |
+| `ShinLyricsEngine` | 纯时间轴查询、歌词分组、偏移换算与单句/AB 播放区间计算 |
+| `ShinAppleData` | GRDB/SQLite 存储（含 v4 生词本表）、事务、迁移、备份校验与恢复 |
+| `ShinAppServices` | 导入、关联、编辑、AI 学习协同与本机词典查询、AB 循环状态机、播放与歌词协调、导出（含生词本）与备份工作流，以及本机链接音频下载与标签封装服务 |
 | `ShinMusicScript` | 唯一 Music Apple Events 适配层，包含资料库、播放选项、封面读取与本地音频文件入库 |
-| `ShinLyricsProvider` | 唯一 HTTP 获取层，包含网易云候选查询、歌词文本获取、匹配和双语 LRC 合成 |
+| `ShinLyricsProvider` | 唯一网易云 HTTP 获取层，包含候选查询、歌词文本获取、匹配和双语 LRC 合成 |
+| `ShinAIProvider` | 唯一 OpenAI 兼容学习 HTTP 客户端（HTTPS / 本机回环端点）、提示词构造、结构化解析与 macOS 钥匙串凭据存储 |
 
 界面和服务通过注入协议调用播放、存储与歌词获取能力。领域模型和歌词引擎不依赖 SwiftUI、AppKit、播放系统、数据库或网络；网络层不直接写数据库，获取结果复用歌词导入与确认流程。
 
@@ -70,9 +71,23 @@ Music 脚本快照是播放状态和位置的权威来源，所有内部时间�
 
 设置中的「缓存资源管理」复用当前歌词库模型，按文档统计已关联与未关联资源，支持搜索、选择删除、清理未关联和删除全部。删除预览捕获文档 revision 和完整关联歌曲集合，确认后单事务重验全部目标，任何目标变化整批拒绝；原学习歌曲页的单项删除使用同一流程。每次删除确认有独立标识，多窗口交错不能将 A 的确认应用到 B。提交前暂停并等待在途自动获取，清除目标歌曲的获取待办；删除完成或失败后恢复此前的运行状态，避免旧结果写回或排队刷新再次抓取；换库使旧预览与迟到概览失效，删除期间禁止重复提交和切换保存位置。管理范围是当前库中的歌词、译文和歌曲关联，不清理导出备份、导入源文件、Music 音频或仅驻内存的封面。
 
+## 语言学习、词典与复读
+
+本机离线词典与 AI 学习链路分层协同：划词默认由 `ShinAppServices` 的 `LocalDictionaryService` 调用系统 `CoreServices`（`DCSCopyTextDefinition`）与 `NaturalLanguage`（`NLLanguageRecognizer` / `NLTagger`）在本地完成语种识别、词元还原、词性标注与系统词典释义查询，零网络等待；仅当用户主动点击 AI 解析、批量生成注音/译文或提炼重点词汇时，才通过 `ShinAIProvider` 向用户配置的 OpenAI 兼容端点发起请求。
+
+划词释义使用依附歌词宿主窗口的可缩放原生窗口。拖动结束后将内容区宽高成对写入本机显示偏好，设置页使用同一偏好编辑或恢复默认尺寸。窗口按当前屏幕的可见区域调整，临时限幅不覆盖偏好。
+
+`ShinAIProvider` 将网络出站严格限定在 `OpenAICompatibleClient.swift`（采用 ephemeral `URLSession`，测试经 `URLProtocol` 拦截），并由 `validatedEndpointURL` 校验仅接受 `https` 协议或本地回环地址（`localhost` / `127.0.0.1` / `::1`）的 `http` 协议，禁止内嵌凭据。API Key 由 `SystemKeychainCredentialStore` 保存在 macOS 钥匙串（Service 常量 `com.shinapple.ai-credentials`），不写入 `UserDefaults`、`lyrics.sqlite`、JSON 备份或日志；非敏感预设、Base URL、模型名与注音偏好独立保存在 `UserDefaults`（`AIServiceSettingsStore`）。发送给 AI 服务的提示词仅包含必要的歌词原文（附稳定 `lineId`）、参考译文与曲目名称，不读取或发送音乐库清单或 Cookie。Mock 模式使用 `InMemoryAICredentialStore` 与内置虚构学习客户端，不触碰真实钥匙串或网络。
+
+批量学习与写库遵守人工成果优先原则：导入预览（`ImportFlowView`）、歌词编辑器（`LyricsEditorView`）与歌词面板菜单均可按需触发「AI 生成注音 / 译文」及「提炼本曲重点词汇」，经预览调整并由用户确认后才落库。`AIStudyWorkflowService` 与 `LyricsStudyService` 按稳定 `lineId` 对齐结果（绝不依赖数组下标），已有 `.manual` 来源的注音或译文默认不勾选覆盖；提交持久化时先读取库内文档核对 `expectedRevision`，防止覆盖并发修改。用户在编辑器修改某行原文后，该行已有译文、`pronunciation`（逐行注音）和 `studyNote`（整句笔记）统一标记 `needsReview = true`；文本注音只基于歌词文字生成，不代表歌手实际演唱唱法。
+
+`lyrics.sqlite` v4 引入 `vocabularyEntry` 与 `vocabularyOccurrence` 两张表，跨歌曲按 `(language, lemma)` 归并同一词条并记录每次出现的 `lyricDocumentId`、`lineId`、UTF-16 词段偏移（`utf16Location` / `utf16Length`）与原句/译文/时间戳快照；`lyricDocumentId` 外键使用 `ON DELETE SET NULL`，删除歌词文档后仍保留历史生词快照。主歌词区通过 `NSLayoutManager` 临时绘制属性渲染已收录生词下划线、行末笔记书签和盲听挖空（Cloze）遮罩，不改动 `NSTextStorage` 字符内容或破坏排版行高；开启 Cloze 模式时隐藏已收录词条，鼠标悬停所在行或播放高亮到当前行时自动揭晓。侧边栏「单词本与笔记」支持检索筛选、释义笔记编辑、原声例句跳转「音乐」播放定位、闪卡自测以及 Anki TSV / CSV / Markdown 导出。
+
+单句循环与 AB 选段复读共用时间轴引擎与权威播放快照：`LyricsTimelineIndex.playbackSegment` 按统一公式 `line.startMs − sourceOffsetMs + userDelayMs` 计算生效 `[startMs, endMs)` 区间（末句要求已知 `durationMs`）；`LyricsABLoopEvaluator` 仅在 `.playing` 且匹配当前曲目键、`trackEpoch` 与 `documentId` 时，于越过区间终点后按冷却时间防抖发出 `seekTo`，切歌、换绑或编辑挂起时自动清除循环状态。
+
 ## 边界
 
-Music 脚本使用固定代码和受验证参数，不拼接用户文本为可执行代码；本地音频导入经 `ShinMusicScript` 校验安全 ASCII `.m4a` 路径并由公开 Apple Events 入库。网易云获取访问集中定义的两个域名，匿名、限速，只查询歌曲信息与歌词文本；歌词端点并非官方公开 API，失败需明确呈现。
+Music 脚本使用固定代码和受验证参数，不拼接用户文本为可执行代码；本地音频导入经 `ShinMusicScript` 校验安全 ASCII `.m4a` 路径并由公开 Apple Events 入库。网易云获取仅经 `ShinLyricsProvider` 访问集中定义的两个域名，匿名、限速，只查询歌曲信息与歌词文本；歌词端点并非官方公开 API，失败需明确呈现。AI 学习文本请求仅经 `ShinAIProvider/OpenAICompatibleClient.swift` 访问用户配置的 HTTPS 或本地回环 OpenAI 兼容端点。
 
 链接音频导入的子进程调用仅限 `ShinAppServices` 中的 `AudioLinkImportService.swift`，通过 `Foundation.Process` 参数数组（禁止 shell 拼接）调用本机安装的 `yt-dlp` 与 `ffmpeg` 完成下载与元数据封装；若用户提供浏览器或 `cookies.txt` 来源，仅透传对应 CLI 参数或文件路径，应用不读取、日志输出或持久化 Cookie 内容。音频文件先落位到 `~/Library/Application Support/ShinApple/ImportedAudio/`，入库后若确认「音乐」App 已复制到媒体目录则清理暂存，否则保留源文件以防断链。
 

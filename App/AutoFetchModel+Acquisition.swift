@@ -53,15 +53,58 @@ extension AutoFetchModel {
         track.artist ?? track.albumArtist
     }
 
-    /// 按曲目信息搜索并打分排序。
+    /// 按曲目信息搜索并打分排序；未命中高置信候选且疑似日语罗马音时串行补搜假名。
     private func searchCandidates(for track: MusicLibraryTrack) async throws -> [RankedCandidate] {
         let artist = artist(of: track)
         let keyword = artist.map { "\(track.title) \($0)" } ?? track.title
         let query = LyricsMatchQuery(
             title: track.title, artist: artist, durationMs: track.durationMs
         )
-        let candidates = try await fetchService.searchSongs(query: keyword)
-        return LyricsMatchRanker.rank(candidates: candidates, query: query)
+
+        var primaryReturnedNoResults = false
+        let primaryCandidates: [NeteaseSongCandidate]
+        do {
+            primaryCandidates = try await fetchService.searchSongs(query: keyword)
+        } catch NeteaseLyricsError.noResults {
+            primaryCandidates = []
+            primaryReturnedNoResults = true
+        }
+
+        var merged = primaryCandidates
+        var seenIds = Set(merged.map(\.songId))
+        var ranked = LyricsMatchRanker.rank(candidates: merged, query: query)
+        if !ranked.contains(where: { $0.score.isAutoHighEligible }),
+           let kana = JapaneseRomajiTransliterator.toHiraganaIfLikelyRomaji(track.title) {
+            let trimmedArtist = artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var kanaQueries: [String] = []
+            if !trimmedArtist.isEmpty {
+                let kanaWithArtist = "\(kana) \(trimmedArtist)"
+                if kanaWithArtist != keyword { kanaQueries.append(kanaWithArtist) }
+            }
+            if kana != keyword { kanaQueries.append(kana) }
+
+            for fallbackQuery in kanaQueries {
+                guard !ranked.contains(where: { $0.score.isAutoHighEligible }) else { break }
+                let kanaCandidates = try await searchAllowingNoResults(query: fallbackQuery)
+                for candidate in kanaCandidates where seenIds.insert(candidate.songId).inserted {
+                    merged.append(candidate)
+                }
+                ranked = LyricsMatchRanker.rank(candidates: merged, query: query)
+            }
+        }
+
+        if merged.isEmpty && primaryReturnedNoResults {
+            throw NeteaseLyricsError.noResults
+        }
+        return ranked
+    }
+
+    private func searchAllowingNoResults(query: String) async throws -> [NeteaseSongCandidate] {
+        do {
+            return try await fetchService.searchSongs(query: query)
+        } catch NeteaseLyricsError.noResults {
+            return []
+        }
     }
 
     /// 待确认记录（含最佳候选摘要，帮助用户判断）。

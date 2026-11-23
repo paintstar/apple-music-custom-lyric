@@ -53,7 +53,10 @@ extension AppModel {
     }
 
     func updateLyricsScrollSuspension() {
-        lyricsPanel?.setAutoScrollSuspended(isImportPresented || isLyricsEditorPresented)
+        lyricsPanel?.setAutoScrollSuspended(
+            isImportPresented || isLyricsEditorPresented
+                || isAIStudyPreviewPresented || isAIKeyPointsPresented
+        )
     }
 
     /// 固定用户确认的文档与版本；换歌、换库或编辑后的旧确认不会生效。

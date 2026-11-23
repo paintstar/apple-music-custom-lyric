@@ -52,15 +52,15 @@ extension GRDBLyricsStore {
         }
     }
 
-    /// 源库当前是否已有任何用户数据（文档或绑定）。保存位置切换用它判断
+    /// 源库当前是否已有任何用户数据（文档、绑定或生词）。保存位置切换用它判断
     /// 是否需要搬运数据；空库直接在新位置重建即可。
     public func hasAnyContent() async -> Bool {
-        let documentCount = (try? await relocationSourcePool.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM lyricDocument") ?? 0
+        let count = (try? await relocationSourcePool.read { db in
+            let documentCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM lyricDocument") ?? 0
+            let bindingCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM songBinding") ?? 0
+            let vocabularyCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM vocabularyEntry") ?? 0
+            return documentCount + bindingCount + vocabularyCount
         }) ?? 0
-        let bindingCount = (try? await relocationSourcePool.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM songBinding") ?? 0
-        }) ?? 0
-        return documentCount + bindingCount > 0
+        return count > 0
     }
 }

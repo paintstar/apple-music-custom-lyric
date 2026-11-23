@@ -8,8 +8,26 @@ enum FloatingLyricsPresentation: Equatable {
     struct Line: Identifiable, Equatable {
         let id: UUID
         let text: String
+        let pronunciation: String?
+        let pronunciationNeedsReview: Bool
         let translation: String?
         let translationNeedsReview: Bool
+
+        init(
+            id: UUID,
+            text: String,
+            pronunciation: String? = nil,
+            pronunciationNeedsReview: Bool = false,
+            translation: String? = nil,
+            translationNeedsReview: Bool = false
+        ) {
+            self.id = id
+            self.text = text
+            self.pronunciation = pronunciation
+            self.pronunciationNeedsReview = pronunciationNeedsReview
+            self.translation = translation
+            self.translationNeedsReview = translationNeedsReview
+        }
     }
 
     case current(lines: [Line])
@@ -19,7 +37,8 @@ enum FloatingLyricsPresentation: Equatable {
     @MainActor
     static func resolve(
         snapshot: PlaybackSnapshot, panel: LyricsPanelModel?,
-        display: PlaybackLyricsDisplay, showsTranslations: Bool
+        display: PlaybackLyricsDisplay, showsTranslations: Bool,
+        showsPronunciations: Bool = true
     ) -> FloatingLyricsPresentation {
         if let environment = environmentMessage(snapshot) { return .message(environment) }
         guard let panel else { return .message("歌词服务初始化中……") }
@@ -30,7 +49,8 @@ enum FloatingLyricsPresentation: Equatable {
                 return .message("正在载入当前歌词……")
             }
             return resolveReady(document: document, snapshot: snapshot, display: display,
-                                showsTranslations: showsTranslations)
+                                showsTranslations: showsTranslations,
+                                showsPronunciations: showsPronunciations)
         case .loading, .transitioning:
             return .message("正在载入当前歌词……")
         case .noTrack:
@@ -57,7 +77,7 @@ enum FloatingLyricsPresentation: Equatable {
 
     private static func resolveReady(
         document: LyricDocument, snapshot: PlaybackSnapshot, display: PlaybackLyricsDisplay,
-        showsTranslations: Bool
+        showsTranslations: Bool, showsPronunciations: Bool
     ) -> FloatingLyricsPresentation {
         guard let position = snapshot.positionMs, position >= 0 else {
             return .message("暂时无法读取播放位置")
@@ -71,11 +91,20 @@ enum FloatingLyricsPresentation: Equatable {
                       line.startMs != nil, !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     return .message("暂无当前歌词")
                 }
+                let pronunciation = showsPronunciations ? line.pronunciation : nil
+                let pronunciationText = pronunciation?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? pronunciation?.text : nil
                 let translation = showsTranslations ? line.translations[LyricsSyncConstants.translationLanguage] : nil
                 let translationText = translation?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                     ? translation?.text : nil
-                lines.append(Line(id: id, text: line.text, translation: translationText,
-                                  translationNeedsReview: translationText != nil && translation?.needsReview == true))
+                lines.append(Line(
+                    id: id,
+                    text: line.text,
+                    pronunciation: pronunciationText,
+                    pronunciationNeedsReview: pronunciationText != nil && pronunciation?.needsReview == true,
+                    translation: translationText,
+                    translationNeedsReview: translationText != nil && translation?.needsReview == true
+                ))
             }
             return .current(lines: lines)
         case .noCurrentLine, .cleared:

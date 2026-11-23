@@ -70,7 +70,10 @@ extension AppModel {
         let service: any LyricsFetchServicing = isMock
             ? MockLyricsFetchService() : LiveLyricsFetchService()
         let fetchModel = NeteaseLyricsFetchModel(
-            service: service, matchQuery: matchQuery, target: target
+            service: service,
+            matchQuery: matchQuery,
+            target: target,
+            isMock: isMock
         )
         fetchModel.onDelivered = { lyrics, provenance in
             onDelivered(lyrics, provenance, target)

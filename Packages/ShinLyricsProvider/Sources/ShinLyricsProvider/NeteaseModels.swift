@@ -14,11 +14,18 @@ public struct NeteaseSongCandidate: Identifiable, Equatable, Sendable {
     public let album: String?
     /// 整数毫秒；网易云未知时为 nil。
     public let durationMs: Int64?
+    /// 候选曲目的别名与译名列表（已去重且不含与主标题相同的项）。
+    public let aliases: [String]
 
     public var id: Int64 { songId }
 
     /// UI 展示用歌手行（空列表返回空串，不冒充「未知」）。
     public var artistLine: String { artists.joined(separator: " / ") }
+
+    /// UI 展示用别名行；无别名时为 nil。
+    public var aliasLine: String? {
+        aliases.isEmpty ? nil : aliases.joined(separator: " / ")
+    }
 
     /// 带命名空间的外部引用（与 Music persistent ID 同一存放惯例）。
     public var externalRef: String { "netease:song:\(songId)" }
@@ -28,13 +35,15 @@ public struct NeteaseSongCandidate: Identifiable, Equatable, Sendable {
         title: String,
         artists: [String],
         album: String? = nil,
-        durationMs: Int64? = nil
+        durationMs: Int64? = nil,
+        aliases: [String] = []
     ) {
         self.songId = songId
         self.title = title
         self.artists = artists
         self.album = album
         self.durationMs = durationMs
+        self.aliases = aliases
     }
 }
 

@@ -5,6 +5,7 @@ import ShinAppleKit
 enum SidebarPage: Hashable {
     case music(MusicLibraryDestination)
     case library
+    case vocabulary
     case audioLinkImport
     case settings
 }
@@ -15,7 +16,6 @@ struct SidebarView: View {
     @ObservedObject var browser: MusicLibraryBrowserModel
     @EnvironmentObject private var model: AppModel
     let onEditLyrics: () -> Void
-    let onNowPlaying: () -> Void
     var topContentInset: CGFloat = 0
 
     var body: some View {
@@ -42,6 +42,7 @@ struct SidebarView: View {
                             symbol: playlist.isFolder ? "folder" : "music.note.list")
                     }
                     sectionTitle("学习")
+                    row(.vocabulary, title: "单词本与笔记", symbol: "character.book.closed")
                     row(.library, title: "学习歌曲与备份", symbol: "text.book.closed")
                     actionRow("编辑当前歌词", symbol: "square.and.pencil", action: onEditLyrics)
                         .disabled(!model.canBeginLyricsEditing)
@@ -49,7 +50,6 @@ struct SidebarView: View {
                     row(.audioLinkImport, title: "从链接导入音频", symbol: "link.badge.plus")
                         .help("从音频或视频链接下载并导入歌曲")
                     Divider().padding(.vertical, 10)
-                    actionRow("完整播放器", symbol: "play.square", action: onNowPlaying)
                     row(.settings, title: "设置", symbol: "gearshape")
                     if model.isMock {
                         Label("模拟模式", systemImage: "ladybug")

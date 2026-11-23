@@ -51,6 +51,8 @@ final class ImportFlowModel: ObservableObject {
     /// 确认成功后的回调（宿主核对目标后刷新歌词并立即恢复跟随）。
     var onDidConfirm: ((ImportConfirmation) -> Void)?
 
+    let store: GRDBLyricsStore
+    let isMock: Bool
     private let service: ImportWorkflowService
     /// 代序号：取消/重开/新操作使旧异步结果失效。
     private var generation = 0
@@ -61,7 +63,9 @@ final class ImportFlowModel: ObservableObject {
     /// 「包含译文」关掉前最后使用的非 off 模式（再次打开时恢复）。
     private var lastActiveBilingualMode: BilingualMode = .pairedTimestamps
 
-    init(store: GRDBLyricsStore) {
+    init(store: GRDBLyricsStore, isMock: Bool = false) {
+        self.store = store
+        self.isMock = isMock
         service = ImportWorkflowService(store: store)
     }
 
@@ -327,5 +331,49 @@ final class ImportFlowModel: ObservableObject {
             }
             return try Data(contentsOf: url)
         }.value
+    }
+}
+
+// MARK: - 预览期 AI 学习增强
+
+extension ImportFlowModel {
+    func currentDraftDocumentForStudy() async -> LyricDocument? {
+        await service.currentDraftDocumentForStudy()
+    }
+
+    func applyAIStudyPreview(
+        items: [AIStudyPreviewLine],
+        task: AIStudyBatchTaskKind,
+        modelName: String?,
+        expectedGeneration: Int? = nil
+    ) async {
+        if let expectedGeneration, expectedGeneration != generation { return }
+        guard case .ready = phase, let draft = await service.currentDraftDocumentForStudy() else { return }
+        if let expectedGeneration, expectedGeneration != generation { return }
+
+        var pronunciations: [UUID: LinePronunciation] = [:]
+        var translations: [UUID: Translation] = [:]
+        var language = LyricsSyncConstants.translationLanguage
+        switch task {
+        case .pronunciation(let style):
+            pronunciations = AIStudyWorkflowService.mergedPronunciations(
+                in: draft, items: items, style: style, modelName: modelName
+            )
+        case .translation(let targetLanguage):
+            language = targetLanguage
+            translations = AIStudyWorkflowService.mergedTranslations(
+                in: draft, items: items, language: targetLanguage
+            )
+        }
+
+        guard let updatedPreview = await service.applyStudyAnnotations(
+            pronunciations: pronunciations,
+            translations: translations,
+            language: language
+        ) else { return }
+        if let expectedGeneration, expectedGeneration != generation { return }
+        guard case let .ready(_, existing) = phase else { return }
+        lastReady = (updatedPreview, existing)
+        phase = .ready(updatedPreview, existing: existing)
     }
 }

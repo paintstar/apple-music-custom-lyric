@@ -203,6 +203,32 @@ struct NeteaseLyricsClientTests {
         #expect(lyrics.translatedLRC == nil)
     }
 
+    @Test("搜索：解析 alias 与 transNames，去空白、过滤主标题并保序去重")
+    func searchParsesAndDeduplicatesAliases() async throws {
+        let json = #"""
+        {"code":200,"result":{"songCount":2,"songs":[
+          {"id":2001,"name":"星河原题","duration":210000,
+           "artists":[{"name":"虚拟歌手X"}],
+           "alias":["  别名一  ","","星河原题","别名二","别名一"],
+           "transNames":[" 译名一 ","别名二","星河原题","  "]},
+          {"id":2002,"name":"无别名曲","duration":200000,
+           "artists":[{"name":"虚拟歌手Y"}],
+           "alias":["","无别名曲"]}
+        ]}}
+        """#
+        MockURLProtocol.respond(json: json)
+        let candidates = try await makeClient().searchSongs(query: "星河")
+        #expect(candidates.count == 2)
+
+        let first = try #require(candidates.first)
+        #expect(first.aliases == ["别名一", "别名二", "译名一"])
+        #expect(first.aliasLine == "别名一 / 别名二 / 译名一")
+
+        let second = try #require(candidates.last)
+        #expect(second.aliases.isEmpty)
+        #expect(second.aliasLine == nil)
+    }
+
     @Test("歌词：翻译缺失时 translatedLRC 为 nil")
     func lyricsWithoutTranslation() async throws {
         MockURLProtocol.respond(
