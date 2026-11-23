@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/paintstar/apple-music-custom-lyric/releases/tag/v0.1.4"><img src="https://img.shields.io/badge/Release-v0.1.4-E95D78?style=flat-square" alt="Release v0.1.4" /></a>
-  <a href="https://github.com/paintstar/apple-music-custom-lyric/releases/tag/v0.1.4"><img src="https://img.shields.io/badge/Platform-macOS%2014.0%2B-0A84FF?style=flat-square&logo=apple&logoColor=white" alt="Platform macOS 14.0+" /></a>
+  <a href="https://github.com/paintstar/apple-music-custom-lyric/releases/tag/v0.1.5"><img src="https://img.shields.io/badge/Release-v0.1.5-E95D78?style=flat-square" alt="Release v0.1.5" /></a>
+  <a href="https://github.com/paintstar/apple-music-custom-lyric/releases/tag/v0.1.5"><img src="https://img.shields.io/badge/Platform-macOS%2014.0%2B-0A84FF?style=flat-square&logo=apple&logoColor=white" alt="Platform macOS 14.0+" /></a>
   <img src="https://img.shields.io/badge/Swift-6.0-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 6.0" />
   <a href="#隐私与技术架构"><img src="https://img.shields.io/badge/Architecture-Local--First%20%C2%B7%20Zero%20Telemetry-2EA043?style=flat-square" alt="Local-First Zero Telemetry" /></a>
 </p>
@@ -118,7 +118,7 @@
 ## 30 秒上手
 
 1. **下载安装包**
-   前往 [GitHub Releases (`v0.1.4`)](https://github.com/paintstar/apple-music-custom-lyric/releases/tag/v0.1.4) 下载 `ShinApple-0.1.4-macOS-arm64.dmg`（打开后将 **ShinApple** 拖入 **Applications**）或同名 `.zip` 安装包。
+   前往 [GitHub Releases (`v0.1.5`)](https://github.com/paintstar/apple-music-custom-lyric/releases/tag/v0.1.5) 下载 `ShinApple-0.1.5-macOS-arm64.dmg`（打开后将 **ShinApple** 拖入 **Applications**）或同名 `.zip` 安装包。
    - **系统要求**：**macOS 14.0 及以上**，当前发布 **Apple Silicon（arm64）** 版本，暂未提供 Intel 安装包（最低部署目标不代表所有系统版本和硬件均已实测）。
    - **签名说明**：当前发布包采用 **ad-hoc 签名，未经 Apple 公证**；若系统提示无法验证开发者，请确认下载来源后参照 [Apple 官方说明](https://support.apple.com/zh-cn/102445) 在「系统设置 → 隐私与安全性」中允许打开。
    - **升级提示**：退出 ShinApple 后用新版替换「应用程序」中的旧版即可，本机学习资料会保留（建议升级前先在设置导出 JSON 备份）。
