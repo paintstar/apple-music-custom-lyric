@@ -24,7 +24,7 @@ struct SamplingContinuityTests {
         if controller.snapshot().trackRef == Fixtures.refB, (controller.snapshot().positionMs ?? 0) >= 21_000 {
             published.signal()
         }
-        try #require(await published.wait(timeout: .milliseconds(500)))
+        try #require(await published.wait())
         #expect(executor.recordedReadCount >= 4)
         #expect(controller.snapshot().trackRef == Fixtures.refB)
         #expect((controller.snapshot().positionMs ?? 0) >= 21_000)

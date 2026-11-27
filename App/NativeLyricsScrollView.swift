@@ -24,6 +24,7 @@ struct NativeLyricsScrollView: NSViewRepresentable {
     /// 只读既有受限播放时钟；nil 表示未知、过期或 seek 中，保持静态。
     var waitingPosition: (() -> Int64?)?
     var waitingIsPlaying = false
+    var focusesPlayback = false
     var userDelayMs: Int64 = 0
     var vocabularyOccurrences: [VocabularyOccurrence] = []
     var isClozeMode = false
@@ -73,8 +74,7 @@ final class LyricsScrollView: NSScrollView {
     let displayLinkTarget = LyricsDisplayLinkTarget()
     nonisolated(unsafe) var frameLink: CADisplayLink?
     var lastFrameTime: TimeInterval?
-    var scrollMotion: LyricsScalarMotion?
-    var motionOmega = LyricsMotionStyle.omega
+    var scrollMotion: LyricsScrollMotion?
     var jump: LyricsJumpTransition?
     var waitingNeedsFrames = false
     var hasActiveDisplayLink: Bool { frameLink != nil }
@@ -199,8 +199,8 @@ final class LyricsScrollView: NSScrollView {
         defer { programmaticScrollDepth -= 1 }
         textLayout.animatesEmphasis = !value.reduceMotion
         if value.reduceMotion {
-            cancelAnimation()
             textLayout.finishEmphasis()
+            cancelAnimation()
         }
         let interactionChanged = configuration?.interactionIdentity != value.interactionIdentity
             || configuration?.canSeek != value.canSeek
@@ -244,7 +244,13 @@ final class LyricsScrollView: NSScrollView {
             isClozeMode: value.isClozeMode,
             didRebuild: didRebuild
         )
-        textLayout.highlight(lineIds: value.currentLineIds)
+        let focusesPlayback = value.focusesPlayback && value.followsPlayback && value.waitingInterval == nil
+        let animatesFocus = textLayout.focusesPlayback && focusesPlayback && !value.reduceMotion
+            && !didRebuild && !interactionChanged && jump?.positioned != false
+            && window?.occlusionState.contains(.visible) == true && !textLayout.textView.hasTextSelection
+        textLayout.focusesPlayback = focusesPlayback
+        let focusDistance = animatesFocus ? contentSize.height * LyricsMotionStyle.jumpViewportFraction : nil
+        let transfersFocus = textLayout.highlight(lineIds: value.currentLineIds, focusDistance: focusDistance)
         layoutTextIfNeeded()
         updateWaitingIndicator()
         updateAccessibilityRows()
@@ -260,7 +266,7 @@ final class LyricsScrollView: NSScrollView {
         lastRequestId = request.requestId
         let previousLineId = targetLineId
         targetLineId = request.lineId
-        scroll(to: request.lineId, animated: animate, previousLineId: previousLineId)
+        scroll(to: request.lineId, animated: animate, previousLineId: previousLineId, transfersFocus: transfersFocus)
     }
 
     private func layoutTextIfNeeded() {
@@ -294,7 +300,7 @@ final class LyricsScrollView: NSScrollView {
            let targetLineId, let target = offset(for: targetLineId) {
             setScrollOffset(target)
         } else {
-            setScrollOffset(oldOffset + textTopInset - oldInset)
+            setScrollOffset(oldOffset + textTopInset - oldInset, alignsToBacking: false)
         }
         updateWaitingIndicator()
         updateAccessibilityRows()
@@ -310,17 +316,22 @@ final class LyricsScrollView: NSScrollView {
         } else {
             rowY = textLayout.rows[index].frame.minY
         }
-        return clampedOffset(rowY + textTopInset - viewportAnchorOffset)
+        return clampedOffset(rowY + textTopInset - viewportAnchorOffset, alignsToBacking: true)
     }
 
-    private func clampedOffset(_ proposed: CGFloat) -> CGFloat {
-        min(max(0, proposed), max(0, canvas.frame.height - contentSize.height))
+    private func clampedOffset(_ proposed: CGFloat, alignsToBacking: Bool) -> CGFloat {
+        let limit = max(0, canvas.frame.height - contentSize.height)
+        let offset = min(max(0, proposed), limit)
+        guard alignsToBacking, let window else { return offset }
+        // 一次移动整设备像素，原文、注音和译文保持同一栅格位移。
+        let scale = window.backingScaleFactor
+        return min((offset * scale).rounded(), (limit * scale).rounded(.down)) / scale
     }
 
-    func setScrollOffset(_ value: CGFloat) {
+    func setScrollOffset(_ value: CGFloat, alignsToBacking: Bool = true) {
         programmaticScrollDepth += 1
         defer { programmaticScrollDepth -= 1 }
-        let destination = NSPoint(x: 0, y: clampedOffset(value))
+        let destination = NSPoint(x: 0, y: clampedOffset(value, alignsToBacking: alignsToBacking))
         guard contentView.bounds.origin != destination else { return }
         contentView.scroll(to: destination)
         reflectScrolledClipView(contentView)
@@ -329,6 +340,7 @@ final class LyricsScrollView: NSScrollView {
     func beginUserInteraction() {
         cancelAnimation()
         lyricsScroller.followsPlayback = false
+        textLayout.focusesPlayback = false
     }
 
     private func waitForStableGeometry() {
@@ -346,6 +358,7 @@ final class LyricsScrollView: NSScrollView {
 
     func prepareForRemoval() {
         stopAllFrames()
+        textLayout.focusesPlayback = false
         geometryTimer?.invalidate()
         geometryTimer = nil
         isGeometrySettled = false
@@ -376,8 +389,7 @@ final class LyricsScrollView: NSScrollView {
               canvas.frame.size == measuredDocumentSize else { return }
         // 缩小窗口时 AppKit 可能先约束旧 bounds、稍后才重排；视口与文档尺寸都要稳定。
         // 辅助功能、键盘与选中文字后的滚动可能没有 NSEvent，仍采用同一浏览语义。
-        cancelAnimation()
-        lyricsScroller.followsPlayback = false
+        beginUserInteraction()
         configuration?.onInteraction()
     }
 
@@ -388,7 +400,7 @@ final class LyricsScrollView: NSScrollView {
 
     private func hoverableRow(at point: NSPoint) -> LyricsTextLayout.Row? {
         if let replayable = replayableRow(at: point) { return replayable }
-        guard textLayout.clozeEnabled else { return nil }
+        guard textLayout.clozeEnabled || textLayout.focusesPlayback else { return nil }
         return textLayout.nonBlankRow(at: point)
     }
 

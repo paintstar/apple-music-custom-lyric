@@ -22,11 +22,14 @@ public final class OpenAICompatibleClient: AIStudyProviding, Sendable {
         self.credentialStore = credentialStore
     }
 
-    /// 构造默认无缓存会话；测试可通过 `protocolClasses` 注入本地拦截器。
+    /// 默认会话禁用 Cookie；测试可通过 `protocolClasses` 注入本地拦截器。
     public static func makeDefaultSession(protocolClasses: [AnyClass]? = nil) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = defaultRequestTimeoutSeconds
         config.timeoutIntervalForResource = defaultResourceTimeoutSeconds
+        config.httpCookieStorage = nil
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
         if let protocolClasses {
             config.protocolClasses = protocolClasses
         }
@@ -124,6 +127,37 @@ public final class OpenAICompatibleClient: AIStudyProviding, Sendable {
             throw AIProviderError.emptyResult("句法解析结果缺少总结内容。")
         }
         return explanation
+    }
+
+    public func followUpLine(
+        _ request: AILineFollowUpRequest,
+        configuration: AIConfiguration,
+        apiKey: String?
+    ) async throws -> String {
+        guard let cleanLine = OpenAICompatibleCodec.trimmedNilIfEmpty(request.lineText),
+              let cleanQuestion = OpenAICompatibleCodec.trimmedNilIfEmpty(request.question) else {
+            throw AIProviderError.invalidConfiguration("歌词行和追问不能为空。")
+        }
+        let cleanedRequest = AILineFollowUpRequest(
+            lineText: cleanLine, context: request.context, analysis: request.analysis,
+            history: request.history, question: cleanQuestion
+        )
+        let completion = try await requestCompletion(
+            ChatRequestOptions(
+                configuration: configuration,
+                apiKey: apiKey,
+                messages: AIPromptBuilder.followUpLineMessages(
+                    cleanedRequest,
+                    targetLanguage: configuration.preferredTargetLanguage
+                ),
+                useJSONResponseFormat: false,
+                maxTokens: nil
+            )
+        )
+        guard let answer = OpenAICompatibleCodec.trimmedNilIfEmpty(completion.content) else {
+            throw AIProviderError.emptyResult("整句追问缺少回答。")
+        }
+        return answer
     }
 
     public func generatePronunciations(
@@ -236,8 +270,11 @@ public final class OpenAICompatibleClient: AIStudyProviding, Sendable {
     // MARK: - 网络请求调度
 
     private func requestCompletion(_ options: ChatRequestOptions) async throws -> AICompletionContent {
+        guard session.configuration.identifier == nil else {
+            throw AIProviderError.invalidConfiguration("AI 服务不支持自动跟随重定向的后台网络会话。")
+        }
         let baseURL = try options.configuration.validatedBaseURL()
-        let endpointURL = Self.chatCompletionsURL(from: baseURL)
+        let endpointURL = AIEndpointURL.chatCompletions(from: baseURL)
         let model = options.configuration.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else {
             throw AIProviderError.invalidConfiguration("请先填写模型名称。")
@@ -277,6 +314,7 @@ public final class OpenAICompatibleClient: AIStudyProviding, Sendable {
             responseFormat: spec.useJSONResponseFormat ? AIResponseFormat(type: "json_object") : nil
         )
         var request = URLRequest(url: spec.endpointURL)
+        request.httpShouldHandleCookies = false
         request.httpMethod = "POST"
         request.httpBody = try JSONEncoder().encode(payload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -288,7 +326,7 @@ public final class OpenAICompatibleClient: AIStudyProviding, Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await session.data(for: request, delegate: SameOriginRedirectDelegate())
         } catch {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 throw CancellationError()
@@ -439,17 +477,24 @@ private extension OpenAICompatibleClient {
         return results
     }
 
-    static func chatCompletionsURL(from baseURL: URL) -> URL {
-        if baseURL.path.hasSuffix("/chat/completions") {
-            return baseURL
-        }
-        return baseURL.appendingPathComponent("chat/completions")
-    }
-
     static func milliseconds(from duration: Duration) -> Int {
         let components = duration.components
         let fromSeconds = Int(components.seconds) * 1_000
         let fromAttoseconds = Int(components.attoseconds / 1_000_000_000_000_000)
         return max(0, fromSeconds + fromAttoseconds)
+    }
+}
+
+private final class SameOriginRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest
+    ) async -> URLRequest? {
+        guard AIEndpointURL.isSameOrigin(from: task.originalRequest?.url, to: request.url) else { return nil }
+        var redirectedRequest = request
+        redirectedRequest.httpShouldHandleCookies = false
+        return redirectedRequest
     }
 }

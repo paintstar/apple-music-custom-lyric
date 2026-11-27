@@ -101,6 +101,12 @@ struct WordPopoverState: Identifiable, Equatable {
     }
 }
 
+struct LineFollowUpItem: Identifiable, Equatable {
+    let id = UUID()
+    let turn: AILineFollowUpTurn
+    var isInNoteDraft = false
+}
+
 /// 整句学习解析与笔记 Popover 状态。
 struct LinePopoverState: Identifiable, Equatable {
     let id: UUID
@@ -115,14 +121,54 @@ struct LinePopoverState: Identifiable, Equatable {
     var isLoadingAI: Bool = false
     var aiExplanation: AILineExplanation?
     var aiErrorMessage: String?
+    var questionDraft = ""
+    var followUps: [LineFollowUpItem] = []
+    var isAskingFollowUp = false
+    var followUpErrorMessage: String?
     var draftGrammarSummary: String = ""
     var draftSingingTips: String = ""
     var draftCulturalNote: String = ""
+    var aiDraftModel: String?
     var usedAIForDraft: Bool = false
     var hasEditedAfterAI: Bool = false
     var isSavingNote: Bool = false
     var saveSuccessMessage: String?
     var saveErrorMessage: String?
+}
+
+struct LineDisplayContent: Equatable {
+    static let keyExpressionsMarker = "\n\n重点表达："
+
+    let grammarSummary: String
+    let keyExpressions: [String]
+    let singingTips: String?
+    let culturalNote: String?
+}
+
+extension LinePopoverState {
+    var draftDisplayContent: LineDisplayContent {
+        let marker = draftGrammarSummary.range(of: LineDisplayContent.keyExpressionsMarker, options: .backwards)
+        let summary = marker.map { String(draftGrammarSummary[..<$0.lowerBound]) } ?? draftGrammarSummary
+        let expressions = marker.map {
+            String(draftGrammarSummary[$0.upperBound...]).components(separatedBy: " · ")
+        } ?? []
+        return LineDisplayContent(
+            grammarSummary: summary.trimmingCharacters(in: .whitespacesAndNewlines),
+            keyExpressions: expressions.compactMap(StudyTextHelpers.nonEmpty),
+            singingTips: StudyTextHelpers.nonEmpty(draftSingingTips),
+            culturalNote: StudyTextHelpers.nonEmpty(draftCulturalNote)
+        )
+    }
+
+    var analysisDisplayContent: LineDisplayContent? {
+        guard let aiExplanation else { return nil }
+        return LineDisplayContent(
+            grammarSummary: aiExplanation.grammarSummary.trimmingCharacters(in: .whitespacesAndNewlines),
+            keyExpressions: aiExplanation.keyExpressions.compactMap(StudyTextHelpers.nonEmpty),
+            singingTips: StudyTextHelpers.nonEmpty(aiExplanation.singingTips),
+            culturalNote: StudyTextHelpers.nonEmpty(aiExplanation.culturalNote)
+        )
+    }
 }
 
 /// 单句歌词 / 注音 / 译文快捷编辑 Popover 状态。

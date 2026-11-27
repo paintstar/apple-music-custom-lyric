@@ -431,14 +431,16 @@ private extension ImportFlowView {
             songTitle: flow.target?.titleHint ?? draft.metadata["ti"]?.first,
             artist: flow.target?.artistHint ?? draft.metadata["ar"]?.first,
             commitTarget: .importDraft { items, task, modelName in
-                await flow.applyAIStudyPreview(
+                try await flow.applyAIStudyPreview(
                     items: items,
                     task: task,
                     modelName: modelName,
+                    expectedDocument: draft,
                     expectedGeneration: expectedGeneration
                 )
             },
             isMock: flow.isMock,
+            draftCache: flow.aiStudyDraftCache,
             onApplied: {
                 isAIStudyPresented = false
             }

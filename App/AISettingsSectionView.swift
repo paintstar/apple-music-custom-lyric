@@ -86,7 +86,7 @@ final class AISettingsSectionModel: ObservableObject {
 
     func refreshKeychainPresence() {
         do {
-            hasSavedAPIKey = (try credentialStore.apiKey(for: preset)) != nil
+            hasSavedAPIKey = try credentialStore.hasAPIKey(for: preset)
         } catch {
             hasSavedAPIKey = false
             keyStatusIsError = true

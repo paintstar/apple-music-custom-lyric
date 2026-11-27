@@ -173,10 +173,34 @@ public final class ScriptingBridgeExecutor: MusicScriptExecutor, MusicArtworkPro
         }
     }
 
+    public func seek(toSeconds seconds: Double, expectedPersistentID: String) throws {
+        try commandExecutor.seek(toSeconds: seconds, expectedPersistentID: expectedPersistentID)
+    }
+
     /// SB 侧不做 whose 查询（需要生成头文件，收益低）：点播统一走
     /// 单曲底层入口不支持；控制器通过完整上下文保留连续播放范围。
     public func playPersistentID(_ persistentID: String) throws {
         throw MusicScriptFailure.commandUnsupported("playPersistentID")
+    }
+
+    public func playVocabularyExample(
+        persistentID: String, positionMs: Int64?,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try commandExecutor.playVocabularyExample(
+            persistentID: persistentID, positionMs: positionMs,
+            checkCancellation: checkCancellation
+        )
+    }
+
+    public func playVocabularyExample(
+        persistentID: String, positionMs: Int64?, replacingPersistentID: String,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try commandExecutor.playVocabularyExample(
+            persistentID: persistentID, positionMs: positionMs, replacingPersistentID: replacingPersistentID,
+            checkCancellation: checkCancellation
+        )
     }
 
     // MARK: - 封面（MusicArtworkProviding）

@@ -3,6 +3,12 @@ import ShinAIProvider
 import ShinAppleData
 import ShinAppleKit
 
+/// 整句解析与追问实际提交的歌词文本。
+public struct AILineInput: Equatable, Sendable {
+    public let text: String
+    public let context: AILineContext
+}
+
 /// 歌词学习协同服务：封装本机离线查词、AI 划词/整句解析、生词本入库与整句笔记持久化。
 /// 全部 AI 解析由用户显式操作触发，不随切歌自动调用，也不静默覆盖人工成果。
 public struct LyricsStudyService: Sendable {
@@ -82,49 +88,141 @@ public struct LyricsStudyService: Sendable {
         }
     }
 
-    /// 用户显式触发的 AI 整句解析：按稳定 `lineId` 提取目标行与前后非空邻行组成 `AILineContext`。
+    /// 打开整句解析时优先复用相同的本地结果。主动重新解析可跳过读取缓存。
     public func explainLineWithAI(
         document: LyricDocument,
         lineId: UUID,
-        songTitle: String?,
-        artist: String?
+        songTitle: String? = nil,
+        artist: String? = nil,
+        useCache: Bool = true,
+        configuration: AIConfiguration? = nil
     ) async throws -> AILineExplanation {
         _ = (songTitle, artist)
-        if Task.isCancelled {
-            throw AIStudyWorkflowError.cancelled
-        }
-
-        guard let targetIndex = document.lines.firstIndex(where: { $0.id == lineId }) else {
-            throw AIStudyWorkflowError.editingError(.lineNotFound(lineId: lineId))
-        }
-
-        let targetLine = document.lines[targetIndex].text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !targetLine.isEmpty else {
-            throw AIStudyWorkflowError.providerError(.invalidConfiguration("待解析歌词行不能为空。"))
-        }
-
-        let context = AILineContext(
-            previousLine: Self.nearestNonEmptyLine(in: document.lines, before: targetIndex),
-            nextLine: Self.nearestNonEmptyLine(in: document.lines, after: targetIndex),
-            sourceLanguage: Self.normalizedNonEmpty(document.sourceLanguage)
-        )
-        let configuration = configurationProvider()
-        let apiKey = apiKeyProvider()
-
         do {
-            let result = try await aiClient.explainLine(
-                targetLine,
-                context: context,
-                configuration: configuration,
-                apiKey: apiKey
-            )
-            if Task.isCancelled {
-                throw AIStudyWorkflowError.cancelled
+            try Task.checkCancellation()
+            let input = try Self.requiredLineInput(document: document, lineId: lineId)
+            let configuration = configuration ?? configurationProvider()
+            let cacheKey = Self.lineExplanationCacheKey(lineId: lineId, input: input, configuration: configuration)
+
+            if useCache, let cached = await cachedLineExplanation(documentId: document.id, key: cacheKey) {
+                try Task.checkCancellation()
+                return cached
             }
-            return result
+            let cacheGeneration = try? await store.aiStudyCacheGeneration()
+            try Task.checkCancellation()
+            let explanation = try await aiClient.explainLine(
+                input.text,
+                context: input.context,
+                configuration: configuration,
+                apiKey: apiKeyProvider()
+            )
+            try Task.checkCancellation()
+            guard Self.normalizedNonEmpty(explanation.grammarSummary) != nil else {
+                throw AIProviderError.emptyResult("句法解析结果缺少总结内容。")
+            }
+            if let cacheGeneration, let payload = try? JSONEncoder().encode(explanation) {
+                try? await store.saveAIStudyCachePayload(
+                    payload, documentID: document.id, key: cacheKey, generation: cacheGeneration
+                )
+            }
+            try Task.checkCancellation()
+            return explanation
         } catch {
             throw Self.mapAIError(error)
         }
+    }
+
+    /// 只把歌词上下文、原始 AI 解析及少量追问记录发给配置的服务。
+    public func followUpLineWithAI(
+        document: LyricDocument,
+        lineId: UUID,
+        analysis: AILineExplanation?,
+        history: [AILineFollowUpTurn],
+        question: String,
+        configuration: AIConfiguration? = nil
+    ) async throws -> String {
+        do {
+            let input = try Self.requiredLineInput(document: document, lineId: lineId)
+            guard let question = Self.normalizedNonEmpty(question) else {
+                throw AIProviderError.invalidConfiguration("追问不能为空。")
+            }
+            try await checkLineContext(documentId: document.id, lineId: lineId, expected: input)
+            let configuration = configuration ?? configurationProvider()
+            var aiAnalysis = analysis
+            if aiAnalysis == nil {
+                let key = Self.lineExplanationCacheKey(lineId: lineId, input: input, configuration: configuration)
+                aiAnalysis = await cachedLineExplanation(documentId: document.id, key: key)
+            }
+            try Task.checkCancellation()
+            let answer = try await aiClient.followUpLine(
+                AILineFollowUpRequest(
+                    lineText: input.text,
+                    context: input.context,
+                    analysis: aiAnalysis,
+                    history: Array(history.suffix(3)),
+                    question: question
+                ),
+                configuration: configuration,
+                apiKey: apiKeyProvider()
+            )
+            try await checkLineContext(documentId: document.id, lineId: lineId, expected: input)
+            guard let cleanedAnswer = Self.normalizedNonEmpty(answer) else {
+                throw AIProviderError.emptyResult("整句追问缺少回答。")
+            }
+            return cleanedAnswer
+        } catch {
+            throw Self.mapAIError(error)
+        }
+    }
+
+    public static func lineInput(document: LyricDocument, lineId: UUID) -> AILineInput? {
+        guard let index = document.lines.firstIndex(where: { $0.id == lineId }),
+              let targetLine = normalizedNonEmpty(document.lines[index].text) else { return nil }
+        return AILineInput(
+            text: targetLine,
+            context: AILineContext(
+                previousLine: nearestNonEmptyLine(in: document.lines, before: index),
+                nextLine: nearestNonEmptyLine(in: document.lines, after: index),
+                sourceLanguage: normalizedNonEmpty(document.sourceLanguage)
+            )
+        )
+    }
+
+    private static func requiredLineInput(document: LyricDocument, lineId: UUID) throws -> AILineInput {
+        if let input = lineInput(document: document, lineId: lineId) { return input }
+        guard document.lines.contains(where: { $0.id == lineId }) else {
+            throw AIStudyWorkflowError.editingError(.lineNotFound(lineId: lineId))
+        }
+        throw AIProviderError.invalidConfiguration("待解析歌词行不能为空。")
+    }
+
+    private static func lineExplanationCacheKey(
+        lineId: UUID, input: AILineInput, configuration: AIConfiguration
+    ) -> String {
+        AIStudyCacheKey.make(task: "line-explanation", configuration: configuration, inputs: [
+            lineId.uuidString,
+            input.text,
+            input.context.sourceLanguage ?? "",
+            input.context.previousLine ?? "",
+            input.context.nextLine ?? "",
+            configuration.preferredTargetLanguage
+        ])
+    }
+
+    private func cachedLineExplanation(documentId: UUID, key: String) async -> AILineExplanation? {
+        guard let payload = try? await store.aiStudyCachePayload(documentID: documentId, key: key),
+              let explanation = try? JSONDecoder().decode(AILineExplanation.self, from: payload),
+              Self.normalizedNonEmpty(explanation.grammarSummary) != nil else { return nil }
+        return explanation
+    }
+
+    private func checkLineContext(documentId: UUID, lineId: UUID, expected: AILineInput) async throws {
+        try Task.checkCancellation()
+        guard let current = try await store.document(id: documentId),
+              Self.lineInput(document: current, lineId: lineId) == expected else {
+            throw AIStudyWorkflowError.cancelled
+        }
+        try Task.checkCancellation()
     }
 
     /// 保存生词词条及原声出处快照；同一词条不同位置自动归并去重。

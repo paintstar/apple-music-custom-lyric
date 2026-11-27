@@ -2,6 +2,11 @@ import Foundation
 import ShinAppleData
 import ShinAppleKit
 
+enum VocabularyPlaybackSource: Equatable {
+    case book
+    case flashcard
+}
+
 // swiftlint:disable inclusive_language
 /// 单词本与笔记页面状态机：负责检索筛选、详情编辑、原声点播与状态同步。
 @MainActor
@@ -12,7 +17,8 @@ final class VocabularyBookModel: ObservableObject {
     @Published private(set) var isMutating = false
     @Published var statusMessage: String?
     @Published private(set) var statusTone: VocabularyBookStatusTone = .info
-    @Published private(set) var playingOccurrenceId: UUID?
+    @Published private var playingOccurrence: VocabularyPlaybackRequest?
+    @Published private var pendingPlayback: VocabularyPendingPlayback?
 
     @Published var searchText: String = "" {
         didSet { ensureValidSelection() }
@@ -35,7 +41,8 @@ final class VocabularyBookModel: ObservableObject {
     @Published var flashcardStats = VocabularyFlashcardStats()
 
     private let store: GRDBLyricsStore
-    private let onPlayOccurrence: @MainActor (VocabularyOccurrence) async -> String?
+    private let onPlayOccurrence: @MainActor (VocabularyOccurrence) async -> VocabularyOccurrencePlaybackOutcome
+    private let onConfirmPlayback: @MainActor (VocabularyPlaybackConfirmation) async -> VocabularyOccurrencePlaybackOutcome
     var onVocabularyChanged: (@MainActor () -> Void)?
 
     private var reloadSequence = 0
@@ -45,11 +52,15 @@ final class VocabularyBookModel: ObservableObject {
 
     init(
         store: GRDBLyricsStore,
-        onPlayOccurrence: @escaping @MainActor (VocabularyOccurrence) async -> String?,
+        onPlayOccurrence: @escaping @MainActor (VocabularyOccurrence) async -> VocabularyOccurrencePlaybackOutcome,
+        onConfirmPlayback: @escaping @MainActor (
+            VocabularyPlaybackConfirmation
+        ) async -> VocabularyOccurrencePlaybackOutcome = { _ in .cancelled },
         onVocabularyChanged: (@MainActor () -> Void)? = nil
     ) {
         self.store = store
         self.onPlayOccurrence = onPlayOccurrence
+        self.onConfirmPlayback = onConfirmPlayback
         self.onVocabularyChanged = onVocabularyChanged
     }
 
@@ -240,30 +251,12 @@ final class VocabularyBookModel: ObservableObject {
         }
     }
 
-    func playOccurrence(_ occurrence: VocabularyOccurrence) {
-        guard !isInvalidated, playingOccurrenceId == nil else { return }
-        playingOccurrenceId = occurrence.id
-        statusMessage = nil
-        let handler = onPlayOccurrence
-        playTask = Task { @MainActor [weak self] in
-            defer {
-                if let self, self.playingOccurrenceId == occurrence.id {
-                    self.playingOccurrenceId = nil
-                }
-            }
-            let message = await handler(occurrence)
-            guard let self, !self.isInvalidated, !Task.isCancelled else { return }
-            if let message {
-                self.setStatus(message, tone: .warning)
-            }
-        }
-    }
-
     func clearPendingExport() {
         pendingExport = nil
     }
 
     func closeFlashcards() {
+        cancelOccurrencePlayback(source: .flashcard)
         isFlashcardPresented = false
     }
 
@@ -278,14 +271,99 @@ final class VocabularyBookModel: ObservableObject {
     func invalidate() {
         isInvalidated = true
         reloadSequence += 1
-        playTask?.cancel()
-        playTask = nil
+        cancelOccurrencePlayback()
         pendingMutationTask?.cancel()
         pendingMutationTask = nil
         onVocabularyChanged = nil
     }
 }
 // swiftlint:enable inclusive_language
+
+private struct VocabularyPlaybackRequest {
+    let id = UUID()
+    let occurrence: VocabularyOccurrence
+    let source: VocabularyPlaybackSource
+}
+
+private struct VocabularyPendingPlayback {
+    let request: VocabularyPlaybackRequest
+    let confirmation: VocabularyPlaybackConfirmation
+}
+
+extension VocabularyBookModel {
+    var playingOccurrenceId: UUID? { playingOccurrence?.occurrence.id }
+
+    func playOccurrence(_ occurrence: VocabularyOccurrence, source: VocabularyPlaybackSource = .book) {
+        guard pendingPlayback == nil else { return }
+        let handler = onPlayOccurrence
+        startOccurrencePlayback(VocabularyPlaybackRequest(occurrence: occurrence, source: source)) {
+            await handler(occurrence)
+        }
+    }
+
+    func playbackConfirmation(for source: VocabularyPlaybackSource) -> VocabularyPlaybackConfirmation? {
+        pendingPlayback?.request.source == source ? pendingPlayback?.confirmation : nil
+    }
+
+    func dismissPlaybackConfirmation(_ confirmation: VocabularyPlaybackConfirmation) {
+        guard pendingPlayback?.confirmation.id == confirmation.id else { return }
+        pendingPlayback = nil
+    }
+
+    func confirmPlayback(_ confirmation: VocabularyPlaybackConfirmation) {
+        guard let pendingPlayback, pendingPlayback.confirmation.id == confirmation.id else { return }
+        self.pendingPlayback = nil
+        let handler = onConfirmPlayback
+        startOccurrencePlayback(pendingPlayback.request) { await handler(confirmation) }
+    }
+
+    private func startOccurrencePlayback(
+        _ request: VocabularyPlaybackRequest,
+        operation: @escaping @MainActor () async -> VocabularyOccurrencePlaybackOutcome
+    ) {
+        guard !isInvalidated, playingOccurrence == nil else { return }
+        playingOccurrence = request
+        statusMessage = nil
+        playTask = Task { @MainActor [weak self] in
+            guard !Task.isCancelled else { return }
+            let result = await operation()
+            guard let self, self.playingOccurrence?.id == request.id else { return }
+            self.playingOccurrence = nil
+            self.playTask = nil
+            guard !self.isInvalidated, !Task.isCancelled else { return }
+            self.applyOccurrencePlaybackOutcome(result, request: request)
+        }
+    }
+
+    func cancelOccurrencePlayback(source: VocabularyPlaybackSource? = nil) {
+        if source == nil || pendingPlayback?.request.source == source {
+            pendingPlayback = nil
+        }
+        guard let request = playingOccurrence, source == nil || request.source == source else { return }
+        playTask?.cancel()
+        playTask = nil
+        playingOccurrence = nil
+    }
+
+    func cancelOccurrencePlaybackOutsideEntry(_ entryId: UUID?, source: VocabularyPlaybackSource) {
+        guard let request = pendingPlayback?.request ?? playingOccurrence,
+              request.source == source, request.occurrence.entryId != entryId else { return }
+        cancelOccurrencePlayback(source: source)
+    }
+
+    private func applyOccurrencePlaybackOutcome(_ result: VocabularyOccurrencePlaybackOutcome, request: VocabularyPlaybackRequest) {
+        switch result {
+        case .played, .cancelled:
+            break
+        case .requiresQueueConfirmation(let confirmation):
+            pendingPlayback = VocabularyPendingPlayback(request: request, confirmation: confirmation)
+        case .information(let message):
+            setStatus(message, tone: .info)
+        case .warning(let message):
+            setStatus(message, tone: .warning)
+        }
+    }
+}
 
 // MARK: - 内部队列、检索与分组助手
 

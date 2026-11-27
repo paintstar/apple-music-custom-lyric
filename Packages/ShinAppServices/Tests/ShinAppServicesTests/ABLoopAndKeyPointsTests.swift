@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Security
 import Testing
 import ShinAIProvider
 import ShinAppleData
@@ -294,6 +295,39 @@ struct AIKeyStudyPointsTests {
             _ = try await service.extractKeyStudyPoints(for: doc)
             Issue.record("应当映射 CancellationError")
         } catch let error as AIStudyWorkflowError { #expect(error == .cancelled) }
+    }
+
+    @Test("凭据读取失败时按当前任务预设读取一次并中止请求")
+    func credentialDenialStopsAIWorkflows() async throws {
+        let (store, dir) = try TestEnv.makeTempStore()
+        defer { TestEnv.cleanup(dir) }
+        let document = LyricDocument(lines: [LyricLine(startMs: 1_000, text: "虚构的星灯测试句")])
+        let client = KeyPointsMockAIClient()
+        let requestedPresets = OSAllocatedUnfairLock(initialState: [AIProviderPreset]())
+        let denial = AIProviderError.keychainError(status: errSecAuthFailed)
+        let service = AIStudyWorkflowService(
+            store: store, aiClient: client,
+            configurationProvider: { AIConfiguration(preset: .deepSeek, modelName: "mock-model") },
+            apiKeyProvider: {
+                Issue.record("凭据读取失败后不应调用旧入口重试")
+                return nil
+            },
+            configuredAPIKeyProvider: { preset in
+                requestedPresets.withLock { $0.append(preset) }
+                throw denial
+            }
+        )
+        await #expect(throws: AIStudyWorkflowError.providerError(denial)) {
+            try await service.extractKeyStudyPoints(for: document)
+        }
+        await #expect(throws: AIStudyWorkflowError.providerError(denial)) {
+            try await service.generatePreview(
+                for: document, task: .translation(targetLanguage: "zh-Hans"),
+                configuration: AIConfiguration(preset: .openAI, modelName: "mock-model")
+            )
+        }
+        #expect(client.capturedCalls.isEmpty)
+        #expect(requestedPresets.withLock { $0 } == [.deepSeek, .openAI])
     }
 
     @Test("saveKeyStudyPoints：提取行快照、UTF-16 词段偏移并按词元归并入库")

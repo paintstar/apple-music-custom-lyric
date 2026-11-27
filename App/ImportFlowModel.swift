@@ -53,6 +53,7 @@ final class ImportFlowModel: ObservableObject {
 
     let store: GRDBLyricsStore
     let isMock: Bool
+    private(set) var aiStudyDraftCache = AIStudyPreviewCache()
     private let service: ImportWorkflowService
     /// 代序号：取消/重开/新操作使旧异步结果失效。
     private var generation = 0
@@ -98,6 +99,7 @@ final class ImportFlowModel: ObservableObject {
         lastReady = nil
         pastedText = ""
         resetBilingualUIState()
+        aiStudyDraftCache = AIStudyPreviewCache()
         do {
             try await service.openImportSession(target: newTarget, provenance: provenance)
             guard currentGeneration == generation else { return }
@@ -152,6 +154,7 @@ final class ImportFlowModel: ObservableObject {
         phase = .loadingPreview
         alertMessage = nil
         resetBilingualUIState()
+        aiStudyDraftCache = AIStudyPreviewCache()
         do {
             // 沙盒下 fileImporter 授予的安全作用域只在本次读取内使用。
             let data = try await Self.readData(url)
@@ -184,6 +187,7 @@ final class ImportFlowModel: ObservableObject {
         phase = .loadingPreview
         alertMessage = nil
         resetBilingualUIState()
+        aiStudyDraftCache = AIStudyPreviewCache()
         do {
             let preview = try await service.ingest(fileData: Data(text.utf8), filename: nil)
             guard currentGeneration == generation else { return }
@@ -206,6 +210,7 @@ final class ImportFlowModel: ObservableObject {
         alertMessage = nil
         lastReady = nil
         resetBilingualUIState()
+        aiStudyDraftCache = AIStudyPreviewCache()
     }
 
     /// 确认导入（唯一写库提交点）。成功后本会话结束。
@@ -216,7 +221,10 @@ final class ImportFlowModel: ObservableObject {
         phase = .saving
         alertMessage = nil
         do {
+            let cache = aiStudyDraftCache
             let confirmation = try await service.confirmImport()
+            guard currentGeneration == generation else { return }
+            await cache.persist(in: store, for: confirmation.document.id)
             guard currentGeneration == generation else { return }
             phase = .succeeded(confirmation)
             onDidConfirm?(confirmation)
@@ -245,6 +253,7 @@ final class ImportFlowModel: ObservableObject {
         alertMessage = nil
         pastedText = ""
         resetBilingualUIState()
+        aiStudyDraftCache = AIStudyPreviewCache()
     }
 
     /// 成功页点击「完成」：清理本地展示状态（库数据已提交）。
@@ -257,6 +266,7 @@ final class ImportFlowModel: ObservableObject {
         alertMessage = nil
         pastedText = ""
         resetBilingualUIState()
+        aiStudyDraftCache = AIStudyPreviewCache()
     }
 
     // MARK: - 双语模式
@@ -345,11 +355,12 @@ extension ImportFlowModel {
         items: [AIStudyPreviewLine],
         task: AIStudyBatchTaskKind,
         modelName: String?,
-        expectedGeneration: Int? = nil
-    ) async {
-        if let expectedGeneration, expectedGeneration != generation { return }
-        guard case .ready = phase, let draft = await service.currentDraftDocumentForStudy() else { return }
-        if let expectedGeneration, expectedGeneration != generation { return }
+        expectedDocument: LyricDocument,
+        expectedGeneration: Int
+    ) async throws {
+        guard expectedGeneration == generation, case .ready = phase else {
+            throw AIStudyWorkflowError.cancelled
+        }
 
         var pronunciations: [UUID: LinePronunciation] = [:]
         var translations: [UUID: Translation] = [:]
@@ -357,22 +368,26 @@ extension ImportFlowModel {
         switch task {
         case .pronunciation(let style):
             pronunciations = AIStudyWorkflowService.mergedPronunciations(
-                in: draft, items: items, style: style, modelName: modelName
+                in: expectedDocument, items: items, style: style, modelName: modelName
             )
         case .translation(let targetLanguage):
             language = targetLanguage
             translations = AIStudyWorkflowService.mergedTranslations(
-                in: draft, items: items, language: targetLanguage
+                in: expectedDocument, items: items, language: targetLanguage
             )
         }
 
-        guard let updatedPreview = await service.applyStudyAnnotations(
+        guard !Task.isCancelled, let updatedPreview = await service.applyStudyAnnotations(
             pronunciations: pronunciations,
             translations: translations,
-            language: language
-        ) else { return }
-        if let expectedGeneration, expectedGeneration != generation { return }
-        guard case let .ready(_, existing) = phase else { return }
+            language: language,
+            expectedDocument: expectedDocument
+        ) else {
+            throw AIStudyWorkflowError.editingError(.storeRejection("导入草稿已改变，请重新打开 AI 预览。"))
+        }
+        guard expectedGeneration == generation, case let .ready(_, existing) = phase else {
+            throw AIStudyWorkflowError.cancelled
+        }
         lastReady = (updatedPreview, existing)
         phase = .ready(updatedPreview, existing: existing)
     }

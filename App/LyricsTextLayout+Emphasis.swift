@@ -1,12 +1,14 @@
 import AppKit
 
-/// 歌词行高亮与悬停亮度过渡（与滚动共用 displayLink，不改动字形与行高）。
+/// 歌词行的亮度和焦点过渡与滚动共用 displayLink，保留原有排版。
 @MainActor
 extension LyricsTextLayout {
-    func highlight(lineIds: Set<UUID>) {
-        guard lineIds != activeIds else { return }
+    func highlight(lineIds: Set<UUID>, focusDistance: CGFloat?) -> Bool {
+        guard lineIds != activeIds else { return false }
+        let advances = focusDistance.map { advancesToNearbyGroup(from: activeIds, to: lineIds, within: $0) } ?? false
         activeIds = lineIds
-        refreshEmphasis()
+        refreshEmphasis(animatingFocus: advances)
+        return advances
     }
 
     func hover(lineId: UUID?) {
@@ -19,8 +21,27 @@ extension LyricsTextLayout {
         }
     }
 
+    private func paintFocus() {
+        guard focusesPlayback, activeIds.contains(where: { id in rowIndices[id].map { !rows[$0].isBlank } == true }) else {
+            manager.focusedRanges = nil
+            return
+        }
+        manager.focusedRanges = emphasisMotions.keys.sorted().compactMap { index in
+            let row = rows[index]
+            let sharpness = row.id == hoveredId ? 1 : (emphasisMotions[index]?.sharpness.position ?? 0)
+            guard sharpness > 0 else { return nil }
+            let range = NSUnionRange(row.originalRange, row.translationRange ?? row.pronunciationRange ?? row.originalRange)
+            return LyricsFocusLayoutManager.FocusedRange(characters: range, sharpness: sharpness)
+        }
+    }
+
+    func finishFocus() {
+        for index in Array(emphasisMotions.keys) { emphasisMotions[index]?.sharpness.finish() }
+        paintFocus()
+    }
+
     /// 计算目标亮度并启动过渡（或直接应用终值）。
-    func refreshEmphasis() {
+    private func refreshEmphasis(animatingFocus: Bool? = nil) {
         let currentIndices = activeIds.compactMap { rowIndices[$0] }
         var next: Set<Int> = []
         if let anchor = currentIndices.min() {
@@ -39,8 +60,8 @@ extension LyricsTextLayout {
             let original: Double = next.contains(index)
                 ? (current ? 1 : max(hovered ? 0.88 : 0, LyricsTypography.opacity(distance: distance)))
                 : (row.timed ? 0.35 : 0.3)
-            let pronunciation = next.contains(index) ? (current ? 0.85 : (hovered ? 0.78 : 0.60)) : 0.60
-            let translation = next.contains(index) ? (current ? 0.8 : (hovered ? 0.75 : 0.5)) : 0.45
+            let pronunciation = current ? 0.96 : (hovered ? 0.78 : 0.60)
+            let translation = next.contains(index) ? (current ? 0.92 : (hovered ? 0.75 : 0.5)) : 0.45
             var motion = emphasisMotions[index] ?? EmphasisMotion(
                 original: LyricsScalarMotion(position: row.timed ? 0.35 : 0.3),
                 pronunciation: row.pronunciationRange == nil ? nil : LyricsScalarMotion(position: 0.60),
@@ -49,10 +70,15 @@ extension LyricsTextLayout {
             motion.original.retarget(original, omega: LyricsMotionStyle.omega)
             motion.pronunciation?.retarget(pronunciation, omega: LyricsMotionStyle.omega)
             motion.translation?.retarget(translation, omega: LyricsMotionStyle.omega)
+            if let animatingFocus {
+                motion.sharpness.retarget(current && !row.isBlank ? 1 : 0, omega: LyricsMotionStyle.omega)
+                if !animatingFocus { motion.sharpness.finish() }
+            }
             emphasisMotions[index] = motion
         }
         emphasizedIndices = next
         if animatesEmphasis {
+            paintFocus()
             hasActiveEmphasis = true
             onNeedsAnimation?()
         } else {
@@ -60,24 +86,27 @@ extension LyricsTextLayout {
         }
     }
 
-    /// 与滚动共用 displayLink 和阻尼参数；只更新临时颜色，字形和行高保持不变。
-    func advanceEmphasis(by delta: TimeInterval, omega: Double) {
-        guard hasActiveEmphasis else { return }
+    /// 跟随位移时共用它的进度，悬停和视口无需移动时单独按时间收敛。
+    func advanceEmphasis(by delta: TimeInterval, focusStep: Double?) {
+        guard hasActiveEmphasis, focusStep != 0 else { return }
         var running = false
         for index in Array(emphasisMotions.keys) {
             guard var motion = emphasisMotions[index] else { continue }
-            motion.original.advance(by: delta, omega: omega, tolerance: 0.002)
-            motion.pronunciation?.advance(by: delta, omega: omega, tolerance: 0.002)
-            motion.translation?.advance(by: delta, omega: omega, tolerance: 0.002)
+            motion.original.advanceEmphasis(by: delta, focusStep: focusStep)
+            motion.pronunciation?.advanceEmphasis(by: delta, focusStep: focusStep)
+            motion.translation?.advanceEmphasis(by: delta, focusStep: focusStep)
+            motion.sharpness.advanceEmphasis(by: delta, focusStep: focusStep)
             running = running
                 || !motion.original.isSettled
                 || motion.pronunciation?.isSettled == false
                 || motion.translation?.isSettled == false
+                || !motion.sharpness.isSettled
             emphasisMotions[index] = motion
             paint(index: index, motion: motion)
         }
         hasActiveEmphasis = running
         if !running { emphasisMotions = emphasisMotions.filter { emphasizedIndices.contains($0.key) } }
+        paintFocus()
         textView.needsDisplay = true
     }
 
@@ -87,11 +116,13 @@ extension LyricsTextLayout {
             motion.original.finish()
             motion.pronunciation?.finish()
             motion.translation?.finish()
+            motion.sharpness.finish()
             emphasisMotions[index] = motion
             paint(index: index, motion: motion)
         }
         hasActiveEmphasis = false
         emphasisMotions = emphasisMotions.filter { emphasizedIndices.contains($0.key) }
+        paintFocus()
         textView.needsDisplay = true
     }
 
@@ -137,5 +168,11 @@ extension LyricsTextLayout {
         )
         emphasisMotions = [:]
         emphasizedIndices = []
+    }
+}
+
+private extension LyricsScalarMotion {
+    mutating func advanceEmphasis(by delta: TimeInterval, focusStep: Double?) {
+        if let focusStep { blend(by: focusStep) } else { advance(by: delta, omega: LyricsMotionStyle.omega, tolerance: 0.002) }
     }
 }

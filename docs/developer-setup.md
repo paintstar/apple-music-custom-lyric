@@ -33,7 +33,7 @@ bash scripts/package-release.sh
 
 脚本默认构建 Apple Silicon 的未签名 Release App，再对分发副本签名，生成 DMG、ZIP 和发布说明，输出位于 `.build/release/`。DMG 中提供拖到 Applications 的安装入口；ZIP 中只有 App。包名从 App 的版本号及实际 Mach-O 架构生成，构建缓存位于 `.build/release-xcode/`。安装包包含项目及第三方许可证，不包含源码、构建日志、本机数据库或签名材料。
 
-签名默认优先使用本机 `APPLE_SIGNING_IDENTITY`；没有配置时使用 ad-hoc 签名，不启用 Hardened Runtime。可通过 `--signing ad-hoc` 明确选择该模式。0.1.5 提供 arm64 安装包；Intel 尚未提供，`--arch x86_64` 和 `--arch universal` 仅是其他架构的构建入口，需另行验收。
+签名默认优先使用本机 `APPLE_SIGNING_IDENTITY`；没有配置时使用 ad-hoc 签名，不启用 Hardened Runtime。可通过 `--signing ad-hoc` 明确选择该模式。0.1.6 提供 arm64 安装包；Intel 尚未提供，`--arch x86_64` 和 `--arch universal` 仅是其他架构的构建入口，需另行验收。
 
 已有 Developer ID Application 证书的开发者，可在本机配置 `APPLE_SIGNING_IDENTITY` 后执行 `bash scripts/package-release.sh --signing developer-id`。脚本不导入证书，也不输出该配置值；此模式为临时分发副本启用 Hardened Runtime，并添加 `com.apple.security.automation.apple-events` entitlement，保留系统自动化授权。签名身份不是 Developer ID Application 时停止打包。
 
@@ -44,6 +44,8 @@ bash scripts/package-release.sh
 ## Music 权限
 
 官方「音乐」App 负责登录、订阅与音频播放；ShinApple 通过公开脚本访问可用资料库和播放状态。首次访问按 macOS 提示允许自动化控制。权限设置位于「系统设置 → 隐私与安全性 → 自动化」。
+
+原声例句使用相同的「音乐」自动化授权。实际联测应覆盖同曲定位、空闲时跨曲播放，以及已有播放队列时保留当前播放。
 
 当前 App 未启用 App Sandbox，配置在 `App/ShinApple.entitlements`，用途说明在 `App/Info.plist`。拒绝权限时真实资料库与播放不可用，本地歌词功能仍可使用。终端 osascript 与 App 的授权分别由系统处理，应分别验证；签名、Hardened Runtime 和公证配置变化后重新检查 App 授权与控制行为。
 

@@ -1,6 +1,27 @@
 import SwiftUI
 import ShinAppleKit
 
+struct PlaybackListButton: View {
+    @EnvironmentObject private var model: AppModel
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        Button { isPresented.toggle() } label: {
+            Image(systemName: "list.bullet")
+                .font(.system(size: PlaybackControlSizing.iconSize, weight: .medium))
+                .foregroundStyle(isPresented ? Color.appleMusicPink : .secondary)
+                .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PlaybackButtonStyle(isSelected: isPresented))
+        .accessibilityLabel("当前播放列表")
+        .help("显示当前播放列表")
+        .popover(isPresented: $isPresented) {
+            PlaybackListView(browser: model.musicLibraryBrowser).environmentObject(model)
+        }
+    }
+}
+
 struct PlaybackListView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var browser: MusicLibraryBrowserModel

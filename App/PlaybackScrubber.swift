@@ -19,11 +19,12 @@ enum ThinPlaybackSliderSizing {
 /// NSSlider 保留系统键盘/辅助功能。鼠标跟踪期间只预览，结束后发出一次 seek；
 /// 键盘或辅助功能的一次调节直接提交。快照更新不会覆盖拖动位置。
 struct PlaybackScrubber: NSViewRepresentable {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let snapshot: PlaybackSnapshot
     let positionMs: Int64?
     let durationMs: Int64
     let enabled: Bool
-    let thinStyle: Bool
     var reduceMotion = false
     let onPreview: (Int64?) -> Void
     let onSeek: (Int64, PlaybackSnapshot) -> Void
@@ -32,7 +33,7 @@ struct PlaybackScrubber: NSViewRepresentable {
 
     func makeNSView(context: Context) -> TrackingSlider {
         let slider = TrackingSlider()
-        if thinStyle { slider.cell = ThinPlaybackSliderCell() }
+        slider.cell = ThinPlaybackSliderCell()
         slider.isContinuous = true
         slider.controlSize = .small
         slider.target = context.coordinator
@@ -45,6 +46,8 @@ struct PlaybackScrubber: NSViewRepresentable {
 
     func updateNSView(_ slider: TrackingSlider, context: Context) {
         context.coordinator.parent = self
+        let appearance = playbackAppearance
+        if slider.appearance?.name != appearance { slider.appearance = NSAppearance(named: appearance) }
         slider.updatePlaybackEnabled(enabled)
         if slider.isTrackingMouse, !enabled || !context.coordinator.isTrackingCurrent {
             slider.cancelMouseTracking()
@@ -66,6 +69,15 @@ struct PlaybackScrubber: NSViewRepresentable {
             if slider.minValue != 0 { slider.minValue = 0 }
             if slider.maxValue != maximum { slider.maxValue = maximum }
             if slider.doubleValue != position { slider.doubleValue = position }
+        }
+    }
+
+    private var playbackAppearance: NSAppearance.Name {
+        switch (colorScheme, colorSchemeContrast) {
+        case (.dark, .increased): .accessibilityHighContrastDarkAqua
+        case (.dark, _): .darkAqua
+        case (_, .increased): .accessibilityHighContrastAqua
+        default: .aqua
         }
     }
 
@@ -94,9 +106,10 @@ struct PlaybackScrubber: NSViewRepresentable {
         }
 
         @objc func changed(_ slider: TrackingSlider) {
-            slider.setAccessibilityValueDescription(PlayerBarView.formatDuration(Int64(slider.doubleValue)))
+            let position = trackedPosition(slider)
+            slider.setAccessibilityValueDescription(PlayerBarView.formatDuration(position))
             if slider.isTrackingMouse {
-                parent.onPreview(startedSnapshot.map(isCurrent) == true ? Int64(slider.doubleValue) : nil)
+                parent.onPreview(startedSnapshot.map(isCurrent) == true ? position : nil)
             } else {
                 commit(slider, expected: parent.snapshot)
             }
@@ -110,8 +123,12 @@ struct PlaybackScrubber: NSViewRepresentable {
 
         private func commit(_ slider: TrackingSlider, expected: PlaybackSnapshot) {
             guard parent.enabled, isCurrent(expected) else { return }
-            let position = min(max(Int64(slider.doubleValue), 0), parent.durationMs)
-            parent.onSeek(position, expected)
+            parent.onSeek(trackedPosition(slider), expected)
+        }
+
+        private func trackedPosition(_ slider: TrackingSlider) -> Int64 {
+            let position = Int64(exactly: slider.doubleValue.rounded()) ?? parent.durationMs
+            return min(max(position, 0), parent.durationMs)
         }
 
         private func isCurrent(_ expected: PlaybackSnapshot) -> Bool {
@@ -127,7 +144,6 @@ struct PlaybackScrubber: NSViewRepresentable {
         var isTrackingMouse = false {
             didSet { refreshInteractionAppearance() }
         }
-        private var grabOffset: CGFloat = 0
         private var isPointerInside = false
         private var hoverTrackingArea: NSTrackingArea?
         private var appearanceTarget: CGFloat = 0
@@ -253,9 +269,6 @@ struct PlaybackScrubber: NSViewRepresentable {
             isPointerInside = bounds.contains(convert(event.locationInWindow, from: nil))
             isTrackingMouse = true
             coordinator?.begin()
-            let point = convert(event.locationInWindow, from: nil)
-            let knob = (cell as? NSSliderCell)?.knobRect(flipped: isFlipped) ?? .zero
-            grabOffset = knob.contains(point) ? point.x - knob.midX : 0
             preview(event)
         }
 
@@ -301,7 +314,7 @@ struct PlaybackScrubber: NSViewRepresentable {
             let knobWidth = (cell as? NSSliderCell)?.knobRect(flipped: isFlipped).width ?? 0
             let travel = bounds.width - knobWidth
             guard travel > 0 else { return }
-            let fraction = min(max((point.x - grabOffset - bounds.minX - knobWidth / 2) / travel, 0), 1)
+            let fraction = min(max((point.x - bounds.minX - knobWidth / 2) / travel, 0), 1)
             doubleValue = minValue + Double(fraction) * (maxValue - minValue)
             needsDisplay = true
             sendAction(action, to: target)
@@ -309,7 +322,7 @@ struct PlaybackScrubber: NSViewRepresentable {
     }
 }
 
-/// 浮栏轨道根据本地鼠标状态绘制；原生knobRect仍是唯一的进度几何，不随视觉大小改变。
+/// 轨道和位置标记共用滑块行程；悬停和拖动只调整外观。
 @MainActor
 private final class ThinPlaybackSliderCell: NSSliderCell {
     var positionKnown = false
@@ -324,11 +337,14 @@ private final class ThinPlaybackSliderCell: NSSliderCell {
             + hoverAmount * (ThinPlaybackSliderSizing.hoveringTrackHeight - ThinPlaybackSliderSizing.restingTrackHeight)
             + pressAmount * (ThinPlaybackSliderSizing.pressedTrackHeight - ThinPlaybackSliderSizing.hoveringTrackHeight)
         let track = NSRect(x: rect.minX, y: rect.midY - height / 2, width: rect.width, height: height)
+            .insetBy(dx: knobRect(flipped: flipped).width / 2, dy: 0)
+        guard track.width > 0 else { return }
         let radius = height / 2
         NSColor.labelColor.withAlphaComponent(isEnabled ? 0.17 + hoverAmount * 0.06 + pressAmount * 0.04 : 0.10).setFill()
         NSBezierPath(roundedRect: track, xRadius: radius, yRadius: radius).fill()
-        guard positionKnown else { return }
-        let width = min(max(knobRect(flipped: flipped).midX - track.minX, 0), track.width)
+        guard positionKnown, doubleValue > minValue, maxValue > minValue else { return }
+        let fraction = (doubleValue - minValue) / (maxValue - minValue)
+        let width = track.width * fraction
         let filled = NSRect(x: track.minX, y: track.minY, width: width, height: track.height)
         NSColor.labelColor.withAlphaComponent(isEnabled ? 0.52 + hoverAmount * 0.18 + pressAmount * 0.12 : 0.24).setFill()
         NSBezierPath(roundedRect: filled, xRadius: radius, yRadius: radius).fill()

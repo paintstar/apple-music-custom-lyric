@@ -29,6 +29,7 @@ final class LyricsStudyModel: ObservableObject {
     var onDocumentNoteSaved: (@MainActor () -> Void)?
 
     var activeLineSourceDocument: LyricDocument?
+    var activeLineProviderConfiguration: AIConfiguration?
     var isInvalidated = false
     private var wordRequestSequence = 0
     var lineRequestSequence = 0
@@ -37,6 +38,7 @@ final class LyricsStudyModel: ObservableObject {
     var lineEditSaveSequence = 0
     private var wordAITask: Task<Void, Never>?
     var lineAITask: Task<Void, Never>?
+    var lineFollowUpTask: Task<Void, Never>?
     var wordSaveTask: Task<Void, Never>?
     var lineSaveTask: Task<Void, Never>?
     var lineEditSaveTask: Task<Void, Never>?
@@ -69,12 +71,7 @@ final class LyricsStudyModel: ObservableObject {
             store: store,
             localDictionary: localDictionary,
             aiClient: resolvedClient,
-            configurationProvider: { settingsStore.load() },
-            apiKeyProvider: {
-                guard !isMock else { return nil }
-                let config = settingsStore.load()
-                return try? resolvedCredentials.apiKey(for: config.preset)
-            }
+            configurationProvider: { settingsStore.load() }
         )
     }
 
@@ -83,10 +80,9 @@ final class LyricsStudyModel: ObservableObject {
         let config = settingsStore.load()
         guard config.preset.requiresAPIKey else { return nil }
         do {
-            let key = try credentialStore.apiKey(for: config.preset)
-            return key == nil
-                ? "尚未配置「\(config.preset.displayName)」API Key，请前往「设置 → AI 学习服务」保存密钥。"
-                : nil
+            return try credentialStore.hasAPIKey(for: config.preset)
+                ? nil
+                : "尚未配置「\(config.preset.displayName)」API Key，请前往「设置 → AI 学习服务」保存密钥。"
         } catch {
             return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -275,6 +271,7 @@ final class LyricsStudyModel: ObservableObject {
         linePopover = nil
         lineEditPopover = nil
         activeLineSourceDocument = nil
+        activeLineProviderConfiguration = nil
         onVocabularyChanged = nil
         onDocumentNoteSaved = nil
     }

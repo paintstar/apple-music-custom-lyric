@@ -66,7 +66,7 @@ enum LyricsSyncConstants {
     static let waitingSlotHeight: CGFloat = 24
     /// 译文语言（v1 固定简体中文；与编辑器一致）。
     static let translationLanguage = "zh-Hans"
-    /// 边缘渐隐高度（上下各 80pt，远端行淡出；比逐行 blur 便宜）。
+    /// 边缘渐隐高度（上下各 80pt）。
     static let edgeFadeHeight: CGFloat = 80
 }
 
@@ -289,6 +289,7 @@ struct LyricsUnlinkConfirmation: ViewModifier {
 /// 标准播放器与紧凑播放器共用的歌词区。
 struct SyncLyricsArea<MenuContent: View>: View {
     @Environment(\.lyricsViewportAnchorFraction) private var viewportAnchorFraction
+    @Environment(\.colorSchemeContrast) private var contrast
     let document: LyricDocument
     @ObservedObject var panel: LyricsPanelModel
     let showTranslations: Bool
@@ -299,7 +300,7 @@ struct SyncLyricsArea<MenuContent: View>: View {
     var canSeek = false
     var interactionIdentity = ""
     var waitingPosition: (() -> Int64?)?
-    var waitingIsPlaying = false
+    var isPlaying = false
     var studyModel: LyricsStudyModel?
     var onToggleSingleLineLoop: ((UUID) -> Void)?
     var onSetABLoopAnchor: ((UUID) -> Void)?
@@ -350,7 +351,8 @@ struct SyncLyricsArea<MenuContent: View>: View {
                 viewportAnchorFraction: viewportAnchorFraction,
                 waitingInterval: panel.syncDisplay.waitingInterval,
                 waitingPosition: waitingPosition,
-                waitingIsPlaying: waitingIsPlaying,
+                waitingIsPlaying: isPlaying,
+                focusesPlayback: isPlaying && contrast != .increased && !isStudyPopoverOpen,
                 userDelayMs: panel.syncDisplay.userDelayMs,
                 vocabularyOccurrences: panel.documentOccurrences,
                 isClozeMode: isClozeMode,

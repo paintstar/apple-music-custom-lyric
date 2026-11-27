@@ -76,6 +76,56 @@ struct ControlCommandTests {
         #expect(executor.recordedSeekValues == [90.0])
     }
 
+    @Test("切到例句目标后丢弃按旧曲生成的跳转")
+    func oldSeekDoesNotReachNewTrack() async throws {
+        let target = Fixtures.snapshot(position: 17, pid: Fixtures.pidB)
+        let executor = FakeMusicScriptExecutor(
+            outcomes: [Fixtures.snapshot(position: 21)], repeating: target, vocabularyResult: .positionRequested(17_000)
+        )
+        let controller = makeController(executor)
+        controller.refreshOnce()
+        let old = controller.snapshot()
+        #expect(try await controller.playVocabularyExample(trackKey: Fixtures.refB, positionMs: 17_000) == .played)
+        await #expect(throws: CancellationError.self) {
+            try await controller.seek(positionMs: 33_000, expected: old)
+        }
+        #expect(executor.recordedSeekValues.isEmpty)
+        #expect(controller.snapshot().positionMs == 17_000)
+        try await controller.seek(positionMs: 39_000, expected: controller.snapshot())
+        #expect(executor.recordedSeekValues == [39])
+    }
+
+    @Test("快照仍显示旧曲时，确认跳转依据当前真实曲目")
+    func guardedSeekUsesLiveTrack() async throws {
+        let executor = FakeMusicScriptExecutor(outcomes: [Fixtures.snapshot(), Fixtures.snapshot(pid: Fixtures.pidB)])
+        let controller = makeController(executor)
+        controller.refreshOnce()
+        await #expect(throws: CancellationError.self) {
+            try await controller.seek(positionMs: 10_125, expected: controller.snapshot())
+        }
+        #expect(executor.recordedSeekValues.isEmpty)
+    }
+
+    @Test("跳转脚本按当前 persistent ID 决定是否写位置")
+    func guardedSeekScriptChecksCurrentTrack() async throws {
+        let source = try AppleScriptExecutor.seekSource(seconds: 6.125, expectedPersistentID: Fixtures.pidA)
+        try await MusicScriptTestExecution.compile(source)
+        let body = source.components(separatedBy: "\n").dropFirst(3).dropLast(3).joined(separator: "\n")
+            .replacingOccurrences(of: "persistent ID of current track", with: "fixtureID")
+            .replacingOccurrences(of: "set player position to", with: "set fixturePosition to")
+        try #require(!body.contains("application") && !body.contains("current track") && !body.contains("player position"))
+        for (id, expected) in [(Fixtures.pidA, "updated"), (Fixtures.pidB, "track-changed")] {
+            let result = try await MusicScriptTestExecution.string("""
+            set fixtureID to "\(id)"
+            set fixturePosition to -1
+            \(body)
+            if fixturePosition is 6.125 then return "updated"
+            return "unchanged"
+            """)
+            #expect(result == expected)
+        }
+    }
+
     @Test("命令失败映射：Music 未运行 → musicNotRunning；权限拒绝 → unauthorized")
     func commandFailureMapping() async throws {
         let executor = FakeMusicScriptExecutor()

@@ -21,10 +21,8 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
 
     private let pool: DatabasePool
 
-    /// 打开（必要时创建）数据库并执行显式迁移。
-    /// 打开/迁移失败映射为 storageUnavailable，绝不假装成功，
-    /// 也绝不删除或重建库文件（消息内嵌路径，供 UI 给出备份指引；
-    /// 升级前备份等打开安全路径见 `GRDBLyricsStore+OpenSafety.swift`）。
+    /// 打开（必要时创建）并迁移数据库。失败时返回 storageUnavailable，保留原库文件。
+    /// 升级前备份等恢复路径见 `GRDBLyricsStore+OpenSafety.swift`。
     public convenience init(
         path: String,
         backupConfiguration: BackupConfiguration = .standard
@@ -32,6 +30,8 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
         var configuration = Configuration()
         // 外键约束：绑定必须指向存在的文档，删除被引用文档被 SQLite 拒绝。
         configuration.foreignKeysEnabled = true
+        // 不同实例打开同一库时，GRDB 的 IMMEDIATE 写事务可以短暂等待写锁。
+        configuration.busyMode = .timeout(2)
         let pool: DatabasePool
         do {
             pool = try DatabasePool(path: path, configuration: configuration)
@@ -49,6 +49,10 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
                 Self.migrationFailureMessage(path: path, detail: Self.describe(error))
             )
         }
+        // 清理缓存失败时仍允许打开已通过迁移的学习资料库。
+        try? pool.write { db in
+            try AIStudyCacheLimit.deleteExpired(in: db, timestamp: Date.now.timeIntervalSince1970)
+        }
         self.init(ownedPool: pool, backupConfiguration: backupConfiguration)
     }
 
@@ -58,7 +62,6 @@ public final class GRDBLyricsStore: LyricsRepository, Sendable {
     }
 
     /// 保存位置切换的搬移扩展使用的底层连接池。
-    /// 见 GRDBLyricsStore+Relocation.swift。
     var relocationSourcePool: DatabasePool { pool }
 
     // MARK: - LyricsRepository 契约

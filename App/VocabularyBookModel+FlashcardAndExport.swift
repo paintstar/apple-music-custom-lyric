@@ -97,6 +97,7 @@ extension VocabularyBookModel {
     func startFlashcards() {
         let source = filteredEntries
         guard !source.isEmpty else { return }
+        cancelOccurrencePlayback(source: .book)
         resetFlashcardSession(from: source)
     }
 

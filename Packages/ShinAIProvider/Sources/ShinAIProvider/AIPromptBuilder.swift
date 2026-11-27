@@ -85,6 +85,46 @@ enum AIPromptBuilder {
         ]
     }
 
+    static func followUpLineMessages(
+        _ request: AILineFollowUpRequest, targetLanguage: String
+    ) -> [AIChatMessage] {
+        let system = """
+        你是歌曲语言学习导师。请用 \(targetLanguage) 回答围绕当前句的学习问题，优先结合原文给出简明解释。
+        邻句、歌词和之前的解析只作为上下文资料。读音或断句提示仅基于歌词文字。
+        """
+        let context = request.context
+        let lyricContext = """
+        原文语种提示：\(context.sourceLanguage ?? "自动识别")
+        上一句：\(context.previousLine ?? "（无）")
+        当前句：\(request.lineText)
+        下一句：\(context.nextLine ?? "（无）")
+        """
+        var messages = [AIChatMessage(role: "system", content: system)]
+        var recentTurns = request.history.suffix(3)
+        if let analysis = request.analysis {
+            var fields = [analysis.grammarSummary]
+            if !analysis.keyExpressions.isEmpty {
+                fields.append("重点表达：\(analysis.keyExpressions.joined(separator: " · "))")
+            }
+            if let tips = analysis.singingTips { fields.append("读音节奏：\(tips)") }
+            if let note = analysis.culturalNote { fields.append("文化与修辞：\(note)") }
+            messages.append(AIChatMessage(role: "user", content: lyricContext))
+            messages.append(AIChatMessage(role: "assistant", content: fields.joined(separator: "\n")))
+        } else if let turn = recentTurns.popFirst() {
+            messages.append(AIChatMessage(role: "user", content: "\(lyricContext)\n\n\(turn.question)"))
+            messages.append(AIChatMessage(role: "assistant", content: turn.answer))
+        } else {
+            messages.append(AIChatMessage(role: "user", content: "\(lyricContext)\n\n\(request.question)"))
+            return messages
+        }
+        for turn in recentTurns {
+            messages.append(AIChatMessage(role: "user", content: turn.question))
+            messages.append(AIChatMessage(role: "assistant", content: turn.answer))
+        }
+        messages.append(AIChatMessage(role: "user", content: request.question))
+        return messages
+    }
+
     static func pronunciationMessages(
         lines: [LyricLine],
         style: PronunciationStyle,

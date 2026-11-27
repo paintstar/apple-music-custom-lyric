@@ -9,6 +9,13 @@ public protocol PlaybackSubscriptionHandle: AnyObject, Sendable {
     func cancel()
 }
 
+/// 原声例句播放结果。替换已有队列须先由用户确认。
+public enum VocabularyPlaybackResult: Equatable, Sendable {
+    case played
+    case queueProtected
+    case targetNotReady
+}
+
 /// 播放控制器契约。
 ///
 /// - `snapshot()` 是同步读取的权威状态。
@@ -39,6 +46,9 @@ public protocol PlaybackController: AnyObject, Sendable {
     /// 跳转到指定位置（整数毫秒）。越界值由实现裁剪到合法时长范围。
     func seek(positionMs: Int64) async throws
 
+    /// 跳转只对指定曲目有效。曲目生命周期已变化时取消命令。
+    func seek(positionMs: Int64, expected: PlaybackSnapshot) async throws
+
     func next() async throws
     func previous() async throws
 
@@ -55,10 +65,31 @@ public protocol PlaybackController: AnyObject, Sendable {
     /// trackUnavailable（不具备该能力的适配器不假装成功）。
     /// 命令发出不冒充成功，结果以随后的快照为准。
     func playTrackRef(_ trackRef: String) async throws
+
+    /// 播放已定位的例句。实现须在操作前确认曲目，避免用旧快照替当前队列做决定。
+    func playVocabularyExample(
+        trackKey: String, positionMs: Int64?
+    ) async throws -> VocabularyPlaybackResult
+
+    /// 用户已确认中断快照所示的播放上下文。上下文变化时返回 `.queueProtected`。
+    func playVocabularyExample(
+        trackKey: String, positionMs: Int64?, replacingQueueFor expected: PlaybackSnapshot
+    ) async throws -> VocabularyPlaybackResult
 }
 
 /// 可选能力的默认实现，供未提供对应功能的适配器使用。
 public extension PlaybackController {
+    /// 同步检查后委托给旧实现；若实现会排队，须在执行时重新验证曲目。
+    func seek(positionMs: Int64, expected: PlaybackSnapshot) async throws {
+        try Task.checkCancellation()
+        let current = snapshot()
+        guard let trackKey = expected.trackKey, current.trackKey == trackKey,
+              current.sessionEpoch == expected.sessionEpoch, current.trackEpoch == expected.trackEpoch else {
+            throw CancellationError()
+        }
+        try await seek(positionMs: positionMs)
+    }
+
     func stop() async throws {
         throw PlaybackError.unknown("playback:commandUnsupported:stop")
     }
@@ -68,5 +99,17 @@ public extension PlaybackController {
 
     func playTrackRef(_ trackRef: String) async throws {
         throw PlaybackError.trackUnavailable
+    }
+
+    func playVocabularyExample(
+        trackKey: String, positionMs: Int64?
+    ) async throws -> VocabularyPlaybackResult {
+        throw PlaybackError.trackUnavailable
+    }
+
+    func playVocabularyExample(
+        trackKey: String, positionMs: Int64?, replacingQueueFor expected: PlaybackSnapshot
+    ) async throws -> VocabularyPlaybackResult {
+        .queueProtected
     }
 }

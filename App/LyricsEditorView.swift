@@ -114,16 +114,22 @@ struct LyricsEditorView: View {
         guard !isPreparingAIStudy, model.isEditing else { return }
         isPreparingAIStudy = true
         defer { isPreparingAIStudy = false }
-        guard let draft = await model.currentWorkingDocument(), model.isEditing else { return }
+        let draftCache = model.aiStudyDraftCache
+        guard let draft = await model.currentWorkingDocument(), model.isEditing,
+              model.aiStudyDraftCache === draftCache else { return }
         let previewModel = AIStudyPreviewModel(
             store: model.store,
             document: draft,
             songTitle: draft.metadata["ti"]?.first,
             artist: draft.metadata["ar"]?.first,
             commitTarget: .editorDraft { items, task, modelName in
-                await model.applyAIStudyPreview(items: items, task: task, modelName: modelName)
+                guard model.aiStudyDraftCache === draftCache else { throw AIStudyWorkflowError.cancelled }
+                try await model.applyAIStudyPreview(
+                    items: items, task: task, modelName: modelName, expectedDocument: draft
+                )
             },
             isMock: model.isMock,
+            draftCache: draftCache,
             onApplied: {
                 isAIStudyPresented = false
             }

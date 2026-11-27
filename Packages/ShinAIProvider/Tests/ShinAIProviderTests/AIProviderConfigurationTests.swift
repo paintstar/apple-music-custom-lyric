@@ -100,18 +100,24 @@ struct AIProviderConfigurationTests {
 
     @Test("InMemoryAICredentialStore 支持按预设存取与删除且忽略空字符串")
     func inMemoryCredentialStoreOperations() throws {
-        let store = InMemoryAICredentialStore()
+        let store: any AICredentialStoring = InMemoryAICredentialStore()
+        #expect(try !store.hasAPIKey(for: .deepSeek))
         #expect(try store.apiKey(for: .deepSeek) == nil)
 
         try store.saveAPIKey("test-key", for: .deepSeek)
+        #expect(try store.hasAPIKey(for: .deepSeek))
+        #expect(try !store.hasAPIKey(for: .openAI))
         #expect(try store.apiKey(for: .deepSeek) == "test-key")
         #expect(try store.apiKey(for: .openAI) == nil)
 
         try store.saveAPIKey("   ", for: .deepSeek)
+        #expect(try !store.hasAPIKey(for: .deepSeek))
         #expect(try store.apiKey(for: .deepSeek) == nil)
 
         try store.saveAPIKey("other-key", for: .openAI)
+        #expect(try store.hasAPIKey(for: .openAI))
         try store.deleteAPIKey(for: .openAI)
+        #expect(try !store.hasAPIKey(for: .openAI))
         #expect(try store.apiKey(for: .openAI) == nil)
     }
 }

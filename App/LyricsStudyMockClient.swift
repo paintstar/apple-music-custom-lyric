@@ -89,6 +89,18 @@ final class MockStudyDetailAIClient: AIStudyProviding, Sendable {
         )
     }
 
+    func followUpLine(
+        _ request: AILineFollowUpRequest,
+        configuration: AIConfiguration,
+        apiKey: String?
+    ) async throws -> String {
+        try await Task.sleep(for: .milliseconds(300))
+        if let previous = request.history.last {
+            return "承接上一问「\(previous.question)」，可以把它和「\(request.question)」一起放回本句，看修饰成分如何连接核心谓语。"
+        }
+        return "针对「\(request.question)」，可以先找本句的核心谓语，再结合前后句理解修饰成分的作用。"
+    }
+
     func generatePronunciations(
         for lines: [LyricLine],
         style: PronunciationStyle,

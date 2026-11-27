@@ -191,6 +191,7 @@ extension AppModel {
             LyricsDatabase.storeOverride(isDefaultTarget ? nil : targetDirectory)
             return
         }
+        lyricsStudy?.dismissLinePopover(clearSelection: false)
         let previousAutoFetch = autoFetch
         do {
             try await previousAutoFetch?.suspendAndWait()
@@ -218,8 +219,7 @@ extension AppModel {
             }
         }
 
-        // 打开新库。失败时若目标文件是本轮刚备份出的副本则清掉，避免下次被
-        // 误当作「目标已有库」；旧的一切保持原状。
+        // 其他实例可能在检查后创建目标库。打开失败时保留目标文件，继续使用源库。
         let newStore: GRDBLyricsStore
         do {
             let path = targetPath
@@ -227,9 +227,6 @@ extension AppModel {
                 try GRDBLyricsStore(path: path)
             }.value
         } catch {
-            if !targetHasDatabase {
-                try? FileManager.default.removeItem(atPath: targetPath)
-            }
             storageSwitchMessage = "打开新位置失败，已继续使用原位置：\(ErrorText.describe(error))"
             return
         }

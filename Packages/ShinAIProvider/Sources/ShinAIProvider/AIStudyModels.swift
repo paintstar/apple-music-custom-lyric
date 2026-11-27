@@ -239,6 +239,37 @@ public struct AILineContext: Equatable, Sendable {
     }
 }
 
+/// 同一整句解析卡中的一轮追问。
+public struct AILineFollowUpTurn: Equatable, Sendable {
+    public let question: String
+    public let answer: String
+
+    public init(question: String, answer: String) {
+        self.question = question
+        self.answer = answer
+    }
+}
+
+/// 整句追问的输入，仅含学习文本、原 AI 解析和会话内问答。
+public struct AILineFollowUpRequest: Sendable {
+    public let lineText: String
+    public let context: AILineContext
+    public let analysis: AILineExplanation?
+    public let history: [AILineFollowUpTurn]
+    public let question: String
+
+    public init(
+        lineText: String, context: AILineContext, analysis: AILineExplanation?,
+        history: [AILineFollowUpTurn], question: String
+    ) {
+        self.lineText = lineText
+        self.context = context
+        self.analysis = analysis
+        self.history = history
+        self.question = question
+    }
+}
+
 /// AI 歌词学习服务协议，便于服务层与 UI 注入真实客户端或 Mock 实现。
 public protocol AIStudyProviding: Sendable {
     func testConnection(
@@ -260,6 +291,12 @@ public protocol AIStudyProviding: Sendable {
         configuration: AIConfiguration,
         apiKey: String?
     ) async throws -> AILineExplanation
+
+    func followUpLine(
+        _ request: AILineFollowUpRequest,
+        configuration: AIConfiguration,
+        apiKey: String?
+    ) async throws -> String
 
     func generatePronunciations(
         for lines: [LyricLine],
@@ -292,6 +329,14 @@ public protocol AIStudyProviding: Sendable {
 }
 
 public extension AIStudyProviding {
+    func followUpLine(
+        _ request: AILineFollowUpRequest,
+        configuration: AIConfiguration,
+        apiKey: String?
+    ) async throws -> String {
+        throw AIProviderError.invalidConfiguration("此学习客户端暂不支持整句追问。")
+    }
+
     func testConnection(configuration: AIConfiguration) async throws -> AIConnectionTestResult {
         try await testConnection(configuration: configuration, apiKey: nil)
     }

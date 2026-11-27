@@ -8,17 +8,23 @@ import ShinAppServices
 struct VocabularyBookContainerView: View {
     let store: GRDBLyricsStore
     let bottomContentInset: CGFloat
+    @ObservedObject private var model: AppModel
     @StateObject private var book: VocabularyBookModel
 
     init(store: GRDBLyricsStore, model: AppModel, bottomContentInset: CGFloat) {
         self.store = store
         self.bottomContentInset = bottomContentInset
+        self.model = model
         _book = StateObject(
             wrappedValue: VocabularyBookModel(
                 store: store,
                 onPlayOccurrence: { [weak model] occurrence in
-                    guard let model else { return "应用状态不可用。" }
+                    guard let model, model.lyricsStore === store else { return .cancelled }
                     return await model.playVocabularyOccurrence(occurrence)
+                },
+                onConfirmPlayback: { [weak model] confirmation in
+                    guard let model, model.lyricsStore === store else { return .cancelled }
+                    return await model.confirmVocabularyPlayback(confirmation)
                 },
                 onVocabularyChanged: { [weak model] in
                     model?.lyricsPanel?.reloadStudyMarks()
@@ -35,6 +41,9 @@ struct VocabularyBookContainerView: View {
                     return
                 }
                 Task { await book.reload() }
+            }
+            .onChange(of: model.isSwitchingStorage) { _, isSwitching in
+                if isSwitching { book.cancelOccurrencePlayback() }
             }
             .onDisappear { book.invalidate() }
     }
@@ -59,6 +68,10 @@ struct VocabularyBookView: View {
         .sheet(isPresented: $book.isFlashcardPresented) {
             VocabularyFlashcardView(book: book)
         }
+        .onChange(of: book.selectedEntryId) { _, entryId in
+            book.cancelOccurrencePlaybackOutsideEntry(entryId, source: .book)
+        }
+        .modifier(VocabularyPlaybackAlert(book: book, source: .book))
         .fileExporter(
             isPresented: Binding(
                 get: { book.pendingExport != nil },

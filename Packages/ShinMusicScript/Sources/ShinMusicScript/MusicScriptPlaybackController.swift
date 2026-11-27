@@ -26,9 +26,8 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
 
     private struct State: Sendable {
         var snapshot = PlaybackSnapshot()
-        var seq = 0
-        var trackEpoch = 0
-        var lastTrackRef: String?
+        var latestReadOrder = 0
+        var vocabularyReadback: MusicVocabularyReadback?
         var entries: [Entry] = []
         var disposed = false
         var samplingTask: Task<Void, Never>?
@@ -41,12 +40,20 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         var handlers: [@Sendable (PlaybackSnapshot) -> Void]
     }
 
+    private enum TransportSnapshot {
+        case refresh
+        case ready(PublishOutcome?)
+    }
+
     /// 会话编号：进程内每次构造新控制器递增（区分适配器重启前后的快照流）。
     private static let sessionCounter = OSAllocatedUnfairLock(initialState: 0)
 
     private let executor: MusicScriptExecutor
     /// 执行锁：保证 SBApplication/NSAppleScript 的串行访问（不嵌套状态锁）。
     private let executorLock = NSLock()
+    /// 只在执行锁内读写；和快照发布序号分开，保留未发布采样的先后关系。
+    private var sampleReadOrder = 0
+    private var sampleTime: @Sendable () -> Int64 = MusicScriptPlaybackController.monotonicNowMs
     private let playbackCommandQueue = MusicPlaybackCommandQueue()
     private let artworkAccess: MusicCurrentArtworkAccess
     private var playbackContext = MusicPlaybackContext()
@@ -98,6 +105,12 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         if let libraryReader { self.libraryCache = MusicLibraryCache(reader: libraryReader) }
     }
 
+    /// Fake 采样可用手动时钟；测试实例不启动后台采样。
+    convenience init(executor: MusicScriptExecutor, sampleTime: @escaping @Sendable () -> Int64) {
+        self.init(executor: executor, startsSampler: false)
+        self.sampleTime = sampleTime
+    }
+
     deinit {
         state.withLock { $0.samplingTask }?.cancel()
     }
@@ -123,18 +136,25 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     @discardableResult
     private func sampleOnce() -> Bool {
         guard !state.withLock({ $0.disposed }) else { return false }
-        let startedAt = DispatchTime.now()
-        let outcome: MusicSnapshotOutcome? = MusicAppleScriptExecution.withSamplingLock {
+        let sample: MusicScriptSample? = MusicAppleScriptExecution.withSamplingLock {
             executorLock.withLock {
                 guard !state.withLock({ $0.disposed }) else { return nil }
-                return executor.readSnapshot()
+                return readSampleLocked()
             }
         }
-        guard let outcome else { return false }
-        let requestDurationMs = Int64(
-            DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds
-        ) / 1_000_000
-        return publish(outcome: outcome, requestDurationMs: requestDurationMs)
+        guard let sample else { return false }
+        deliver(merge(sample))
+        return !isDisposed
+    }
+
+    private func readSampleLocked() -> MusicScriptSample {
+        let startedAt = sampleTime()
+        let outcome = executor.readSnapshot()
+        let sampledAt = sampleTime()
+        sampleReadOrder += 1
+        return MusicScriptSample(
+            order: sampleReadOrder, outcome: outcome, sampledAtMs: sampledAt, requestDurationMs: sampledAt - startedAt
+        )
     }
 
     /// 公开的手动刷新入口（控制命令后、测试与前台恢复时调用）。
@@ -190,14 +210,32 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
     }
 
     public func seek(positionMs ms: Int64) async throws {
-        // 越界裁剪：时长已知裁到 [0, duration]，未知保底非负（契约约定）。
-        let durationMs = state.withLock { $0.snapshot.durationMs }
-        var clampedMs = max(ms, 0)
-        if let durationMs {
-            clampedMs = min(clampedMs, durationMs)
+        try await performSeek(ms, expected: nil)
+    }
+
+    public func seek(positionMs ms: Int64, expected: PlaybackSnapshot) async throws {
+        try await performSeek(ms, expected: expected)
+    }
+
+    private func performSeek(_ ms: Int64, expected: PlaybackSnapshot?) async throws {
+        try await performTransportCommand(preservingReadback: true) { [self] checkCancellation in
+            let current = snapshot()
+            let clampedMs = min(max(ms, 0), current.durationMs ?? Int64.max)
+            let seconds = Double(clampedMs) / 1_000
+            try checkCancellation()
+            if let expected {
+                guard current.sessionEpoch == expected.sessionEpoch, current.trackEpoch == expected.trackEpoch,
+                      let trackRef = expected.trackRef, trackRef == current.trackRef,
+                      let persistentID = MusicScriptMapping.persistentID(fromTrackRef: trackRef) else {
+                    throw CancellationError()
+                }
+                try executor.seek(toSeconds: seconds, expectedPersistentID: persistentID)
+            } else {
+                try executor.seek(toSeconds: seconds)
+            }
+            state.withLock { $0.vocabularyReadback = nil }
+            return ((), .refresh)
         }
-        let seconds = Double(clampedMs) / 1_000
-        try await performTransportCommand { try self.executor.seek(toSeconds: seconds) }
     }
 
     public func next() async throws {
@@ -257,6 +295,36 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
         try await playTracks(refs, startingAt: trackRef, in: .library, shuffleEnabled: nil)
     }
 
+    func performVocabularyExample(
+        trackKey: String, positionMs: Int64?, expected: PlaybackSnapshot?
+    ) async throws -> VocabularyPlaybackResult {
+        guard let persistentID = MusicScriptMapping.persistentID(fromTrackRef: trackKey) else {
+            throw PlaybackError.trackUnavailable
+        }
+        return try await performTransportCommand(preservingReadback: true) { [self] checkCancellation in
+            let previous = snapshot()
+            let result = try executor.playVocabularyExample(
+                persistentID: persistentID, positionMs: positionMs, expected: expected, current: previous,
+                checkCancellation: checkCancellation
+            )
+            switch result {
+            case .played:
+                return (positionMs == nil ? .played : .targetNotReady, .refresh)
+            case .queueProtected:
+                return (.queueProtected, expected == nil ? .refresh : .ready(nil))
+            case .targetNotReady:
+                return (.targetNotReady, .refresh)
+            case .positionRequested(let targetMs):
+                state.withLock { $0.vocabularyReadback = nil }
+                let readback = MusicVocabularyReadback(
+                    trackRef: trackKey, targetMs: targetMs,
+                    previousPositionMs: previous.trackRef == trackKey ? previous.positionMs : nil
+                )
+                return try confirmVocabularyPosition(readback, checkCancellation: checkCancellation)
+            }
+        }
+    }
+
     func performContextCommand(
         _ operation: @escaping @Sendable (MusicPlaybackContext, () throws -> Void) throws -> Void
     ) async throws {
@@ -269,6 +337,7 @@ public final class MusicScriptPlaybackController: PlaybackController, @unchecked
                         do {
                             try cancellation.check()
                             guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+                            state.withLock { $0.vocabularyReadback = nil }
                             try operation(playbackContext) {
                                 try cancellation.check()
                                 guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
@@ -302,31 +371,55 @@ extension MusicScriptPlaybackController {
     /// 同步 Apple Events 由专用队列承接，避免切歌等待阻塞 UI 或 Swift 协作线程。
     /// 排队期间取消/dispose 的命令不再发出；已发送事件的结果只经随后采样发布。
     private func performTransportCommand(_ body: @escaping @Sendable () throws -> Void) async throws {
+        try await performTransportCommand { _ in
+            try body()
+            return ((), .refresh)
+        }
+    }
+
+    private func performTransportCommand<Value: Sendable>(
+        preservingReadback: Bool = false,
+        _ body: @escaping @Sendable (() throws -> Void) throws -> (Value, TransportSnapshot)
+    ) async throws -> Value {
         try Task.checkCancellation()
         let cancellation = MusicLibraryCancellation()
         do {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            return try await withTaskCancellationHandler {
+                let value = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Value, Error>) in
                     playbackCommandQueue.async(cancellation: cancellation) { [self] in
                         do {
-                            try cancellation.check()
-                            try MusicAppleScriptExecution.withCancellableLock {
+                            let checkCancellation = { [self] in
+                                try cancellation.check()
+                                guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
+                            }
+                            try checkCancellation()
+                            let (value, readback) = try MusicAppleScriptExecution.withCancellableLock {
                                 try executorLock.withLock {
-                                    try cancellation.check()
-                                    guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
-                                    try body()
+                                    try checkCancellation()
+                                    state.withLock {
+                                        $0.latestReadOrder = sampleReadOrder
+                                        if !preservingReadback { $0.vocabularyReadback = nil }
+                                    }
+                                    return try body(checkCancellation)
                                 }
                             }
-                            try cancellation.check()
-                            guard !state.withLock({ $0.disposed }) else { throw CancellationError() }
-                            _ = sampleOnce()
-                            continuation.resume()
+                            // 已确认样本若已合入权威快照，仍须发送通知。
+                            switch readback {
+                            case .refresh:
+                                try checkCancellation()
+                                _ = sampleOnce()
+                            case .ready(let publication):
+                                deliver(publication)
+                                try checkCancellation()
+                            }
+                            continuation.resume(returning: value)
                         } catch {
                             continuation.resume(throwing: error)
                         }
                     }
                 }
                 try Task.checkCancellation()
+                return value
             } onCancel: {
                 cancellation.cancel()
             }
@@ -343,133 +436,61 @@ extension MusicScriptPlaybackController {
 // MARK: - 采样合并与发布
 
 extension MusicScriptPlaybackController {
-
-    /// 把一次读取结果合并进状态并在内容变化时分发（合并在状态锁内，
-    /// 分发在锁外——与 MockPlaybackController 相同的死锁规避模式）。
-    private func publish(outcome: MusicSnapshotOutcome, requestDurationMs: Int64) -> Bool {
-        let sampledAt = Self.monotonicNowMs()
-        let result: PublishOutcome? = state.withLock { s -> PublishOutcome? in
-            guard !s.disposed else { return nil }
-
-            var snapshot = PlaybackSnapshot()
-            snapshot.sessionEpoch = sessionEpoch
-            snapshot.sampledAtMonotonicMs = sampledAt
-            snapshot.requestDurationMs = requestDurationMs
-            snapshot.capabilities = capabilities
-
-            switch outcome {
-            case .identityChangedDuringRead:
-                // 同批身份不一致：整批丢弃，保持上一发布值（下个周期重读）。
-                return nil
-            case .musicNotRunning:
-                Self.applyEnvironmentLocked(&s, snapshot: &snapshot, status: .notRunning)
-            case .noCurrentTrack(let stateCode):
-                Self.applyEnvironmentLocked(&s, snapshot: &snapshot, status: .noTrack)
-                // noTrack 语义本身已确定；状态枚举读不出已知值时补 errorCode。
-                if let stateCode, MusicScriptMapping.status(forStateCode: stateCode) == nil {
-                    snapshot.errorCode = MusicScriptMapping.unknownStateCode(stateCode)
-                }
-            case .snapshot(let raw):
-                Self.applyTrackSnapshotLocked(raw, state: &s, snapshot: &snapshot)
-            case .failed(let failure):
-                Self.applyFailureLocked(failure, state: &s, snapshot: &snapshot)
+    private func confirmVocabularyPosition(
+        _ readback: MusicVocabularyReadback, checkCancellation: () throws -> Void
+    ) throws -> (VocabularyPlaybackResult, TransportSnapshot) {
+        let deadline = ContinuousClock.now.advanced(by: MusicVocabularyReadback.confirmationBudget)
+        var firstMatchAtMs: Int64?
+        while true {
+            try checkCancellation()
+            let sample = readSampleLocked()
+            try checkCancellation()
+            let matches = readback.confirms(sample, following: firstMatchAtMs)
+            if matches, firstMatchAtMs != nil {
+                var protection = readback
+                protection.confirm(at: sample.sampledAtMs)
+                return (.played, .ready(merge(sample, confirming: protection)))
             }
+            if !matches && (ContinuousClock.now >= deadline || !readback.shouldContinueWaiting(for: sample)) {
+                return (.targetNotReady, .ready(merge(sample)))
+            }
+            firstMatchAtMs = matches ? sample.sampledAtMs : nil
+            Thread.sleep(forTimeInterval: MusicVocabularyReadback.pollInterval)
+        }
+    }
 
-            // 内容未变化不发布（seq/采样时间戳不参与比较）。
-            s.seq += 1
-            snapshot.seq = s.seq
+    /// 合并时按实际读取顺序丢弃迟到的旧样本；所有监听回调在锁外发送。
+    private func merge(
+        _ sample: MusicScriptSample, confirming readback: MusicVocabularyReadback? = nil
+    ) -> PublishOutcome? {
+        state.withLock { s -> PublishOutcome? in
+            guard !s.disposed, sample.order > s.latestReadOrder else { return nil }
+            s.latestReadOrder = sample.order
+            guard let snapshot = sample.snapshot(after: s.snapshot) else { return nil }
+            if let readback {
+                s.vocabularyReadback = readback
+            } else if s.vocabularyReadback?.shouldHold(snapshot, after: s.snapshot) == true {
+                return nil
+            } else if s.vocabularyReadback?.isActive(for: snapshot) == false {
+                s.vocabularyReadback = nil
+            }
             let changed = s.snapshot.contentValue != snapshot.contentValue
             let handlers = changed ? s.entries.map(\.handler) : []
             s.snapshot = snapshot
             return PublishOutcome(snapshot: snapshot, changed: changed, handlers: handlers)
         }
-        // nil 也表示切歌时丢弃了混合身份样本；只有 dispose 才应终止周期采样。
-        guard let result else { return state.withLock { !$0.disposed } }
-        if result.changed {
-            for handler in result.handlers {
-                handler(result.snapshot)
-            }
-        }
-        return true
     }
 
-    /// 环境态（未运行/无曲目）统一处理：身份不可读 → trackRef nil、时间 nil；
-    /// 之前有曲目时 epoch 递增（装载/卸载都是生命周期变化）。
-    private static func applyEnvironmentLocked(
-        _ s: inout State,
-        snapshot: inout PlaybackSnapshot,
-        status: PlayerStatus
-    ) {
-        if s.lastTrackRef != nil {
-            s.lastTrackRef = nil
-            s.trackEpoch += 1
+    private func deliver(_ result: PublishOutcome?) {
+        guard let result, result.changed,
+              state.withLock({ !$0.disposed && $0.snapshot.contentValue == result.snapshot.contentValue }) else { return }
+        for handler in result.handlers {
+            handler(result.snapshot)
         }
-        snapshot.trackEpoch = s.trackEpoch
-        snapshot.trackRef = nil
-        snapshot.status = status
-    }
-
-    /// 曲目快照用例：trackRef/epoch 推进 + 字段换算（锁内调用）。
-    private static func applyTrackSnapshotLocked(
-        _ raw: MusicScriptRawSnapshot,
-        state s: inout State,
-        snapshot: inout PlaybackSnapshot
-    ) {
-        let trackRef = raw.persistentID.map { SongBinding.trackKey(persistentID: $0) }
-        if trackRef != s.lastTrackRef {
-            s.lastTrackRef = trackRef
-            s.trackEpoch += 1
-        }
-        snapshot.trackEpoch = s.trackEpoch
-        snapshot.trackRef = trackRef
-        snapshot.title = raw.title
-        snapshot.artist = raw.artist
-        snapshot.positionMs = raw.positionSeconds.flatMap(MusicScriptMapping.secondsToMs)
-        snapshot.durationMs = raw.durationSeconds.flatMap(MusicScriptMapping.secondsToMs)
-        if let status = MusicScriptMapping.status(forStateCode: raw.playerStateCode) {
-            snapshot.status = status
-        } else {
-            snapshot.status = .error
-            snapshot.errorCode = MusicScriptMapping.unknownStateCode(raw.playerStateCode)
-        }
-    }
-
-    /// 读取失败用例：身份状态视为未变（保留 trackRef/epoch），值字段全部
-    /// 置 nil（未知不是旧值），状态显式 error + 稳定错误码（锁内调用）。
-    private static func applyFailureLocked(
-        _ failure: MusicScriptFailure,
-        state s: inout State,
-        snapshot: inout PlaybackSnapshot
-    ) {
-        snapshot.trackEpoch = s.trackEpoch
-        snapshot.trackRef = s.lastTrackRef
-        snapshot.status = .error
-        snapshot.errorCode = failure.errorCode
     }
 
     /// 宿主进程单调时钟毫秒（跨进程/跨时钟域不可直接比较）。
     static func monotonicNowMs() -> Int64 {
         Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
-    }
-}
-
-/// 适配器订阅句柄（可取消、幂等）。
-private final class ScriptControllerSubscription: PlaybackSubscriptionHandle, @unchecked Sendable {
-    private let id: UUID
-    private let onCancel: @Sendable (UUID) -> Void
-    private let lock = NSLock()
-    private var cancelled = false
-
-    init(id: UUID, onCancel: @escaping @Sendable (UUID) -> Void) {
-        self.id = id
-        self.onCancel = onCancel
-    }
-
-    func cancel() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !cancelled else { return }
-        cancelled = true
-        onCancel(id)
     }
 }

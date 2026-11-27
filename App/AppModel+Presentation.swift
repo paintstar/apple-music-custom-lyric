@@ -23,7 +23,7 @@ extension AppModel {
 
     /// 保持权威插值与松手后的展示目标分离。
     func estimatedPositionMs(nowMonotonicMs: Int64) -> PlaybackEstimate {
-        playbackClock.estimate(nowMonotonicMs: nowMonotonicMs)
+        snapshot.positionMs == nil ? .none : playbackClock.estimate(nowMonotonicMs: nowMonotonicMs)
     }
 
     /// 无采样时刻的控制器以到达时间进入同一单调时钟域。
@@ -74,9 +74,9 @@ extension AppModel {
     }
 
     var sliderDurationMs: Int64 {
-        snapshot.durationMs
-            ?? selectedSong?.durationMs
-            ?? 1
+        if let duration = snapshot.durationMs { return duration }
+        guard let selectedSong, selectedSong.identity == snapshot.track else { return 1 }
+        return selectedSong.durationMs ?? 1
     }
 
     /// 播放条环境提示（非错误）：Music 未运行 / 无曲目。

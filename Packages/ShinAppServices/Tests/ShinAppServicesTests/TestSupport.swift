@@ -14,8 +14,11 @@ enum TestEnv {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ShinAppServicesTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let store = try GRDBLyricsStore(path: dir.appendingPathComponent("lyrics.sqlite").path)
-        return (store, dir)
+        return (try openStore(in: dir), dir)
+    }
+
+    static func openStore(in directory: URL) throws -> GRDBLyricsStore {
+        try GRDBLyricsStore(path: directory.appendingPathComponent("lyrics.sqlite").path)
     }
 
     static func cleanup(_ directory: URL) {

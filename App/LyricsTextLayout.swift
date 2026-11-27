@@ -3,7 +3,7 @@ import ShinAppleKit
 import ShinLyricsEngine
 
 /// TextKit 以固定字体建立准确行坐标；只在文档、排版或宽度变化时重新排版。
-/// 当前行颜色使用临时绘制属性，不改变字形、换行或文档高度。
+/// 歌词焦点只改变绘制，不改变字形、换行或文档高度。
 @MainActor
 final class LyricsTextLayout {
     struct Row {
@@ -19,7 +19,7 @@ final class LyricsTextLayout {
     }
 
     let storage = NSTextStorage()
-    let manager = NSLayoutManager()
+    let manager = LyricsFocusLayoutManager()
     let container = NSTextContainer()
     let textView: LyricsInteractiveTextView
     private(set) var rows: [Row] = []
@@ -36,6 +36,9 @@ final class LyricsTextLayout {
     var clozeRangesByLine: [UUID: [NSRange]] = [:]
     /// 是否为亮度渐变（由宿主随 reduceMotion 配置；false 时直接应用终值）。
     var animatesEmphasis = true
+    var focusesPlayback = false {
+        didSet { if oldValue != focusesPlayback { finishFocus() } }
+    }
 
     // 滚动宿主统一驱动每帧提亮；这里不再拥有独立的 Timer。
     var onNeedsAnimation: (() -> Void)?
@@ -43,6 +46,7 @@ final class LyricsTextLayout {
         var original: LyricsScalarMotion
         var pronunciation: LyricsScalarMotion?
         var translation: LyricsScalarMotion?
+        var sharpness = LyricsScalarMotion(position: 0)
     }
     var emphasisMotions: [Int: EmphasisMotion] = [:]
     var hasActiveEmphasis = false
@@ -82,6 +86,7 @@ final class LyricsTextLayout {
         blankTimeGroups = Set(groups.values)
         activeIds = []
         hoveredId = nil
+        manager.focusedRanges = nil
         preludeRange = nil
         preludeFrame = nil
         // 整文档一次预计算紧凑槽；资格采用有效时间，进入/退出等待不重新排版。
@@ -220,8 +225,20 @@ final class LyricsTextLayout {
     /// 合并等待段内的连续打轴空白可跨过；含实词的时间组不能跳过。
     func areNeighboringAnchors(_ previous: UUID?, _ next: UUID) -> Bool {
         guard let previous, let from = timeGroupIndices[previous], let to = timeGroupIndices[next] else { return false }
-        let lower = min(from, to)
-        let upper = max(from, to)
+        return areNeighboringGroups(min(from, to), max(from, to))
+    }
+
+    func advancesToNearbyGroup(from previous: Set<UUID>, to next: Set<UUID>, within distance: CGFloat) -> Bool {
+        guard let first = previous.compactMap({ rowIndices[$0] }).min(),
+              let last = next.compactMap({ rowIndices[$0] }).min(),
+              let from = timeGroupIndices[rows[first].id], let to = timeGroupIndices[rows[last].id], from < to else { return false }
+        if areNeighboringGroups(from, to) { return true }
+        // 一个采样间隔可能跨过很短的句子。近距连续移动时直接交接给实际的新句。
+        let advance = rows[last].frame.minY - rows[first].frame.minY
+        return advance > 0 && advance <= distance
+    }
+
+    private func areNeighboringGroups(_ lower: Int, _ upper: Int) -> Bool {
         return upper - lower <= 1 || ((lower + 1)..<upper).allSatisfy { blankTimeGroups.contains($0) }
     }
 
@@ -299,6 +316,14 @@ final class LyricsInteractiveTextView: NSTextView {
         super.draw(dirtyRect)
         drawStudyIndicators?(dirtyRect)
     }
+
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
+        let hadSelection = hasTextSelection
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        if hadSelection != hasTextSelection { needsDisplay = true }
+    }
+
+    var hasTextSelection: Bool { selectedRanges.contains { $0.rangeValue.length > 0 } }
 
     override func mouseMoved(with event: NSEvent) { updateHover(at: convert(event.locationInWindow, from: nil)) }
     override func mouseEntered(with event: NSEvent) { updateHover(at: convert(event.locationInWindow, from: nil)) }

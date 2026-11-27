@@ -83,7 +83,7 @@ struct PlayerBarView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .help(model.currentArtist ?? "艺人未知")
-                PlaybackTimelineProgressView(showsTimeLabels: false, thinStyle: true)
+                PlaybackTimelineProgressView(showsTimeLabels: false)
             }
             .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
         }
@@ -93,7 +93,7 @@ struct PlayerBarView: View {
         HStack(spacing: Self.trailingControlSpacing) {
             lyricsButton
             floatingLyricsControl
-            playbackListButton
+            PlaybackListButton(isPresented: playbackListVisibility ?? $showsPlaybackList)
             trailingMenu
             PlaybackVolumeButton(model: model.playbackOptions)
         }
@@ -103,23 +103,6 @@ struct PlayerBarView: View {
         let floatingControlWidth = floatingLyricsControl == nil
             ? 0 : PlaybackControlSizing.optionSide + Self.trailingControlSpacing
         return Self.inlineContentWidth + floatingControlWidth + 2 * Self.horizontalPadding
-    }
-
-    private var playbackListButton: some View {
-        let visibility = playbackListVisibility ?? $showsPlaybackList
-        return Button { visibility.wrappedValue.toggle() } label: {
-            Image(systemName: "list.bullet")
-                .font(.system(size: PlaybackControlSizing.iconSize, weight: .medium))
-                .foregroundStyle(visibility.wrappedValue ? Color.appleMusicPink : .secondary)
-                .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(PlaybackButtonStyle(isSelected: visibility.wrappedValue))
-        .accessibilityLabel("当前播放列表")
-        .help("显示当前播放列表")
-        .popover(isPresented: visibility) {
-            PlaybackListView(browser: model.musicLibraryBrowser).environmentObject(model)
-        }
     }
 
     private var interactiveArtwork: some View {
@@ -168,16 +151,18 @@ struct PlayerBarView: View {
 
 struct PlayerTrackInfo: View {
     @EnvironmentObject private var model: AppModel
+    @ScaledMetric(relativeTo: .headline) private var titleSize: CGFloat = 19
+    @ScaledMetric(relativeTo: .subheadline) private var artistSize: CGFloat = 15
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(model.currentTitle ?? "未在播放")
-                .font(.headline)
+                .font(.system(size: titleSize, weight: .semibold))
                 .lineLimit(2)
                 .help(model.currentTitle ?? "未在播放")
             if let artist = model.currentArtist {
                 Text(artist)
-                    .font(.subheadline)
+                    .font(.system(size: artistSize, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .help(artist)

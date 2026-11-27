@@ -505,39 +505,34 @@ private struct PlayerUICheck {
             precondition(value.window === window, "歌词鼠标事件必须属于测试自身窗口")
             return value
         }
-        func click(_ point: NSPoint, count: Int, drag: Bool = false, returnToStart: Bool = true) async throws {
+        @MainActor func postDuringTracking(_ action: @escaping @MainActor @Sendable () -> Void) {
+            let timer = Timer(timeInterval: hold, repeats: false) { _ in
+                MainActor.assumeIsolated { action() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            RunLoop.main.add(timer, forMode: .eventTracking)
+        }
+        func click(_ point: NSPoint, count: Int, dragTo end: NSPoint? = nil, returnToStart: Bool = false) async throws {
             let before = replayCount()
-            let end = drag ? NSPoint(x: point.x + 60, y: point.y) : point
-            let releasePoint = (drag && !returnToStart) ? end : point
-            let release = Timer(timeInterval: hold * 2, repeats: false) { _ in
-                MainActor.assumeIsolated {
-                    if count == 1 {
-                        precondition(replayCount() == before, "真正松手前不得从mouseDown返回提前seek")
+            let releasePoint = returnToStart ? point : (end ?? point)
+            let postRelease: @MainActor @Sendable () -> Void = {
+                if count == 1 {
+                    precondition(replayCount() == before, "真正松手前不得从mouseDown返回提前seek")
+                }
+                NSApplication.shared.postEvent(event(.leftMouseUp, releasePoint, count), atStart: false)
+            }
+            postDuringTracking {
+                guard let end else { postRelease(); return }
+                NSApplication.shared.postEvent(event(.leftMouseDragged, end, count), atStart: false)
+                postDuringTracking {
+                    if returnToStart {
+                        NSApplication.shared.postEvent(event(.leftMouseDragged, point, count), atStart: false)
                     }
-                    NSApplication.shared.postEvent(event(.leftMouseUp, releasePoint, count), atStart: false)
+                    postRelease()
                 }
             }
-            RunLoop.main.add(release, forMode: .common)
-            RunLoop.main.add(release, forMode: .eventTracking)
-            if drag {
-                let dragging = Timer(timeInterval: hold, repeats: false) { _ in
-                    MainActor.assumeIsolated {
-                        NSApplication.shared.postEvent(event(.leftMouseDragged, end, count), atStart: false)
-                    }
-                }
-                RunLoop.main.add(dragging, forMode: .common)
-                RunLoop.main.add(dragging, forMode: .eventTracking)
-                if returnToStart {
-                    let returning = Timer(timeInterval: hold * 1.5, repeats: false) { _ in
-                        MainActor.assumeIsolated {
-                            NSApplication.shared.postEvent(event(.leftMouseDragged, point, count), atStart: false)
-                        }
-                    }
-                    RunLoop.main.add(returning, forMode: .common)
-                    RunLoop.main.add(returning, forMode: .eventTracking)
-                }
-            }
-            NSApplication.shared.postEvent(event(.leftMouseDown, point, count), atStart: false)
+            // 同步分发按下，让 NSTextView 从自己的事件跟踪循环消费后续事件；拖动后才排定松手。
+            window.sendEvent(event(.leftMouseDown, point, count))
             try await Task.sleep(for: .milliseconds(Int64(hold * 3_000) + 10))
         }
         let singleWait = Duration.milliseconds(Int64(max(NSEvent.doubleClickInterval * 2, 0.15) * 1_000))
@@ -589,16 +584,32 @@ private struct PlayerUICheck {
         precondition(text.selectedRange().length == 0, "mouseDown 无修饰键三击不得触发原生选段高亮")
         precondition(lastPublishedSelection?.length == 0, "mouseDown 无修饰键三击应发布空选区")
 
+        func glyphPoint(at characterIndex: Int) -> NSPoint {
+            let manager = view.textLayout.manager
+            let glyphs = manager.glyphRange(forCharacterRange: NSRange(location: characterIndex, length: 1),
+                                            actualCharacterRange: nil)
+            let bounds = manager.boundingRect(forGlyphRange: glyphs, in: view.textLayout.container)
+            let origin = text.textContainerOrigin
+            return NSPoint(x: bounds.midX + origin.x, y: bounds.midY + origin.y)
+        }
+        let original = view.textLayout.rows[0].originalRange
+        let dragStart = glyphPoint(at: original.location)
+        let dragEnd = glyphPoint(at: original.location + 6)
+        precondition(dragStart.x < dragEnd.x, "拖选夹具必须跨越原文中的多个字形")
+
         let beforeReturnDrag = replayCount()
-        try await click(NSPoint(x: 8, y: points[0].y), count: 1, drag: true)
+        text.setSelectedRange(NSRange(location: original.location, length: 0))
+        try await click(dragStart, count: 1, dragTo: dragEnd, returnToStart: true)
         try await Task.sleep(for: clickDelay)
         precondition(replayCount() == beforeReturnDrag, "原生单击拖选即使回到起点也不得重听")
         let beforeDragSelect = replayCount()
         lastPublishedSelection = nil
-        try await click(NSPoint(x: 8, y: points[0].y), count: 1, drag: true, returnToStart: false)
+        text.setSelectedRange(NSRange(location: original.location, length: 0))
+        try await click(dragStart, count: 1, dragTo: dragEnd)
         try await Task.sleep(for: clickDelay)
         precondition(replayCount() == beforeDragSelect, "单次拖动划词不得触发重听")
         precondition((lastPublishedSelection?.length ?? 0) > 0, "单次拖动划词应向划词浮条发布非空选区")
+        precondition(lastPublishedSelection == text.selectedRange(), "划词浮条收到的范围应与原生选区一致")
 
         text.setSelectedRange(NSRange(location: 0, length: 0))
         let rightClickWord = event(.rightMouseDown, timedWordPoint, 1)
@@ -802,9 +813,7 @@ private struct PlayerUICheck {
         _ type: NSEvent.EventType, fraction: CGFloat, slider: NSSlider, window: NSWindow, localY: CGFloat? = nil
     ) -> NSPoint {
         let knob = (slider.cell as! NSSliderCell).knobRect(flipped: slider.isFlipped)
-        var local = NSPoint(x: knob.width / 2 + fraction * (slider.bounds.width - knob.width), y: localY ?? slider.bounds.midY)
-        // 此夹具抓旋钮中心；原生中心已按像素取整，数学近似会意外形成抓取偏移。
-        if type == .leftMouseDown, knob.contains(local) { local.x = knob.midX }
+        let local = NSPoint(x: knob.width / 2 + fraction * (slider.bounds.width - knob.width), y: localY ?? slider.bounds.midY)
         let location = slider.convert(local, to: nil)
         let event = NSEvent.mouseEvent(
             with: type, location: location, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
@@ -849,7 +858,7 @@ private struct PlayerUICheck {
 
     @MainActor static func checkPlaybackDragging(store: GRDBLyricsStore, snapshot: PlaybackSnapshot) async throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
-        for thin in [false, true] {
+        for showsTimeLabels in [false, true] {
             var sample = snapshot
             sample.positionMs = 6_000
             let controller = CheckController(sample)
@@ -858,12 +867,14 @@ private struct PlayerUICheck {
                 makeLyricsDatabase: { LyricsDatabase.Database(store: store, locationDescription: "临时测试库", directory: URL(fileURLWithPath: "/tmp")) }
             )
             await model.start()
-            let host = NSHostingView(rootView: PlaybackTimelineProgressView(showsTimeLabels: !thin, thinStyle: thin)
+            let host = NSHostingView(rootView: PlaybackTimelineProgressView(showsTimeLabels: showsTimeLabels)
+                .environment(\.colorScheme, showsTimeLabels ? .dark : .light)
                 .environmentObject(model).padding(20))
             let window = NSWindow(
                 contentRect: NSRect(x: 60, y: 60, width: 360, height: 100),
                 styleMask: [.titled, .closable], backing: .buffered, defer: false
             )
+            window.appearance = NSAppearance(named: showsTimeLabels ? .aqua : .darkAqua)
             window.isMovableByWindowBackground = true
             window.contentView = host
             window.level = .floating
@@ -916,9 +927,11 @@ private struct PlayerUICheck {
             let point = slider.convert(NSPoint(x: slider.bounds.midX, y: slider.bounds.midY), to: host.superview)
             let hit = host.hitTest(point)
             precondition(hit === slider && !slider.mouseDownCanMoveWindow, "进度命中不得被宿主或拖窗接走")
-            let restingHeight = thin ? renderedTrackHeight(slider) : 0
+            let restingHeight = renderedTrackHeight(slider)
             let originalBounds = slider.bounds
-            if thin {
+            precondition(slider.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == (showsTimeLabels ? .darkAqua : .aqua),
+                         "进度轨道应配合播放器的明暗外观")
+            if showsTimeLabels {
                 precondition(abs(slider.bounds.height - ThinPlaybackSliderSizing.hitHeight) < 0.01
                              && slider.alignmentRect(forFrame: slider.frame) == slider.frame,
                              "细进度原生边界与24点SwiftUI槽位应一致：\(slider.bounds)，\(slider.alignmentRectInsets)")
@@ -951,24 +964,24 @@ private struct PlayerUICheck {
                 sliderHover(false, slider: slider, window: window)
                 try await eventually("离开应恢复静止轨道") { abs(renderedTrackHeight(slider) - restingHeight) < 0.15 }
             }
-            let downPoint = sendSliderMouse(.leftMouseDown, fraction: 0.2, slider: slider, window: window, localY: thin ? 2 : nil)
+            let downPoint = sendSliderMouse(.leftMouseDown, fraction: 0.2, slider: slider, window: window, localY: 2)
             let valueAfterDown = slider.doubleValue
-            if thin {
+            if showsTimeLabels {
                 sliderHover(false, slider: slider, window: window)
             }
-            let dragPoint = sendSliderMouse(.leftMouseDragged, fraction: 0.78, slider: slider, window: window, localY: thin ? -6 : nil)
+            let dragPoint = sendSliderMouse(.leftMouseDragged, fraction: 0.78, slider: slider, window: window, localY: -6)
             try await Task.sleep(for: .milliseconds(25))
             precondition(controller.seekCount == 0 && abs(slider.doubleValue - 23_400) < 3,
-                         "拖动中只更新原生滑块预览，不发送seek：thin=\(thin)，"
+                         "拖动中只更新滑块预览，不发送seek：showsTimeLabels=\(showsTimeLabels)，"
                          + "tracking=\((slider as? PlaybackScrubber.TrackingSlider)?.isTrackingMouse == true)，"
                          + "value=\(slider.doubleValue)，seekCount=\(controller.seekCount)，"
                          + "downPoint=\(downPoint)，dragPoint=\(dragPoint)，valueAfterDown=\(valueAfterDown)，"
                          + "pendingSeek=\(String(describing: model.pendingSeek))，"
                          + "bounds=\(slider.bounds)，knob=\((slider.cell as! NSSliderCell).knobRect(flipped: slider.isFlipped))，"
                          + "windowVisible=\(window.isVisible)，unoccluded=\(window.occlusionState.contains(.visible))")
-            if thin {
+            precondition(slider.focusRingType == .none, "鼠标按住不显示蓝色键盘焦点圈")
+            if showsTimeLabels {
                 try await eventually("按住后移出仍应保持6.5点强调，进度不等待动画") { abs(renderedTrackHeight(slider) - 6.5) < 0.2 }
-                precondition(slider.focusRingType == .none, "鼠标按住不显示蓝色键盘焦点圈")
             }
             sample.seq += 1
             sample.positionMs = 4_000
@@ -978,8 +991,8 @@ private struct PlayerUICheck {
             precondition(abs(slider.doubleValue - 23_400) < 3, "同歌曲新采样不得覆盖拖动位置")
             sendSliderMouse(.leftMouseDragged, fraction: 0.35, slider: slider, window: window)
             precondition(abs(slider.doubleValue - 10_500) < 3, "向左拖动也必须更新预览")
-            sendSliderMouse(.leftMouseUp, fraction: 0.35, slider: slider, window: window, localY: thin ? -6 : nil)
-            if thin {
+            sendSliderMouse(.leftMouseUp, fraction: 0.35, slider: slider, window: window, localY: -6)
+            if showsTimeLabels {
                 try await eventually("轨道外松手应柔和恢复静止样式") { abs(renderedTrackHeight(slider) - restingHeight) < 0.15 }
                 precondition(slider.bounds == originalBounds, "外观动画不能改变命中高度")
             }
@@ -1009,7 +1022,7 @@ private struct PlayerUICheck {
             sample.seq += 1
             controller.publish(sample)
             try await eventually("确认后原生进度接回权威时钟") { abs(slider.doubleValue - Double(target)) < 3 }
-            if thin {
+            if showsTimeLabels {
                 sendSliderMouse(.leftMouseDown, fraction: 0.35, slider: slider, window: window)
                 sliderHover(false, slider: slider, window: window)
                 try await eventually("Esc取消前应已有正在绘制的强调动画") { renderedTrackHeight(slider) > restingHeight + 0.15 }
@@ -1035,13 +1048,15 @@ private struct PlayerUICheck {
             sample.positionMs = nil
             sample.seq += 1
             controller.publish(sample)
-            try await eventually("未知播放位置应禁用原生进度") { !slider.isEnabled }
+            try await eventually("未知播放位置应清空并禁用进度") {
+                !slider.isEnabled && slider.accessibilityValueDescription() == "播放位置未知"
+            }
             sendSliderMouse(.leftMouseDown, fraction: 0.2, slider: slider, window: window)
             sendSliderMouse(.leftMouseDragged, fraction: 0.8, slider: slider, window: window)
             sendSliderMouse(.leftMouseUp, fraction: 0.8, slider: slider, window: window)
             try await Task.sleep(for: .milliseconds(25))
             precondition(controller.seekCount == 1, "未知位置不得通过鼠标手势发出seek")
-            if thin {
+            if showsTimeLabels {
                 sliderHover(true, slider: slider, window: window)
                 precondition(renderedTrackHeight(slider) <= restingHeight, "未知或禁用位置不显示可拖动强调")
                 sample.positionMs = 2_000
@@ -1067,12 +1082,12 @@ private struct PlayerUICheck {
             }
         }
         try await checkReducedMotionScrubber(snapshot: snapshot)
-        print("PASS 默认/细进度拖动与单次seek；24点命中、动画中间态/快速反向、拖出保持、减少动态效果、Esc/卸载清理及未知禁用")
+        print("PASS 播放器和底栏的拖动与单次跳转；24点命中、明暗外观、悬停动画、拖出保持、减少动态效果、Esc、卸载清理和未知位置")
     }
 
     @MainActor static func checkReducedMotionScrubber(snapshot: PlaybackSnapshot) async throws {
         let view = PlaybackScrubber(snapshot: snapshot, positionMs: 6_000, durationMs: 30_000,
-                                    enabled: true, thinStyle: true, reduceMotion: true,
+                                    enabled: true, reduceMotion: true,
                                     onPreview: { _ in }, onSeek: { _, _ in preconditionFailure("外观检查不可提交seek") })
         let host = NSHostingView(rootView: view.frame(height: 24).padding(20))
         let window = NSWindow(contentRect: NSRect(x: 60, y: 60, width: 360, height: 100),
@@ -1125,7 +1140,8 @@ private struct PlayerUICheck {
             let host = NSHostingView(rootView: AnyView(ContentView(preferences: preferences)
                 .environmentObject(model).defaultAppStorage(preferences)))
             let window = NSWindow(contentRect: NSRect(origin: NSPoint(x: 80, y: 80), size: size),
-                                  styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                  backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             window.contentView = host
             window.collectionBehavior = [.fullScreenPrimary]
@@ -1180,6 +1196,26 @@ private struct PlayerUICheck {
         try await eventually("模拟窗口应完成原生全屏退出", attempts: 1_200) {
             transitions.exited && !window.styleMask.contains(.fullScreen)
         }
+        try await eventually("完整播放器窗口应恢复焦点") { window.isKeyWindow }
+        host.layoutSubtreeIfNeeded()
+        // 顶栏从左起预留 76 点，组内留 12 点，再加胶囊内边距 1 点。
+        // 点击首个 32 点槽位的水平中心，距槽位上缘 4 点，避开叉号笔画。
+        let fromTop: CGFloat = 4 + 1 + 4
+        let closePoint = host.convert(NSPoint(
+            x: host.bounds.minX + 76 + 12 + 1 + 16,
+            y: host.isFlipped ? host.bounds.minY + fromTop : host.bounds.maxY - fromTop
+        ), to: nil)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            let event = NSEvent.mouseEvent(
+                with: type, location: closePoint, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                pressure: type == .leftMouseDown ? 1 : 0
+            )!
+            NSApplication.shared.postEvent(event, atStart: false)
+        }
+        try await eventually("点击叉号图案外的标题栏留白应返回资料库") {
+            preferences.string(forKey: "player.presentationMode") == "browser" && window.isVisible
+        }
         window.close()
 
         for presentBeforeAttach in [true, false] {
@@ -1201,7 +1237,7 @@ private struct PlayerUICheck {
             sheetModel.isLibraryPresented = false
             try await eventually("模拟预览应完成收起", attempts: 600) { sheetWindow.attachedSheet == nil }
         }
-        print("PASS 窗口布局：compact冷启动、拖宽回完整、全屏拒绝compact、已有预览优先展开")
+        print("PASS 窗口布局：compact冷启动、拖宽回完整、全屏拒绝compact、叉号槽位留白点击、已有预览优先展开")
     }
 
     @MainActor static func main() {
@@ -1248,6 +1284,12 @@ private struct PlayerUICheck {
             trackEpoch: 1, title: "原创界面测试", positionMs: 2_000, durationMs: 30_000,
             status: .paused, seq: 1, sessionEpoch: 1, trackRef: binding.trackKey
         )
+        if CommandLine.arguments.contains("--playback-presentation-only") {
+            try await LyricsMotionUICheck.run()
+            try await PlaybackProgressUICheck.runChecks()
+            try await checkPlaybackDragging(store: store, snapshot: initial)
+            return
+        }
         var denied = initial
         denied.errorCode = AppModel.permissionDeniedCode
         let deniedController = CheckController(denied)

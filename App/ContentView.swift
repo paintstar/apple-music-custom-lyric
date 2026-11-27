@@ -77,7 +77,7 @@ struct ContentView: View {
                 if usesCompact {
                     CompactPlayerView(artworkStore: model.artworkStore, topControls: AnyView(compactWindowControls))
                 } else if expandedPresentation == .nowPlaying {
-                    NowPlayingView(artworkStore: model.artworkStore)
+                    NowPlayingView(artworkStore: model.artworkStore, floatingLyricsControl: floatingLyricsControl)
                 } else {
                     browserArea(hasLyrics: hasLyrics, availableWidth: availableWidth)
                 }
@@ -251,6 +251,7 @@ struct ContentView: View {
     private var windowControls: some View {
         HStack(spacing: 14) {
             playerPresentationControls
+                .offset(y: 4)
             Spacer()
             PlaybackVolumeButton(model: model.playbackOptions, compact: true)
             navigationMenu(compact: true)
@@ -287,7 +288,9 @@ struct ContentView: View {
     private var playerPresentationControls: some View {
         HStack(spacing: 0) {
             Button { returnToBrowser() } label: {
-                Image(systemName: "xmark").frame(width: 32, height: 32)
+                Image(systemName: "xmark")
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .help("关闭播放器，返回资料库")
             .accessibilityLabel("关闭播放器并返回资料库")
@@ -302,6 +305,7 @@ struct ContentView: View {
             } label: {
                 Image(systemName: presentation == .compact ? "pip.exit" : "pip.enter")
                     .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .help(presentation == .compact ? "展开播放器" : "切换紧凑播放器")
             .accessibilityLabel(presentation == .compact ? "展开播放器" : "切换紧凑播放器")

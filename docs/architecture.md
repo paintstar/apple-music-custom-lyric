@@ -1,6 +1,6 @@
 # 架构
 
-ShinApple 使用 SwiftUI 构建界面，局部使用 AppKit 管理窗口和歌词文本布局。官方「音乐」App 负责实际音频播放，应用通过公开脚本读状态和控制播放；本地歌词资料与官方音乐账号独立。
+ShinApple 使用 SwiftUI 构建界面，局部使用 AppKit 管理窗口和歌词文本布局。官方「音乐」App 负责实际音频播放，ShinApple 通过公开脚本读取状态和控制播放。本地歌词资料与官方音乐账号独立。
 
 ## 模块
 
@@ -9,7 +9,7 @@ ShinApple 使用 SwiftUI 构建界面，局部使用 AppKit 管理窗口和歌�
 | `App/` | 界面、窗口、界面状态及服务接线 |
 | `ShinAppleKit` | 领域模型（歌词与生词模型）、播放和存储协议、LRC 解析、Mock |
 | `ShinLyricsEngine` | 纯时间轴查询、歌词分组、偏移换算与单句/AB 播放区间计算 |
-| `ShinAppleData` | GRDB/SQLite 存储（含 v4 生词本表）、事务、迁移、备份校验与恢复 |
+| `ShinAppleData` | GRDB/SQLite 存储（含生词本和 AI 结果缓存）、事务、迁移、备份校验与恢复 |
 | `ShinAppServices` | 导入、关联、编辑、AI 学习协同与本机词典查询、AB 循环状态机、播放与歌词协调、导出（含生词本）与备份工作流，以及本机链接音频下载与标签封装服务 |
 | `ShinMusicScript` | 唯一 Music Apple Events 适配层，包含资料库、播放选项、封面读取与本地音频文件入库 |
 | `ShinLyricsProvider` | 唯一网易云 HTTP 获取层，包含候选查询、歌词文本获取、匹配和双语 LRC 合成 |
@@ -19,7 +19,7 @@ ShinApple 使用 SwiftUI 构建界面，局部使用 AppKit 管理窗口和歌�
 
 ## 播放与歌词同步
 
-Music 脚本快照是播放状态和位置的权威来源，所有内部时间使用整数毫秒，未知位置用 nil。展示层可从最近有效样本按单调时钟短时插值，默认外推上限 1 秒；新样本立即校正，暂停、切歌、停滞和陈旧样本停止推进。
+Music 脚本快照是播放状态和位置的权威来源，所有内部时间使用整数毫秒，未知位置用 nil。展示层在播放中从最近一次位置变化或播放开始的有效样本按单调时钟短时插值，默认最多外推 1 秒。重复位置沿用原锚点，到达上限或确认停滞后冻结显示并标记陈旧。暂停、切歌、跳转读回及变动的权威位置会重置插值。
 
 播放请求入队时登记优先权，AppleScript 仍经进程内同一脚本门串行执行。实际等待执行的播放脚本优先于采样，采样可在长列表建立的批次之间及播放确认等待期间继续；资料库和列表封面脚本在每段脚本边界让播放先行。采样与控制统一先进入脚本门，再取播放执行锁；取消、dispose 和命令完成均释放排队优先权，专用退出清理仍可执行。已开始的单个 Apple Event 无法抢占。
 
@@ -51,6 +51,8 @@ Music 脚本快照是播放状态和位置的权威来源，所有内部时间�
 
 等待展示只使用实际前奏和时间轴中的明确空白区间，不凭相邻歌词的间隔猜测句尾。较长等待显示三点，由权威播放位置依次填满；暂停冻结，未知位置不猜测进度，减少动态效果时使用静态样式。等待槽按文档及有效偏移预先排布，连续空白合并为紧凑槽，短等待收起；播放推进、暂停和 seek 只更新显示状态，不改变歌词行位置。
 
+同步歌词的普通前进从当前视口轻缓起步，连续目标沿用当前滚动速度。亮度和清晰度按视口位移交接，新句靠近阅读位置才完整高亮。权威采样跨过近处短句时直接过渡到已确认的新句。远距跳转用淡出、定位、淡入避免扫过中间段落，减少动态效果时直接定位。
+
 异步操作检查曲目或文档生命周期与请求顺序，防止旧结果覆盖新状态。采样、监听和动画可取消。手动歌词滚动、拖动和选词暂时挂起自动跟随，停止阅读后按本地设置的空闲时间恢复；设置变化按最后实际阅读活动重算，不当作新的阅读动作。导入、编辑与进度拖动各自保留明确的预览和提交边界。导入保存成功后自动关闭导入页，重查关联后核对曲目、文档、服务实例和导入代次，再立即恢复歌词跟随；暂停仍按已知权威位置定位，未知位置不猜测当前行。
 
 完整与紧凑播放器的歌词动作合并到顶栏菜单，独立歌词侧栏保留自己的入口。菜单按面板状态启用偏移、译文、编辑和解除关联，解除确认固定曲目、生命周期、面板实例、文档和 revision；确认前与写事务中分别重验，切歌、换库、换绑或编辑后拒绝旧请求。解除最后一个歌曲关联时同时删除歌词和译文；共享歌词仅解除当前歌曲关联。
@@ -77,11 +79,19 @@ Music 脚本快照是播放状态和位置的权威来源，所有内部时间�
 
 划词释义使用依附歌词宿主窗口的可缩放原生窗口。拖动结束后将内容区宽高成对写入本机显示偏好，设置页使用同一偏好编辑或恢复默认尺寸。窗口按当前屏幕的可见区域调整，临时限幅不覆盖偏好。
 
-`ShinAIProvider` 将网络出站严格限定在 `OpenAICompatibleClient.swift`（采用 ephemeral `URLSession`，测试经 `URLProtocol` 拦截），并由 `validatedEndpointURL` 校验仅接受 `https` 协议或本地回环地址（`localhost` / `127.0.0.1` / `::1`）的 `http` 协议，禁止内嵌凭据。API Key 由 `SystemKeychainCredentialStore` 保存在 macOS 钥匙串（Service 常量 `com.shinapple.ai-credentials`），不写入 `UserDefaults`、`lyrics.sqlite`、JSON 备份或日志；非敏感预设、Base URL、模型名与注音偏好独立保存在 `UserDefaults`（`AIServiceSettingsStore`）。发送给 AI 服务的提示词仅包含必要的歌词原文（附稳定 `lineId`）、参考译文与曲目名称，不读取或发送音乐库清单或 Cookie。Mock 模式使用 `InMemoryAICredentialStore` 与内置虚构学习客户端，不触碰真实钥匙串或网络。
+`ShinAIProvider` 将网络出站严格限定在 `OpenAICompatibleClient.swift`（采用 ephemeral `URLSession`，测试经 `URLProtocol` 拦截），并由 `validatedEndpointURL` 校验仅接受 `https` 协议或本地回环地址（`localhost` / `127.0.0.1` / `::1`）的 `http` 协议，禁止内嵌凭据。API Key 由 `SystemKeychainCredentialStore` 保存在 macOS 钥匙串（Service 常量 `com.shinapple.ai-credentials`），不写入 `UserDefaults`、`lyrics.sqlite`、JSON 备份或日志；非敏感预设、Base URL、模型名与注音偏好独立保存在 `UserDefaults`（`AIServiceSettingsStore`）。发送给 AI 服务的内容限于当前任务所需的歌词、学习上下文和用户问题，搜词任务仅使用曲目名称和作者。请求不读取或发送音乐库清单或 Cookie。Mock 模式使用 `InMemoryAICredentialStore` 与内置虚构学习客户端，不触碰真实钥匙串或网络。
 
-批量学习与写库遵守人工成果优先原则：导入预览（`ImportFlowView`）、歌词编辑器（`LyricsEditorView`）与歌词面板菜单均可按需触发「AI 生成注音 / 译文」及「提炼本曲重点词汇」，经预览调整并由用户确认后才落库。`AIStudyWorkflowService` 与 `LyricsStudyService` 按稳定 `lineId` 对齐结果（绝不依赖数组下标），已有 `.manual` 来源的注音或译文默认不勾选覆盖；提交持久化时先读取库内文档核对 `expectedRevision`，防止覆盖并发修改。用户在编辑器修改某行原文后，该行已有译文、`pronunciation`（逐行注音）和 `studyNote`（整句笔记）统一标记 `needsReview = true`；文本注音只基于歌词文字生成，不代表歌手实际演唱唱法。
+导入预览、歌词编辑器与歌词面板菜单均可主动生成注音与译文。批量任务默认补齐缺失项，已有内容会直接展示，逐行选中后可请求重新生成。`AIStudyWorkflowService` 与 `LyricsStudyService` 按稳定 `lineId` 对齐结果，确认写入时核对文档 `expectedRevision`。修改原文后，对应译文、逐行注音与整句笔记标记为待复核。
+
+`lyrics.sqlite` v5 添加 `aiStudyCache`，按文档 ID 与任务输入摘要保存校验通过的生成结果。摘要覆盖实际发送的行 ID、文本与上下文、任务参数、服务端点、模型和提示词版本。缓存按 7 天有效期和每库 20 MiB 结果载荷上限淘汰，随文档删除清理。学习资料备份和搬运学习资料到空目录均排除缓存。v6 新增缓存代次，清空缓存的事务同时更新代次。清空前已发出的请求返回后，其结果仅供当前预览使用。
+
+导入草稿和未保存的歌词编辑稿使用当前会话的内存缓存。导入确认后可将匹配结果写入已入库歌词的缓存。关闭歌词编辑器、放弃修改或开始新编辑会话时重置编辑稿缓存。
+
+整句卡片优先展示已保存的本句笔记，其次匹配解析缓存。发送追问时传入当前句、所需上下文、AI 解析与最近三轮问答。问答随卡片关闭清理，用户可主动加入笔记草稿，并在通过文档 revision 和行 ID 校验后确认写入。
 
 `lyrics.sqlite` v4 引入 `vocabularyEntry` 与 `vocabularyOccurrence` 两张表，跨歌曲按 `(language, lemma)` 归并同一词条并记录每次出现的 `lyricDocumentId`、`lineId`、UTF-16 词段偏移（`utf16Location` / `utf16Length`）与原句/译文/时间戳快照；`lyricDocumentId` 外键使用 `ON DELETE SET NULL`，删除歌词文档后仍保留历史生词快照。主歌词区通过 `NSLayoutManager` 临时绘制属性渲染已收录生词下划线、行末笔记书签和盲听挖空（Cloze）遮罩，不改动 `NSTextStorage` 字符内容或破坏排版行高；开启 Cloze 模式时隐藏已收录词条，鼠标悬停所在行或播放高亮到当前行时自动揭晓。侧边栏「单词本与笔记」支持检索筛选、释义笔记编辑、原声例句跳转「音乐」播放定位、闪卡自测以及 Anki TSV / CSV / Markdown 导出。
+
+单词本与闪卡共用原声例句播放入口。同曲通过已装载的歌词时间轴定位，其他曲优先按已关联文档和绑定的偏移换算，缺少关联时用出处快照。「音乐」已停止且没有当前曲目或播放列表时，可按持久曲目 ID 直接播放目标曲，确认曲目后定位。已有播放上下文时，跨曲点播会显示目标曲名并提示将中断当前队列。用户确认后复核当前曲目和播放会话，通过公开脚本播放目标曲，再根据实际读回的曲目定位。取消时保留当前的播放状态和队列。
 
 单句循环与 AB 选段复读共用时间轴引擎与权威播放快照：`LyricsTimelineIndex.playbackSegment` 按统一公式 `line.startMs − sourceOffsetMs + userDelayMs` 计算生效 `[startMs, endMs)` 区间（末句要求已知 `durationMs`）；`LyricsABLoopEvaluator` 仅在 `.playing` 且匹配当前曲目键、`trackEpoch` 与 `documentId` 时，于越过区间终点后按冷却时间防抖发出 `seekTo`，切歌、换绑或编辑挂起时自动清除循环状态。
 

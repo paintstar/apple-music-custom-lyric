@@ -73,16 +73,15 @@ final class AIKeyPointsModel: ObservableObject {
             ?? (isMock ? InMemoryAICredentialStore() : SystemKeychainCredentialStore())
         self.credentialStore = resolvedCredentials
         let resolvedClient: any AIStudyProviding = aiClient
-            ?? (isMock ? MockKeyPointsClient() : OpenAICompatibleClient(credentialStore: resolvedCredentials))
+            ?? (isMock ? MockKeyPointsClient() : OpenAICompatibleClient())
 
         self.workflowService = AIStudyWorkflowService(
             store: store,
             aiClient: resolvedClient,
             configurationProvider: { settingsStore.load() },
-            apiKeyProvider: {
+            configuredAPIKeyProvider: { preset in
                 guard !isMock else { return nil }
-                let config = settingsStore.load()
-                return try? resolvedCredentials.apiKey(for: config.preset)
+                return try resolvedCredentials.apiKey(for: preset)
             }
         )
         refreshServiceStatus()
@@ -124,10 +123,9 @@ final class AIKeyPointsModel: ObservableObject {
             return
         }
         do {
-            let key = try credentialStore.apiKey(for: config.preset)
-            missingKeyWarning = key == nil
-                ? "尚未配置「\(config.preset.displayName)」的 API Key，请前往「设置 → AI 学习服务」保存密钥。"
-                : nil
+            missingKeyWarning = try credentialStore.hasAPIKey(for: config.preset)
+                ? nil
+                : "尚未配置「\(config.preset.displayName)」的 API Key，请前往「设置 → AI 学习服务」保存密钥。"
         } catch {
             missingKeyWarning = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }

@@ -12,11 +12,23 @@ enum Schema {
     /// 迁移器。每次返回新值（DatabaseMigrator 是值类型，register 是 mutating）。
     /// internal：供测试注入坏迁移验证回滚行为。
     static func migrator() -> DatabaseMigrator {
-        var migrator = DatabaseMigrator()
-        registerV1Schema(on: &migrator)
-        registerV2TrackKeyNamespace(on: &migrator)
-        registerV3DocumentSummary(on: &migrator)
-        registerV4LearningAndVocabulary(on: &migrator)
+        var migrator = v5Migrator()
+        migrator.registerMigration("v6.aiStudyCacheGeneration") { db in
+            try db.execute(sql: """
+                CREATE TABLE aiStudyCacheGeneration (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    token TEXT NOT NULL
+                )
+                """)
+            try AIStudyCacheGeneration.renew(in: db)
+        }
+        return migrator
+    }
+
+    /// 供测试构造已经有持久缓存的 v5 库。
+    static func v5Migrator() -> DatabaseMigrator {
+        var migrator = v4Migrator()
+        registerV5AIStudyCache(on: &migrator)
         return migrator
     }
 
@@ -44,6 +56,13 @@ enum Schema {
         registerV1Schema(on: &migrator)
         registerV2TrackKeyNamespace(on: &migrator)
         registerV3DocumentSummary(on: &migrator)
+        return migrator
+    }
+
+    /// 供测试构造 v4 库，验证添加 AI 缓存表时学习资料仍可读。
+    static func v4Migrator() -> DatabaseMigrator {
+        var migrator = v3Migrator()
+        registerV4LearningAndVocabulary(on: &migrator)
         return migrator
     }
 
@@ -254,6 +273,20 @@ enum Schema {
                 on: "vocabularyOccurrence",
                 columns: ["lyricDocumentId", "lineId"]
             )
+        }
+    }
+
+    private static func registerV5AIStudyCache(on migrator: inout DatabaseMigrator) {
+        migrator.registerMigration("v5.aiStudyCache") { db in
+            try db.create(table: "aiStudyCache") { table in
+                table.column("documentId", .text).notNull()
+                    .references("lyricDocument", onDelete: .cascade)
+                table.column("cacheKey", .text).notNull()
+                table.column("payload", .blob).notNull()
+                table.column("createdAt", .double).notNull()
+                table.primaryKey(["documentId", "cacheKey"])
+            }
+            try db.create(index: "aiStudyCache.on.createdAt", on: "aiStudyCache", columns: ["createdAt"])
         }
     }
 }

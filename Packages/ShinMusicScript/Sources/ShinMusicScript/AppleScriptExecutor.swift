@@ -21,6 +21,7 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
         static let noTrack = "no-track"
         static let notRunning = "not-running"
         static let notFound = "not-found"
+        static let trackChanged = "track-changed"
     }
 
     public init() {}
@@ -63,15 +64,55 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
     }
 
     public func seek(toSeconds seconds: Double) throws {
-        // "%.3f" 只产生数字/点/负号：数值插值无注入面。
-        let source = Self.commandSource("set player position \(String(format: "%.3f", seconds))")
-        try runSource(source, name: "seek")
+        try runSource(Self.seekSource(seconds: seconds), name: "seek")
+    }
+
+    public func seek(toSeconds seconds: Double, expectedPersistentID: String) throws {
+        try runSource(Self.seekSource(seconds: seconds, expectedPersistentID: expectedPersistentID), name: "seek")
     }
 
     /// 单曲 Apple Event 会丢失连续播放范围；由控制器的完整上下文入口负责点播。
     public func playPersistentID(_ persistentID: String) throws {
         guard SongBinding.isValidPersistentID(persistentID) else { throw MusicScriptFailure.trackNotFound }
         throw MusicScriptFailure.commandUnsupported("playPersistentID")
+    }
+
+    public func playVocabularyExample(
+        persistentID: String, positionMs: Int64?,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try performVocabularyExample(
+            persistentID: persistentID, positionMs: positionMs, replacingPersistentID: nil,
+            checkCancellation: checkCancellation
+        )
+    }
+
+    public func playVocabularyExample(
+        persistentID: String, positionMs: Int64?, replacingPersistentID: String,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try performVocabularyExample(
+            persistentID: persistentID, positionMs: positionMs, replacingPersistentID: replacingPersistentID,
+            checkCancellation: checkCancellation
+        )
+    }
+
+    private func performVocabularyExample(
+        persistentID: String, positionMs: Int64?, replacingPersistentID: String?,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try MusicAppleScriptExecution.withCancellableLock {
+            try MusicVocabularyPlayback.perform(
+                persistentID: persistentID, positionMs: positionMs, replacingPersistentID: replacingPersistentID,
+                execute: { source in
+                    guard let script = NSAppleScript(source: source) else {
+                        throw MusicScriptFailure.unknown("vocabulary:scriptConstruction")
+                    }
+                    return try execute(script, errorContext: "vocabulary:playback")
+                },
+                checkCancellation: checkCancellation
+            )
+        }
     }
 
     // MARK: - 快照列表解析（static 纯函数，供单元测试）
@@ -154,7 +195,7 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
     /// 描述符 → Double。先查 descriptorType 再取值（NSAppleEventDescriptor
     /// 的数值访问器对类型不符会抛 ObjC 异常，不能盲取）；
     /// 缺项/意外类型 nil（未知值不是 0）。
-    private static func numberValue(_ descriptor: NSAppleEventDescriptor?) -> Double? {
+    static func numberValue(_ descriptor: NSAppleEventDescriptor?) -> Double? {
         guard let descriptor else { return nil }
         // Apple Event 数值类型（AEDataModel FourCharCode；Swift 未直接暴露）。
         let typeFloatCode: OSType = 0x646F_7562 // 'doub'
@@ -199,6 +240,23 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
         """
     }
 
+    static func seekSource(seconds: Double, expectedPersistentID: String? = nil) throws -> String {
+        guard seconds.isFinite else { throw MusicScriptFailure.unknown("seek:invalidPosition") }
+        let position = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), seconds)
+        let update = "set player position to \(position)"
+        guard let expectedPersistentID else { return commandSource(update) }
+        guard SongBinding.isValidPersistentID(expectedPersistentID) else { throw CancellationError() }
+        return commandSource("""
+        try
+            if (persistent ID of current track) is not "\(expectedPersistentID)" then return "\(Marker.trackChanged)"
+        on error number readError
+            if readError is -1728 then return "\(Marker.trackChanged)"
+            error number readError
+        end try
+        \(update)
+        """)
+    }
+
     // MARK: - 执行
 
     private func runSource(_ source: String, name: String) throws {
@@ -210,6 +268,8 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
             switch result?.stringValue {
             case Marker.notRunning:
                 throw MusicScriptFailure.musicNotRunning
+            case Marker.trackChanged:
+                throw CancellationError()
             case Marker.ok:
                 return
             default:
@@ -219,12 +279,12 @@ public final class AppleScriptExecutor: MusicScriptExecutor, @unchecked Sendable
     }
 
     /// 调用方已持 OSA 生命周期锁；执行脚本并映射为执行器层失败。
-    private func execute(_ script: NSAppleScript) throws -> NSAppleEventDescriptor? {
+    private func execute(_ script: NSAppleScript, errorContext: String? = nil) throws -> NSAppleEventDescriptor? {
         var errorInfo: NSDictionary?
         let result = script.executeAndReturnError(&errorInfo)
         if let errorInfo {
             let code = (errorInfo[NSAppleScript.errorNumber] as? NSNumber)?.intValue ?? 0
-            let message = (errorInfo[NSAppleScript.errorBriefMessage] as? String) ?? ""
+            let message = errorContext ?? (errorInfo[NSAppleScript.errorBriefMessage] as? String) ?? ""
             throw MusicScriptErrorMapper.failure(appleEventCode: code, detail: message)
         }
         return result

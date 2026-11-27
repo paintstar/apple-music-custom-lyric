@@ -30,7 +30,7 @@ private final class SpyLocalDictionaryProvider: LocalDictionaryLookupProviding, 
     }
 }
 
-private final class SpyAIStudyClient: AIStudyProviding, @unchecked Sendable {
+final class SpyAIStudyClient: AIStudyProviding, @unchecked Sendable {
     struct WordCall: Equatable, Sendable {
         let word: String; let lineText: String; let sourceLanguage: String?; let apiKey: String?
     }
@@ -41,6 +41,7 @@ private final class SpyAIStudyClient: AIStudyProviding, @unchecked Sendable {
     private let state = OSAllocatedUnfairLock(initialState: State())
     var wordHandler: (@Sendable (String, String, String?, AIConfiguration, String?) async throws -> AIWordExplanation)?
     var lineHandler: (@Sendable (String, AILineContext, AIConfiguration, String?) async throws -> AILineExplanation)?
+    var followUpHandler: (@Sendable () async throws -> String)?
     var wordCalls: [WordCall] { state.withLock { $0.wordCalls } }
     var lineCalls: [LineCall] { state.withLock { $0.lineCalls } }
 
@@ -240,7 +241,7 @@ struct VocabularyExportServiceTests {
 @Suite("歌词学习协同服务")
 struct LyricsStudyServiceTests {
 
-    private static func makeService(
+    static func makeService(
         store: GRDBLyricsStore,
         dictionary: any LocalDictionaryLookupProviding = LocalDictionaryService(),
         aiClient: any AIStudyProviding = SpyAIStudyClient(),

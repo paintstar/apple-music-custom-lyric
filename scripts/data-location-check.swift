@@ -179,7 +179,31 @@ private struct DataLocationCheck {
         precondition(model.storageSwitchMessage?.contains("已在当前保存位置") == true,
                      "重复切换到当前位置应提示而非重复搬数据")
 
-        print("PASS 保存位置切换：立即生效/数据完整/偏好持久化/重启尊重/失败原子性/恢复默认/粘贴导入可用")
+        // 7) 目录可写而目标库无法打开，首次存在性检查不足以授权删除目标路径。
+        let emptySource = root.appendingPathComponent("empty-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptySource, withIntermediateDirectories: true)
+        let emptyStore = try GRDBLyricsStore(path: emptySource.appendingPathComponent("lyrics.sqlite").path)
+        let emptyModel = AppModel(
+            isMock: false, controller: CheckController(snapshot), searchService: nil,
+            makeLyricsDatabase: {
+                LyricsDatabase.Database(store: emptyStore, locationDescription: "空测试库", directory: emptySource)
+            }
+        )
+        await emptyModel.start()
+        let brokenLocation = root.appendingPathComponent("broken-location", isDirectory: true)
+        try FileManager.default.createDirectory(at: brokenLocation, withIntermediateDirectories: true)
+        let link = brokenLocation.appendingPathComponent("lyrics.sqlite")
+        let missingTarget = root.appendingPathComponent("missing-directory/lyrics.sqlite")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: missingTarget)
+        precondition(!FileManager.default.fileExists(atPath: link.path), "检查应走最初未发现目标库的路径")
+        await emptyModel.switchLyricsStorage(to: brokenLocation)
+        precondition(emptyModel.storageSwitchMessage?.contains("打开新位置失败") == true, "应报告目标库打开失败")
+        let preservedLink = try FileManager.default.destinationOfSymbolicLink(atPath: link.path)
+        precondition(preservedLink == missingTarget.path, "打开失败应保留目标路径")
+        precondition(emptyModel.lyricsStore === emptyStore && LyricsDatabase.storedOverrideDirectory() == nil,
+                     "打开失败应保留源库和保存位置偏好")
+
+        print("PASS 保存位置切换：立即生效/数据完整/偏好持久化/重启尊重/失败原子性/打开失败保留目标/恢复默认/粘贴导入可用")
     }
 
     static func main() {

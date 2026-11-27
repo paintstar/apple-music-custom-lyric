@@ -36,8 +36,7 @@ public struct PlaybackEstimate: Equatable, Sendable {
     public var positionMs: Int64?
     /// 正在按「样本位置 + 单调差」外推。
     public var isExtrapolated: Bool
-    /// 陈旧标记：外推超上限已钉回样本值，或连击无进展已冻结估计
-    /// （UI 据此弱化显示，不冒充精确时间）。
+    /// 陈旧标记：外推已到上限，或连续无进展已冻结估计。
     public var isStale: Bool
 
     public static let none = PlaybackEstimate(positionMs: nil, isExtrapolated: false, isStale: false)
@@ -53,13 +52,12 @@ public struct PlaybackEstimate: Equatable, Sendable {
 ///
 /// 显示规则：
 /// - **插值只基于最近有效样本**：无样本不插值，绝不从启动时间累加；
-///   估计 = 样本位置 +（当前单调时刻 − 采样时刻），新样本到达即校正；
+///   估计 = 样本位置 +（当前单调时刻 − 采样时刻），位置变化时立即校正；
 /// - **仅在 playing 状态估计**：暂停/其他状态冻结显示样本值，不推进；
-/// - **外推上限 1 秒**：超限后钉在样本值并标记陈旧（`isStale`），
-///   绝不长时间凭空推进；
+/// - **外推上限 1 秒**：超限后停在上限并标记陈旧（`isStale`）；
 /// - **失效即重置/冻结**：切歌（trackEpoch 变化）、暂停、seek 后的新样本、
 ///   单调时钟倒退（时钟域重映射/休眠唤醒）都使估计从新样本重新出发；
-///   连续无进展样本（播放中位置不前进，含位置读取失败）达到阈值后冻结估计；
+///   同一位置或读取失败的样本不刷新锚点，连续达到阈值后冻结估计；
 /// - **权威语义不变**：脚本采样返回的播放位置仍是唯一权威时间，本类型
 ///   是展示层新增，不改变协调器「快照整查」的同步语义。
 public struct InterpolatedPlaybackClock: Sendable {
@@ -74,8 +72,10 @@ public struct InterpolatedPlaybackClock: Sendable {
     public private(set) var sample: PlaybackSample?
     /// 连续无进展的播放样本计数（达 `stallSampleLimit` 后冻结估计）。
     public private(set) var consecutiveNoProgressSamples = 0
-    /// 停滞冻结中：估计钉在样本值，直到出现位置前进的播放样本。
-    public private(set) var isStalled = false
+    private var lastSampledAtMonotonicMs: Int64?
+    private var stalledAtMonotonicMs: Int64?
+    /// 停滞冻结中，直到收到位置变化的样本或播放状态改变。
+    public var isStalled: Bool { stalledAtMonotonicMs != nil }
 
     public let extrapolationLimitMs: Int64
     public let stallSampleLimit: Int
@@ -88,51 +88,21 @@ public struct InterpolatedPlaybackClock: Sendable {
         self.stallSampleLimit = max(stallSampleLimit, 1)
     }
 
-    /// 输入一条新的权威样本（新样本到达即校正：估计永远从本样本重新出发）。
+    /// 输入一条权威样本；重复位置沿用同一个有界外推区间。
     public mutating func apply(sample newSample: PlaybackSample) {
-        if let current = self.sample {
-            // 切歌（trackEpoch 变化）→ 重置估计与连击计数（失效条件）。
-            if newSample.trackEpoch != current.trackEpoch {
-                consecutiveNoProgressSamples = 0
-                isStalled = false
-                self.sample = newSample
-                return
+        let sampleTime = newSample.sampledAtMonotonicMs
+        defer { lastSampledAtMonotonicMs = sampleTime }
+        if let current = self.sample, current.trackEpoch == newSample.trackEpoch,
+           current.isPlaying, newSample.isPlaying, sampleTime >= (lastSampledAtMonotonicMs ?? sampleTime),
+           newSample.positionMs == nil || newSample.positionMs == current.positionMs {
+            if !isStalled {
+                consecutiveNoProgressSamples += 1
+                if consecutiveNoProgressSamples >= stallSampleLimit { stalledAtMonotonicMs = sampleTime }
             }
-            // 单调时钟倒退 = 时钟域重映射/休眠唤醒：旧锚点的时刻不可再比较，
-            // 重置连击计数并从新样本重新出发。
-            if newSample.sampledAtMonotonicMs < current.sampledAtMonotonicMs {
-                consecutiveNoProgressSamples = 0
-                isStalled = false
-                self.sample = newSample
-                return
-            }
-            // 进展判定：仅统计播放中的样本；位置前进 → 解除冻结并清零连击；
-            // 位置不变或未知（读取失败）→ 累计，达阈值后冻结估计。
-            if newSample.isPlaying {
-                let progressed = newSample.positionMs != nil
-                    && newSample.positionMs != current.positionMs
-                if progressed {
-                    consecutiveNoProgressSamples = 0
-                    isStalled = false
-                } else {
-                    consecutiveNoProgressSamples += 1
-                    if consecutiveNoProgressSamples >= stallSampleLimit {
-                        isStalled = true
-                    }
-                }
-            } else {
-                // 暂停等状态：冻结语义由 estimate 承担；连击计数重置。
-                consecutiveNoProgressSamples = 0
-                isStalled = false
-            }
-        }
-        // 无效样本（positionMs == nil）不替换锚点：插值只基于最近「有效」样本；
-        // 有效样本（含暂停冻结值）成为新锚点。
-        if newSample.positionMs != nil {
+        } else {
             self.sample = newSample
-        } else if self.sample == nil {
-            // 从未有过有效样本：保留 nil 锚点本身（未知时间显示 null）。
-            self.sample = newSample
+            consecutiveNoProgressSamples = 0
+            stalledAtMonotonicMs = nil
         }
     }
 
@@ -142,26 +112,17 @@ public struct InterpolatedPlaybackClock: Sendable {
             return .none
         }
         // 仅 playing 插值：暂停/其他状态冻结在样本值。
-        guard anchor.isPlaying, !isStalled else {
-            return PlaybackEstimate(
-                positionMs: positionMs,
-                isExtrapolated: false,
-                isStale: isStalled
-            )
-        }
-        let deltaMs = nowMonotonicMs - anchor.sampledAtMonotonicMs
-        guard deltaMs > 0 else {
-            // 时刻未越过采样点（含时钟域扰动）：原样显示样本值。
+        guard anchor.isPlaying else {
             return PlaybackEstimate(positionMs: positionMs, isExtrapolated: false, isStale: false)
         }
-        if deltaMs > extrapolationLimitMs {
-            // 超过外推上限：钉在样本值并标记陈旧。
-            return PlaybackEstimate(positionMs: positionMs, isExtrapolated: false, isStale: true)
-        }
+        let estimateTime = min(stalledAtMonotonicMs ?? nowMonotonicMs, nowMonotonicMs)
+        let elapsedMs = max(estimateTime - anchor.sampledAtMonotonicMs, 0)
+        let offsetMs = min(elapsedMs, extrapolationLimitMs)
+        let stale = isStalled || elapsedMs > extrapolationLimitMs
         return PlaybackEstimate(
-            positionMs: positionMs + deltaMs,
-            isExtrapolated: true,
-            isStale: false
+            positionMs: positionMs + offsetMs,
+            isExtrapolated: offsetMs > 0 && !stale,
+            isStale: stale
         )
     }
 }

@@ -39,6 +39,7 @@ final class LyricsEditorModel: ObservableObject {
 
     let store: GRDBLyricsStore
     let isMock: Bool
+    private(set) var aiStudyDraftCache = AIStudyPreviewCache()
     private let service: LyricsEditingService
     /// 最近一次打开的文档 id（冲突后「重新载入」复用）。
     private var lastOpenedDocumentId: UUID?
@@ -73,6 +74,7 @@ final class LyricsEditorModel: ObservableObject {
 
     /// 打开编辑器（读取库内文档生成草稿）。
     func open(documentId: UUID) async {
+        aiStudyDraftCache = AIStudyPreviewCache()
         phase = .loading
         alertMessage = nil
         lineMessages = [:]
@@ -93,6 +95,7 @@ final class LyricsEditorModel: ObservableObject {
     /// 结束编辑会话（放弃未保存修改——调用方必须已通过确认或无修改）。
     /// 幂等。
     func close() async {
+        aiStudyDraftCache = AIStudyPreviewCache()
         await service.closeEditor()
         snapshot = nil
         timeInputs = [:]
@@ -102,6 +105,7 @@ final class LyricsEditorModel: ObservableObject {
 
     /// 放弃未保存修改（不关闭编辑器）：回到打开时（或上次保存后）的状态。
     func discardEdits() async {
+        aiStudyDraftCache = AIStudyPreviewCache()
         await service.discard()
         guard let restored = await service.currentSnapshot() else { return }
         snapshot = restored
@@ -323,28 +327,25 @@ extension LyricsEditorModel {
     func applyAIStudyPreview(
         items: [AIStudyPreviewLine],
         task: AIStudyBatchTaskKind,
-        modelName: String?
-    ) async {
-        guard let draft = await service.currentWorkingDocument() else { return }
-        let expectedDocId = draft.id
-        await perform {
-            guard await self.service.currentWorkingDocument()?.id == expectedDocId else {
-                throw LyricsEditingError.noOpenEditor
-            }
-            switch task {
-            case .pronunciation(let style):
-                let updated = AIStudyWorkflowService.mergedPronunciations(
-                    in: draft, items: items, style: style, modelName: modelName
-                )
-                return try await self.service.applyBatchPronunciations(updated)
-            case .translation(let targetLanguage):
-                let updated = AIStudyWorkflowService.mergedTranslations(
-                    in: draft, items: items, language: targetLanguage
-                )
-                return try await self.service.applyBatchTranslations(
-                    updated, language: targetLanguage
-                )
-            }
+        modelName: String?,
+        expectedDocument: LyricDocument
+    ) async throws {
+        let snapshot: LyricsEditingSnapshot
+        switch task {
+        case .pronunciation(let style):
+            let updated = AIStudyWorkflowService.mergedPronunciations(
+                in: expectedDocument, items: items, style: style, modelName: modelName
+            )
+            snapshot = try await service.applyBatchPronunciations(updated, expectedDocument: expectedDocument)
+        case .translation(let targetLanguage):
+            let updated = AIStudyWorkflowService.mergedTranslations(
+                in: expectedDocument, items: items, language: targetLanguage
+            )
+            snapshot = try await service.applyBatchTranslations(
+                updated, language: targetLanguage, expectedDocument: expectedDocument
+            )
         }
+        try Task.checkCancellation()
+        apply(snapshot, preservingTimeInputOf: nil)
     }
 }

@@ -73,9 +73,11 @@ extension LyricsEditingService {
     /// 按稳定 `line.id` 对齐并合并为单条撤销记录。
     @discardableResult
     public func applyBatchPronunciations(
-        _ updates: [UUID: LinePronunciation]
+        _ updates: [UUID: LinePronunciation],
+        expectedDocument: LyricDocument? = nil
     ) async throws -> LyricsEditingSnapshot {
         try await mutate(coalesceKey: nil) { document in
+            try Self.checkStudyPreviewBaseline(expectedDocument, against: document)
             guard !updates.isEmpty else { return }
             for index in document.lines.indices {
                 let lineId = document.lines[index].id
@@ -94,10 +96,12 @@ extension LyricsEditingService {
     @discardableResult
     public func applyBatchTranslations(
         _ updates: [UUID: Translation],
-        language: String
+        language: String,
+        expectedDocument: LyricDocument? = nil
     ) async throws -> LyricsEditingSnapshot {
         let cleanLanguage = language.trimmingCharacters(in: .whitespacesAndNewlines)
         return try await mutate(coalesceKey: nil) { document in
+            try Self.checkStudyPreviewBaseline(expectedDocument, against: document)
             guard !cleanLanguage.isEmpty, !updates.isEmpty else { return }
             for index in document.lines.indices {
                 let lineId = document.lines[index].id
@@ -110,4 +114,13 @@ extension LyricsEditingService {
             }
         }
     }
+    private static func checkStudyPreviewBaseline(
+        _ expectedDocument: LyricDocument?, against document: LyricDocument
+    ) throws {
+        try Task.checkCancellation()
+        if let expectedDocument, expectedDocument != document {
+            throw LyricsEditingError.storeRejection("编辑草稿已改变，请重新打开 AI 预览。")
+        }
+    }
+
 }

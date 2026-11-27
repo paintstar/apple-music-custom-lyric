@@ -10,8 +10,8 @@ final class AIStudyPreviewModel: ObservableObject {
 
     enum CommitTarget {
         case storedDocument(documentId: UUID, expectedRevision: Int)
-        case importDraft(onApply: @MainActor ([AIStudyPreviewLine], AIStudyBatchTaskKind, String?) async -> Void)
-        case editorDraft(onApply: @MainActor ([AIStudyPreviewLine], AIStudyBatchTaskKind, String?) async -> Void)
+        case importDraft(onApply: @MainActor ([AIStudyPreviewLine], AIStudyBatchTaskKind, String?) async throws -> Void)
+        case editorDraft(onApply: @MainActor ([AIStudyPreviewLine], AIStudyBatchTaskKind, String?) async throws -> Void)
     }
 
     enum Phase: Equatable {
@@ -30,7 +30,7 @@ final class AIStudyPreviewModel: ObservableObject {
         var displayName: String {
             switch self {
             case .pronunciation: return "生成逐行注音"
-            case .translation: return "生成中文译文"
+            case .translation: return "生成译文"
             }
         }
     }
@@ -43,9 +43,12 @@ final class AIStudyPreviewModel: ObservableObject {
     ]
 
     @Published private(set) var phase: Phase = .idle
+    @Published private(set) var generationSelection: Set<UUID> = []
     @Published private(set) var generationStartedAt: Date?
     @Published var selectedTaskOption: TaskOption = .pronunciation
     @Published var selectedStyle: PronunciationStyle
+    @Published var selectedTargetLanguage: String
+    let selectableTargetLanguages: [String]
     @Published private(set) var errorMessage: String?
     @Published private(set) var configuredServiceSummary = ""
     @Published private(set) var missingKeyWarning: String?
@@ -64,6 +67,9 @@ final class AIStudyPreviewModel: ObservableObject {
     private var currentTask: Task<Void, Never>?
     private var activeBatchTask: AIStudyBatchTaskKind?
     private var activeModelName: String?
+    private var activeConfiguration: AIConfiguration?
+    private var workingPreviews: [AIStudyBatchTaskKind: [AIStudyPreviewLine]] = [:]
+    private var refreshRun: (lineIDs: Set<UUID>, cache: AIStudyPreviewCache)?
 
     init(
         store: GRDBLyricsStore,
@@ -75,6 +81,7 @@ final class AIStudyPreviewModel: ObservableObject {
         aiClient: (any AIStudyProviding)? = nil,
         settingsStore: AIServiceSettingsStore = AIServiceSettingsStore(),
         credentialStore: (any AICredentialStoring)? = nil,
+        draftCache: AIStudyPreviewCache? = nil,
         onApplied: (() -> Void)? = nil
     ) {
         self.document = document
@@ -87,22 +94,29 @@ final class AIStudyPreviewModel: ObservableObject {
             ?? (isMock ? InMemoryAICredentialStore() : SystemKeychainCredentialStore())
         self.credentialStore = resolvedCredentials
         let resolvedClient: any AIStudyProviding = aiClient
-            ?? (isMock ? MockPreviewAIStudyClient() : OpenAICompatibleClient(credentialStore: resolvedCredentials))
+            ?? (isMock ? MockPreviewAIStudyClient() : OpenAICompatibleClient())
         self.onApplied = onApplied
 
         let storedConfig = settingsStore.load()
+        let preferredLanguage = storedConfig.preferredTargetLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentLanguage = preferredLanguage.isEmpty ? LyricsSyncConstants.translationLanguage : preferredLanguage
+        self.selectedTargetLanguage = currentLanguage
+        let standardLanguages = [LyricsSyncConstants.translationLanguage, "zh-Hant", "en", "ja", "ko"]
+        self.selectableTargetLanguages = standardLanguages.contains(currentLanguage)
+            ? standardLanguages
+            : standardLanguages + [currentLanguage]
         self.selectedStyle = Self.selectablePronunciationStyles.contains(storedConfig.preferredPronunciationStyle)
             ? storedConfig.preferredPronunciationStyle
             : .romaji
         self.workflowService = AIStudyWorkflowService(
             store: store,
             aiClient: resolvedClient,
-            configurationProvider: { settingsStore.load() },
-            apiKeyProvider: {
+            configurationProvider: { isMock ? AIConfiguration(modelName: "mock-study") : settingsStore.load() },
+            configuredAPIKeyProvider: { preset in
                 guard !isMock else { return nil }
-                let config = settingsStore.load()
-                return try? resolvedCredentials.apiKey(for: config.preset)
-            }
+                return try resolvedCredentials.apiKey(for: preset)
+            },
+            draftCache: draftCache
         )
         refreshServiceStatus()
     }
@@ -122,8 +136,8 @@ final class AIStudyPreviewModel: ObservableObject {
     }
 
     var previewLines: [AIStudyPreviewLine] {
-        if case let .preview(lines) = phase { return lines }
-        return []
+        if case let .preview(lines) = phase, activeBatchTask == currentTaskKind { return lines }
+        return AIStudyWorkflowService.localPreview(for: document, task: currentTaskKind)
     }
 
     var selectedCount: Int {
@@ -136,11 +150,16 @@ final class AIStudyPreviewModel: ObservableObject {
         previewLines.filter(\.existingIsManual).count
     }
 
-    var canApply: Bool {
-        if case .preview = phase {
-            return selectedCount > 0
-        }
-        return false
+    var canApply: Bool { isPreviewReady && selectedCount > 0 }
+    var canFillMissing: Bool {
+        isPreviewReady && !AIStudyWorkflowService.missingLineIDs(for: document, task: currentTaskKind).isEmpty
+    }
+
+    var canRegenerate: Bool { isPreviewReady && !generationSelection.isEmpty }
+
+    private var isPreviewReady: Bool {
+        guard case .preview = phase else { return false }
+        return activeBatchTask == currentTaskKind
     }
 
     func refreshServiceStatus() {
@@ -157,103 +176,12 @@ final class AIStudyPreviewModel: ObservableObject {
             return
         }
         do {
-            let key = try credentialStore.apiKey(for: config.preset)
-            missingKeyWarning = key == nil
-                ? "尚未配置「\(config.preset.displayName)」的 API Key，请前往「设置 → AI 学习服务」保存密钥。"
-                : nil
+            missingKeyWarning = try credentialStore.hasAPIKey(for: config.preset)
+                ? nil
+                : "尚未配置「\(config.preset.displayName)」的 API Key，请前往「设置 → AI 学习服务」保存密钥。"
         } catch {
             missingKeyWarning = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
-    }
-
-    func generate() {
-        refreshServiceStatus()
-        guard nonEmptyLineCount > 0 else {
-            errorMessage = AIStudyWorkflowError.emptyLyrics.message
-            return
-        }
-        currentTask?.cancel()
-        generation += 1
-        let expectedGeneration = generation
-        let taskKind = currentTaskKind
-        let config = settingsStore.load()
-        let rawModelName = isMock ? "mock-study" : config.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let totalLines = nonEmptyLineCount
-        let batchSize = AIStudyWorkflowService.defaultBatchSize
-        let totalBatches = max(1, (totalLines + batchSize - 1) / batchSize)
-        activeBatchTask = taskKind
-        activeModelName = rawModelName.isEmpty ? nil : rawModelName
-        errorMessage = nil
-        generationStartedAt = Date()
-        phase = .generating(
-            AIStudyBatchProgress(
-                completedBatches: 0,
-                totalBatches: totalBatches,
-                completedLines: 0,
-                totalLines: totalLines
-            )
-        )
-
-        let service = workflowService
-        let sourceDocument = document
-        let title = songTitle
-        let artistName = artist
-        let onProgress: @Sendable (AIStudyBatchProgress) -> Void = { [weak self] progress in
-            Task { @MainActor [weak self] in
-                guard let self, self.generation == expectedGeneration,
-                      case .generating = self.phase else { return }
-                self.phase = .generating(progress)
-            }
-        }
-
-        currentTask = Task { [weak self] in
-            do {
-                let items = try await service.generatePreview(
-                    for: sourceDocument,
-                    task: taskKind,
-                    songTitle: title,
-                    artist: artistName,
-                    onProgress: onProgress
-                )
-                guard !Task.isCancelled, let self, self.generation == expectedGeneration else { return }
-                self.currentTask = nil
-                self.generationStartedAt = nil
-                self.phase = .preview(items)
-            } catch is CancellationError {
-                guard let self, self.generation == expectedGeneration else { return }
-                self.currentTask = nil
-                self.generationStartedAt = nil
-                self.phase = .idle
-            } catch let error as AIStudyWorkflowError where error == .cancelled {
-                guard let self, self.generation == expectedGeneration else { return }
-                self.currentTask = nil
-                self.generationStartedAt = nil
-                self.phase = .idle
-            } catch {
-                guard let self, self.generation == expectedGeneration else { return }
-                self.currentTask = nil
-                self.generationStartedAt = nil
-                self.phase = .idle
-                self.errorMessage = Self.describeError(error)
-            }
-        }
-    }
-
-    func cancelGeneration() {
-        generation += 1
-        currentTask?.cancel()
-        currentTask = nil
-        generationStartedAt = nil
-        if case .generating = phase {
-            phase = .idle
-        }
-    }
-
-    func resetToIdle() {
-        cancelGeneration()
-        generationStartedAt = nil
-        errorMessage = nil
-        phase = .idle
     }
 
     func invalidate() {
@@ -265,7 +193,11 @@ final class AIStudyPreviewModel: ObservableObject {
     }
 
     func applyPreview() {
-        guard case let .preview(lines) = phase, let taskKind = activeBatchTask else { return }
+        guard canApply, case let .preview(lines) = phase, let taskKind = activeBatchTask else { return }
+        guard activeConfiguration == settingsStore.load() else {
+            openTaskPreview()
+            return
+        }
         generation += 1
         let expectedGeneration = generation
         let modelName = activeModelName
@@ -285,9 +217,9 @@ final class AIStudyPreviewModel: ObservableObject {
                         items: lines
                     )
                 case let .importDraft(onApply):
-                    await onApply(lines, taskKind, modelName)
+                    try await onApply(lines, taskKind, modelName)
                 case let .editorDraft(onApply):
-                    await onApply(lines, taskKind, modelName)
+                    try await onApply(lines, taskKind, modelName)
                 }
                 guard self.generation == expectedGeneration else { return }
                 self.currentTask = nil
@@ -301,13 +233,17 @@ final class AIStudyPreviewModel: ObservableObject {
         }
     }
 
-    private var currentTaskKind: AIStudyBatchTaskKind {
+    var currentTaskKind: AIStudyBatchTaskKind {
         switch selectedTaskOption {
         case .pronunciation:
             return .pronunciation(selectedStyle)
         case .translation:
-            return .translation(targetLanguage: LyricsSyncConstants.translationLanguage)
+            return .translation(targetLanguage: selectedTargetLanguage)
         }
+    }
+
+    private func requestConfiguration(_ snapshot: AIConfiguration) -> AIConfiguration {
+        isMock ? AIConfiguration(modelName: "mock-study") : snapshot
     }
 
     private static func describeError(_ error: Error) -> String {
@@ -319,6 +255,172 @@ final class AIStudyPreviewModel: ObservableObject {
 }
 
 extension AIStudyPreviewModel {
+    func openTaskPreview() {
+        if let activeBatchTask, case let .preview(oldLines) = phase {
+            workingPreviews[activeBatchTask] = oldLines
+        }
+        generationSelection = []
+        refreshRun = nil
+        errorMessage = nil
+        loadLocalPreview()
+    }
+
+    private func loadLocalPreview() {
+        currentTask?.cancel()
+        generation += 1
+        let expectedGeneration = generation
+        let taskKind = currentTaskKind
+        let configuration = settingsStore.load()
+        if activeConfiguration != configuration {
+            workingPreviews.removeAll()
+            refreshRun = nil
+        }
+        activeConfiguration = configuration
+        activeBatchTask = taskKind
+        let rawModelName = isMock ? "mock-study" : configuration.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        activeModelName = rawModelName.isEmpty ? nil : rawModelName
+        generationStartedAt = nil
+        phase = .idle
+
+        currentTask = Task { [weak self] in
+            guard let self else { return }
+            let local = AIStudyWorkflowService.localPreview(for: self.document, task: taskKind)
+            let requestConfiguration = self.requestConfiguration(configuration)
+            let cached = (try? await self.workflowService.cachedPreview(
+                for: self.document, task: taskKind, configuration: requestConfiguration
+            )) ?? local
+            guard !Task.isCancelled, self.generation == expectedGeneration,
+                  self.currentTaskKind == taskKind else { return }
+
+            var lines = self.workingPreviews[taskKind] ?? cached
+            lines = Self.combining(lines, with: cached, replacing: [])
+            if let refresh = self.refreshRun {
+                let request = AIStudyBatchRequest.regenerate(lineIds: refresh.lineIDs, completedBatches: refresh.cache)
+                if let refreshed = try? await self.workflowService.cachedPreview(
+                    for: self.document, task: taskKind, request: request, configuration: requestConfiguration
+                ) {
+                    let updatedIDs = Set(refreshed.filter { !$0.generatedText.isEmpty }.map(\.lineId))
+                    lines = Self.combining(lines, with: refreshed, replacing: updatedIDs)
+                }
+            }
+            guard !Task.isCancelled, self.generation == expectedGeneration,
+                  self.currentTaskKind == taskKind else { return }
+            self.currentTask = nil
+            self.phase = .preview(lines)
+        }
+    }
+
+    func setGenerationSelected(_ selected: Bool, for lineId: UUID) {
+        guard isPreviewReady else { return }
+        if selected {
+            generationSelection.insert(lineId)
+        } else {
+            generationSelection.remove(lineId)
+        }
+        if refreshRun?.lineIDs != generationSelection {
+            refreshRun = nil
+        }
+    }
+
+    func generate(replacingSelected: Bool = false) {
+        guard replacingSelected ? canRegenerate : canFillMissing else { return }
+        refreshServiceStatus()
+        let configuration = settingsStore.load()
+        guard activeConfiguration == configuration else {
+            openTaskPreview()
+            return
+        }
+
+        let previous = previewLines
+        let taskKind = currentTaskKind
+        let requestedIDs: Set<UUID>
+        let request: AIStudyBatchRequest
+        if replacingSelected {
+            let selected = generationSelection
+            let cache = refreshRun?.cache ?? AIStudyPreviewCache()
+            refreshRun = (selected, cache)
+            requestedIDs = selected
+            request = .regenerate(lineIds: selected, completedBatches: cache)
+        } else {
+            request = .fillMissing
+            requestedIDs = AIStudyWorkflowService.missingLineIDs(for: document, task: taskKind)
+        }
+
+        currentTask?.cancel()
+        generation += 1
+        let expectedGeneration = generation
+        workingPreviews[taskKind] = previous
+        errorMessage = nil
+        generationStartedAt = Date()
+        phase = .generating(AIStudyBatchProgress(
+            completedBatches: 0, totalBatches: 0, completedLines: 0, totalLines: requestedIDs.count
+        ))
+
+        let onProgress: @Sendable (AIStudyBatchProgress) -> Void = { [weak self] progress in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == expectedGeneration,
+                      case let .generating(activeProgress) = self.phase,
+                      progress.completedBatches >= activeProgress.completedBatches else { return }
+                self.phase = .generating(progress)
+            }
+        }
+
+        currentTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let items = try await self.workflowService.generatePreview(
+                    for: self.document, task: taskKind, request: request,
+                    configuration: self.requestConfiguration(configuration), onProgress: onProgress
+                )
+                guard !Task.isCancelled, self.generation == expectedGeneration,
+                      self.currentTaskKind == taskKind else { return }
+                self.finishGeneration(
+                    items, previous: previous, requestedIDs: requestedIDs, replacingSelected: replacingSelected
+                )
+            } catch {
+                guard self.generation == expectedGeneration, self.currentTaskKind == taskKind else { return }
+                if !Task.isCancelled, (error as? AIStudyWorkflowError) != .cancelled {
+                    self.errorMessage = Self.describeError(error)
+                }
+                self.loadLocalPreview()
+            }
+        }
+    }
+
+    private func finishGeneration(
+        _ items: [AIStudyPreviewLine], previous: [AIStudyPreviewLine],
+        requestedIDs: Set<UUID>, replacingSelected: Bool
+    ) {
+        currentTask = nil
+        generationStartedAt = nil
+        phase = .preview(Self.combining(previous, with: items, replacing: replacingSelected ? requestedIDs : []))
+        let availableIDs = Set(items.filter { !$0.generatedText.isEmpty }.map(\.lineId))
+        guard requestedIDs.isSubset(of: availableIDs) else {
+            errorMessage = "部分行未返回有效结果，可重试未完成的批次。"
+            return
+        }
+        if replacingSelected {
+            generationSelection = []
+            refreshRun = nil
+        }
+    }
+
+    func cancelGeneration() {
+        guard isGenerating else { return }
+        errorMessage = nil
+        loadLocalPreview()
+    }
+
+    private static func combining(
+        _ previous: [AIStudyPreviewLine], with incoming: [AIStudyPreviewLine], replacing: Set<UUID>
+    ) -> [AIStudyPreviewLine] {
+        let indexed = Dictionary(previous.map { ($0.lineId, $0) }, uniquingKeysWith: { first, _ in first })
+        return incoming.map { new in
+            guard let old = indexed[new.lineId], !replacing.contains(new.lineId) else { return new }
+            return old.generatedText.isEmpty ? new : old
+        }
+    }
+
     func setSelected(_ selected: Bool, for lineId: UUID) {
         updateLines { lines in
             guard let index = lines.firstIndex(where: { $0.lineId == lineId }) else { return }
@@ -346,15 +448,6 @@ extension AIStudyPreviewModel {
         }
     }
 
-    func invertSelection() {
-        updateLines { lines in
-            for index in lines.indices {
-                let hasContent = !lines[index].generatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                lines[index].isSelected = hasContent && !lines[index].isSelected
-            }
-        }
-    }
-
     func deselectAll() {
         updateLines { lines in
             for index in lines.indices {
@@ -364,77 +457,8 @@ extension AIStudyPreviewModel {
     }
 
     private func updateLines(_ mutate: (inout [AIStudyPreviewLine]) -> Void) {
-        guard case var .preview(lines) = phase else { return }
+        guard isPreviewReady, case var .preview(lines) = phase else { return }
         mutate(&lines)
         phase = .preview(lines)
-    }
-}
-
-/// 模拟模式下的本地示例生成器：绝不发送任何真实网络请求，不读取钥匙串。
-private final class MockPreviewAIStudyClient: AIStudyProviding, Sendable {
-    func testConnection(
-        configuration: AIConfiguration,
-        apiKey: String?
-    ) async throws -> AIConnectionTestResult {
-        AIConnectionTestResult(latencyMs: 1, model: "mock-study", replyPreview: "连接正常")
-    }
-
-    func explainWord(
-        _ word: String,
-        inLine lineText: String,
-        sourceLanguage: String?,
-        configuration: AIConfiguration,
-        apiKey: String?
-    ) async throws -> AIWordExplanation {
-        AIWordExplanation(surface: word, lemma: word, contextualMeaning: "模拟语境释义", generalMeaning: "模拟通用释义")
-    }
-
-    func explainLine(
-        _ lineText: String,
-        context: AILineContext,
-        configuration: AIConfiguration,
-        apiKey: String?
-    ) async throws -> AILineExplanation {
-        AILineExplanation(grammarSummary: "模拟句法要点")
-    }
-
-    func generatePronunciations(
-        for lines: [LyricLine],
-        style: PronunciationStyle,
-        sourceLanguage: String?,
-        configuration: AIConfiguration,
-        apiKey: String?
-    ) async throws -> [AIPronunciationLineItem] {
-        try await Task.sleep(for: .milliseconds(120))
-        return lines.map { line in
-            AIPronunciationLineItem(
-                lineId: line.id,
-                pronunciation: "[模拟\(style.displayName)] \(line.text)"
-            )
-        }
-    }
-
-    func generateTranslations(
-        for lines: [LyricLine],
-        sourceLanguage: String?,
-        configuration: AIConfiguration,
-        apiKey: String?
-    ) async throws -> [AITranslationLineItem] {
-        try await Task.sleep(for: .milliseconds(120))
-        return lines.map { line in
-            AITranslationLineItem(
-                lineId: line.id,
-                translation: "[模拟译文] \(line.text)"
-            )
-        }
-    }
-
-    func extractKeyStudyPoints(
-        from lines: [LyricLine],
-        sourceLanguage: String?,
-        configuration: AIConfiguration,
-        apiKey: String?
-    ) async throws -> [AIKeyStudyPoint] {
-        []
     }
 }

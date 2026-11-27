@@ -25,13 +25,14 @@ extension AppModel {
     }
 
     func seekToABLoopStartIfNeeded(_ segment: LyricsPlaybackSegment) {
+        let expected = snapshot
         guard !isTerminating, !isChangingTrack else { return }
         let current = controller.snapshot()
-        guard Self.canSeek(current, isMock: isMock) else { return }
+        guard isCurrentTrack(expected), Self.canSeek(current, isMock: isMock) else { return }
         let isInsidePlayingSegment = current.status == .playing
             && current.positionMs.map { $0 >= segment.startMs && $0 < segment.endMs } == true
         if !isInsidePlayingSegment {
-            seek(toMs: segment.startMs, expectedSnapshot: current)
+            seek(toMs: segment.startMs, expectedSnapshot: expected)
         }
     }
 

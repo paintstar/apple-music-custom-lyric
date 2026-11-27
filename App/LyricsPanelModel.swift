@@ -196,6 +196,7 @@ final class LyricsPanelModel: ObservableObject {
         expectedDelaySequence: UInt64?
     ) {
         let previousDocumentId = currentDocumentId
+        let trackChanged = displayedTrackKey != trackKey || displayedTrackEpoch != trackEpoch
         displayedTrackEpoch = trackEpoch
         switch resolved {
         case .unbound:
@@ -230,11 +231,16 @@ final class LyricsPanelModel: ObservableObject {
             )
             reconcileABLoopWithCurrentDocument(previousDocumentId: previousDocumentId)
         }
-        if currentDocumentId != previousDocumentId, !isAutoScrollSuspended {
+        // 关联结果与当前播放锚点在同一次 UI 更新中应用，首帧直接对齐当前句。
+        let display = coordinator?.currentDisplay() ?? .empty
+        if trackChanged || currentDocumentId != previousDocumentId, !isAutoScrollSuspended {
             browseMode = .follow
+            if syncDisplay != display { syncDisplay = display }
+            scrollRequest = nil
             reanchorIfFollowing()
-        } else if browseMode == .manual {
-            scheduleManualResume()
+        } else {
+            apply(display: display)
+            if browseMode == .manual { scheduleManualResume() }
         }
     }
 
@@ -304,10 +310,12 @@ final class LyricsPanelModel: ObservableObject {
     /// 仅当前组变化时才产生新的滚动定位请求；编辑器打开期间全部挂起。
     /// 过渡期间显示的是旧曲目文档，不按新曲目的当前组滚动。
     func apply(display: PlaybackLyricsDisplay) {
+        guard !isTransitioning, display != syncDisplay else { return }
+        // 曲目切换先清空协调器，关联刷新随后进入过渡态。旧正文继续使用原有偏移和位置。
+        if case .ready = state, case .idle = display.content { return }
         let previous = syncDisplay
         syncDisplay = display
         guard !isAutoScrollSuspended else { return }
-        guard !isTransitioning else { return }
         let previousAnchor = scrollAnchor(for: previous)
         if let anchor = scrollAnchor(for: display),
            anchor != previousAnchor || display.waitingInterval != previous.waitingInterval {

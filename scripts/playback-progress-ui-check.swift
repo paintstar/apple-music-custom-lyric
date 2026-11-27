@@ -102,6 +102,16 @@ enum PlaybackProgressUICheck {
         }
         let initialFrame = slider.frame
         let initialBounds = slider.bounds
+        let initialPosition = slider.doubleValue
+        slider.doubleValue = slider.minValue
+        let empty = trackPaint(slider)
+        slider.doubleValue = slider.maxValue
+        let full = trackPaint(slider)
+        slider.doubleValue = initialPosition
+        precondition(abs(empty.leadingOpacity - empty.trailingOpacity) < 0.02
+                     && abs(full.leadingOpacity - full.trailingOpacity) < 0.02
+                     && full.leadingOpacity > empty.leadingOpacity + 0.2,
+                     "进度轨道在 0% 没有填充，在 100% 填满")
         let restingPaint = trackPaint(slider)
         let start = controller.snapshot().sampledAtMonotonicMs
         var lastPosition = slider.doubleValue
@@ -125,7 +135,7 @@ enum PlaybackProgressUICheck {
                          "连续播放换句不得让进度归零或明显回退：\(lastPosition) → \(slider.doubleValue)")
             let paint = trackPaint(slider)
             precondition(abs(paint.height - restingPaint.height) < 0.15
-                         && abs(paint.opacity - restingPaint.opacity) < 0.02,
+                         && abs(paint.leadingOpacity - restingPaint.leadingOpacity) < 0.02,
                          "歌词换句不得使静止轨道粗细或亮度闪变")
             precondition(slider.trackingAreas.contains { $0 === trackingArea },
                          "歌词滚动不得拆除并重建进度悬停区")
@@ -156,9 +166,9 @@ enum PlaybackProgressUICheck {
                 hoverStableSince = ProcessInfo.processInfo.systemUptime
                 return false
             }
-            if previousHoverHeight != paint.height || previousHoverOpacity != paint.opacity {
+            if previousHoverHeight != paint.height || previousHoverOpacity != paint.leadingOpacity {
                 previousHoverHeight = paint.height
-                previousHoverOpacity = paint.opacity
+                previousHoverOpacity = paint.leadingOpacity
                 hoverStableSince = ProcessInfo.processInfo.systemUptime
                 return false
             }
@@ -173,9 +183,9 @@ enum PlaybackProgressUICheck {
             try await Task.sleep(for: .milliseconds(17))
             let paint = trackPaint(slider)
             precondition(abs(paint.height - hoveredPaint.height) < 0.15
-                         && abs(paint.opacity - hoveredPaint.opacity) < 0.02,
+                         && abs(paint.leadingOpacity - hoveredPaint.leadingOpacity) < 0.02,
                          "歌词换句和采样不能闪回或重启已完成的进度悬停外观："
-                         + "height=\(hoveredPaint.height)→\(paint.height)，opacity=\(hoveredPaint.opacity)→\(paint.opacity)，"
+                         + "height=\(hoveredPaint.height)→\(paint.height)，opacity=\(hoveredPaint.leadingOpacity)→\(paint.leadingOpacity)，"
                          + "interaction=\(slider.interactionAmount)，unoccluded=\(window.occlusionState.contains(.visible))")
             precondition(findSlider(host).map(ObjectIdentifier.init) == identity
                          && slider.trackingAreas.contains { $0 === trackingArea },
@@ -207,7 +217,7 @@ enum PlaybackProgressUICheck {
     }
 
     /// 从生产 cell 的实际像素求轨道高度，确保原生状态没有在换句时闪回另一种外观。
-    private static func trackPaint(_ slider: NSSlider) -> (height: CGFloat, opacity: CGFloat) {
+    private static func trackPaint(_ slider: NSSlider) -> (height: CGFloat, leadingOpacity: CGFloat, trailingOpacity: CGFloat) {
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 160, pixelsHigh: 32,
                                       bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                       colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
@@ -218,9 +228,9 @@ enum PlaybackProgressUICheck {
         (slider.cell as! NSSliderCell).drawBar(inside: NSRect(x: 0, y: 0, width: 160, height: 32), flipped: false)
         NSGraphicsContext.current?.flushGraphics()
         let alphas = (0..<32).map { bitmap.colorAt(x: 145, y: $0)?.alphaComponent ?? 0 }
-        guard let peak = alphas.max(), peak > 0 else { return (0, 0) }
+        guard let peak = alphas.max(), peak > 0 else { return (0, 0, 0) }
         let filledPeak = (0..<32).map { bitmap.colorAt(x: 12, y: $0)?.alphaComponent ?? 0 }.max() ?? 0
-        return (alphas.reduce(0, +) / peak, filledPeak)
+        return (alphas.reduce(0, +) / peak, filledPeak, peak)
     }
 }
 

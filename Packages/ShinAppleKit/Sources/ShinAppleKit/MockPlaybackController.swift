@@ -42,7 +42,6 @@ public struct MockTrack: Equatable, Sendable {
 /// - `dispose()` 清空全部监听，此后不再发出通知；
 /// - 通知在锁外同步分发，处理器内调用控制器方法不会死锁。
 public final class MockPlaybackController: PlaybackController, @unchecked Sendable {
-
     private struct Entry: Sendable {
         let id: UUID
         let handler: @Sendable (PlaybackSnapshot) -> Void
@@ -249,8 +248,24 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
     }
 
     public func seek(positionMs ms: Int64) async throws {
-        try dispatchThrowing(state.withLock { s -> Result<MutationOutcome, PlaybackError> in
-            guard s.index != nil else { return .failure(.trackUnavailable) }
+        try performSeek(ms, expected: nil)
+    }
+
+    public func seek(positionMs ms: Int64, expected: PlaybackSnapshot) async throws {
+        try performSeek(ms, expected: expected)
+    }
+
+    private func performSeek(_ ms: Int64, expected: PlaybackSnapshot?) throws {
+        let outcome = try state.withLock { s in
+            if let expected {
+                try Task.checkCancellation()
+                let current = makeSnapshotLocked(s)
+                guard !s.disposed, expected.trackKey != nil, expected.trackKey == current.trackKey,
+                      expected.sessionEpoch == current.sessionEpoch, expected.trackEpoch == current.trackEpoch else {
+                    throw CancellationError()
+                }
+            }
+            guard s.index != nil else { throw PlaybackError.trackUnavailable }
             let now = clock.nowMs
             s.basePositionMs = clampSeekLocked(s, ms)
             s.baseClockMs = now
@@ -258,8 +273,9 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
             if s.status == .ended, let duration = currentTrackLocked(s)?.durationMs, ms < duration {
                 s.status = .paused
             }
-            return .success(finishLocked(&s))
-        })
+            return finishLocked(&s)
+        }
+        dispatch(outcome)
     }
 
     public func next() async throws {
@@ -396,6 +412,69 @@ public final class MockPlaybackController: PlaybackController, @unchecked Sendab
             trackRef: track?.trackRef,
             capabilities: Self.capabilities
         )
+    }
+}
+
+extension MockPlaybackController {
+    public func playVocabularyExample(
+        trackKey: String, positionMs: Int64?
+    ) async throws -> VocabularyPlaybackResult {
+        try performVocabularyExample(trackKey: trackKey, positionMs: positionMs, expected: nil)
+    }
+
+    public func playVocabularyExample(
+        trackKey: String, positionMs: Int64?, replacingQueueFor expected: PlaybackSnapshot
+    ) async throws -> VocabularyPlaybackResult {
+        try performVocabularyExample(trackKey: trackKey, positionMs: positionMs, expected: expected)
+    }
+
+    private func performVocabularyExample(
+        trackKey: String, positionMs: Int64?, expected: PlaybackSnapshot?
+    ) throws -> VocabularyPlaybackResult {
+        try Task.checkCancellation()
+        let libraryTracks = MockMusicLibrary.tracks + mockImportedTracks.withLock { $0 }
+        let (result, outcome) = try state.withLock { s -> (VocabularyPlaybackResult, MutationOutcome?) in
+            guard !s.disposed else { throw CancellationError() }
+            try Task.checkCancellation()
+            let currentTrack = currentTrackLocked(s)
+            let current = makeSnapshotLocked(s)
+            let currentKey = current.trackKey
+            if let expected {
+                guard current.sessionEpoch == expected.sessionEpoch, current.trackEpoch == expected.trackEpoch,
+                      currentKey == expected.trackKey else { return (.queueProtected, nil) }
+            }
+            let now = clock.nowMs
+            if currentKey == trackKey {
+                if let positionMs {
+                    s.basePositionMs = clampSeekLocked(s, positionMs)
+                } else if s.status == .ended {
+                    s.basePositionMs = 0
+                } else {
+                    s.basePositionMs = effectivePositionLocked(s, nowMs: now)
+                }
+                s.status = .playing
+                s.baseClockMs = now
+                return (.played, finishLocked(&s))
+            }
+            let hasQueue = currentTrack != nil || !s.tracks.isEmpty || s.librarySource != nil
+                || s.status == .playing || s.status == .paused
+            if expected == nil, hasQueue {
+                return (.queueProtected, nil)
+            }
+            guard let track = libraryTracks.first(where: { $0.trackRef == trackKey }) else {
+                throw PlaybackError.trackUnavailable
+            }
+            s.tracks = [MockTrack(
+                identity: CatalogIdentity(storefront: "mock", catalogSongId: track.persistentID),
+                title: track.title, artist: track.artist, durationMs: track.durationMs, trackRef: track.trackRef
+            )]
+            s.librarySource = .library
+            switchToLocked(&s, 0, nowMs: now)
+            if let positionMs { s.basePositionMs = clampSeekLocked(s, positionMs) }
+            return (.played, finishLocked(&s))
+        }
+        if let outcome { dispatch(outcome) }
+        return result
     }
 }
 

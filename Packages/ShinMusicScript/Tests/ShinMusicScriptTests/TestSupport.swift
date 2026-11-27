@@ -133,10 +133,15 @@ final class FakeMusicScriptExecutor: MusicScriptExecutor, @unchecked Sendable {
     private var playedPersistentIDs: [String] = []
     private var readCount = 0
     private let repeatedOutcome: MusicSnapshotOutcome?
+    private let vocabularyResult: MusicVocabularyCommandResult?
 
-    init(outcomes: [MusicSnapshotOutcome] = [], repeating outcome: MusicSnapshotOutcome? = nil) {
+    init(
+        outcomes: [MusicSnapshotOutcome] = [], repeating outcome: MusicSnapshotOutcome? = nil,
+        vocabularyResult: MusicVocabularyCommandResult? = nil
+    ) {
         queue = outcomes
         repeatedOutcome = outcome
+        self.vocabularyResult = vocabularyResult
     }
 
     // 编排
@@ -213,11 +218,37 @@ final class FakeMusicScriptExecutor: MusicScriptExecutor, @unchecked Sendable {
         try record("seek")
     }
 
+    func seek(toSeconds seconds: Double, expectedPersistentID: String) throws {
+        guard case .snapshot(let raw) = readSnapshot(), raw.persistentID == expectedPersistentID else {
+            throw CancellationError()
+        }
+        try seek(toSeconds: seconds)
+    }
+
     func playPersistentID(_ persistentID: String) throws {
         lock.lock()
         playedPersistentIDs.append(persistentID)
         lock.unlock()
         try record("playPersistentID")
+    }
+
+    func playVocabularyExample(
+        persistentID: String, positionMs: Int64?, checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try checkCancellation()
+        guard let vocabularyResult else { throw MusicScriptFailure.commandUnsupported("playVocabularyExample") }
+        try record("vocabulary")
+        return vocabularyResult
+    }
+
+    func playVocabularyExample(
+        persistentID: String, positionMs: Int64?, replacingPersistentID: String,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        try checkCancellation()
+        guard let vocabularyResult else { throw MusicScriptFailure.commandUnsupported("playVocabularyExample") }
+        try record("vocabularyReplacing:\(replacingPersistentID)")
+        return vocabularyResult
     }
 
     private func record(_ name: String) throws {

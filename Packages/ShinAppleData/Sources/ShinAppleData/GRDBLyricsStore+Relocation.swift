@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import GRDB
 
@@ -7,7 +8,7 @@ import GRDB
 extension GRDBLyricsStore {
 
     /// 把当前库一致性在线拷贝到目标路径（SQLite backup API；源库全程可用，
-    /// 拷贝包含架构与全部数据，是源库某一一致时刻的完整快照）。
+    /// 拷贝包含架构与学习资料，是源库某一一致时刻的快照）。
     /// 约束与失败语义：
     /// - 目标路径已存在数据库文件时拒绝覆盖（导入不覆盖旧数据的同一红线）；
     /// - 先写同目录临时文件、成功后原子改名，中途失败不产生半成品目标文件；
@@ -25,6 +26,7 @@ extension GRDBLyricsStore {
             try? fileManager.removeItem(atPath: tempPath)
             try? fileManager.removeItem(atPath: tempPath + "-wal")
             try? fileManager.removeItem(atPath: tempPath + "-shm")
+            try? fileManager.removeItem(atPath: tempPath + "-journal")
         }
         let destination: DatabasePool
         do {
@@ -36,16 +38,25 @@ extension GRDBLyricsStore {
         }
         do {
             try relocationSourcePool.backup(to: destination)
-            // 关闭以合并 WAL 并释放句柄，之后改名才是完整的单文件。
+            // 缓存属于各自的歌词库，搬运学习资料时从新库的空缓存开始。
+            try destination.write { db in
+                try AIStudyCacheGeneration.clearCache(in: db)
+            }
+            try destination.writeWithoutTransaction { db in
+                // 删除行后重建文件，清除空闲页中原先的缓存内容。
+                try db.execute(sql: "VACUUM")
+                try db.checkpoint(.truncate)
+            }
             try destination.close()
         } catch {
+            try? destination.close()
             throw ShinAppleDataError.storageUnavailable(
                 "在线备份失败：\(targetPath)（\(Self.describe(error))）"
             )
         }
-        do {
-            try fileManager.moveItem(atPath: tempPath, toPath: targetPath)
-        } catch {
+        // 同目录原子改名，同时拒绝拷贝期间出现的同名文件。
+        guard renamex_np(tempPath, targetPath, UInt32(RENAME_EXCL)) == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             throw ShinAppleDataError.storageUnavailable(
                 "备份文件落盘失败：\(targetPath)（\(Self.describe(error))）"
             )

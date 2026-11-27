@@ -120,6 +120,9 @@ struct LyricsStudyOverlayLayer: View {
                 onStudyPopoverPresentedChange(true)
             }
         }
+        .onChange(of: document.revision) { _, _ in
+            studyModel.reconcileLineStudyDocument(document)
+        }
         .onChange(of: isPopoverOpen) { _, open in
             onStudyPopoverPresentedChange(open)
         }

@@ -21,10 +21,14 @@ extension ImportWorkflowService {
     public func applyStudyAnnotations(
         pronunciations: [UUID: LinePronunciation],
         translations: [UUID: Translation],
-        language: String
+        language: String,
+        expectedDocument: LyricDocument? = nil
     ) -> ImportPreview? {
-        guard phase == .open, let file = ingested else { return nil }
+        guard !Task.isCancelled, phase == .open, let file = ingested else { return nil }
         let baseDocument = bilingualOutcome?.document ?? file.document
+        if let expectedDocument, mergingStudyAnnotations(into: baseDocument) != expectedDocument {
+            return nil
+        }
         let baseLinesByID = Dictionary(
             baseDocument.lines.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -43,23 +47,27 @@ extension ImportWorkflowService {
             }
         }
 
+        applyStudyTranslations(translations, language: language, baseLinesByID: baseLinesByID)
+        return makeCurrentPreview(for: file)
+    }
+
+    private func applyStudyTranslations(
+        _ translations: [UUID: Translation], language: String, baseLinesByID: [UUID: LyricLine]
+    ) {
         let cleanLanguage = language.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cleanLanguage.isEmpty && !translations.isEmpty {
-            for (lineId, incoming) in translations {
-                guard let baseLine = baseLinesByID[lineId] else { continue }
-                let cleanText = incoming.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cleanText.isEmpty else { continue }
-                var normalized = incoming
-                normalized.text = cleanText
-                if baseLine.translations[cleanLanguage] == normalized {
-                    studyTranslationsByLanguage[cleanLanguage]?.removeValue(forKey: lineId)
-                } else {
-                    studyTranslationsByLanguage[cleanLanguage, default: [:]][lineId] = normalized
-                }
+        guard !cleanLanguage.isEmpty else { return }
+        for (lineId, incoming) in translations {
+            guard let baseLine = baseLinesByID[lineId] else { continue }
+            let cleanText = incoming.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanText.isEmpty else { continue }
+            var normalized = incoming
+            normalized.text = cleanText
+            if baseLine.translations[cleanLanguage] == normalized {
+                studyTranslationsByLanguage[cleanLanguage]?.removeValue(forKey: lineId)
+            } else {
+                studyTranslationsByLanguage[cleanLanguage, default: [:]][lineId] = normalized
             }
         }
-
-        return makeCurrentPreview(for: file)
     }
 
     func resetStudyAnnotations() {

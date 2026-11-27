@@ -181,8 +181,17 @@ final class AppModel: ObservableObject {
         await startupTask?.value
     }
 
-    func applySnapshot(_ snapshot: PlaybackSnapshot) {
+    func applySnapshot(_ snapshot: PlaybackSnapshot, restartingClock: Bool = false) {
         guard !isTerminating else { return }
+        let sameSession = snapshot.sessionEpoch == self.snapshot.sessionEpoch
+        let ordered = sameSession && snapshot.seq > 0
+        guard !ordered || snapshot.seq >= self.snapshot.seq else { return }
+        let alreadyApplied = ordered && snapshot == self.snapshot
+        if restartingClock || !sameSession || snapshot.trackKey != self.snapshot.trackKey {
+            playbackClock = InterpolatedPlaybackClock()
+        }
+        if restartingClock || !alreadyApplied { playbackClock.apply(sample: Self.playbackSample(snapshot)) }
+        guard !alreadyApplied else { return }
         if let expected = waitingForTransportChange, Self.didConfirmTransportChange(from: expected, to: snapshot) {
             waitingForTransportChange = nil
             if playbackMessage == Self.pendingTrackChangeMessage { playbackMessage = nil }
@@ -191,8 +200,11 @@ final class AppModel: ObservableObject {
             self.pendingSeek = nil
             seekSequence += 1
         }
+        if !sameSession || snapshot.trackEpoch != self.snapshot.trackEpoch
+            || snapshot.trackKey != self.snapshot.trackKey {
+            lyricsStudy?.dismissLinePopover(clearSelection: false)
+        }
         self.snapshot = snapshot
-        playbackClock.apply(sample: Self.playbackSample(snapshot))
         artworkStore.handleTrackChange(snapshot, controller: controller)
         applyAutomationState(snapshot: snapshot)
         lyricsCoordinator?.update(snapshot: snapshot)
@@ -287,28 +299,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func togglePlayPause() {
-        launchPlaybackTask { [weak self] in
-            guard let self else { return }
-            let status = self.controller.snapshot().status
-            do {
-                if status == .playing {
-                    try await self.controller.pause()
-                } else {
-                    try await self.controller.play()
-                }
-            } catch let error as PlaybackError {
-                self.handlePlaybackError(error)
-            } catch {
-                self.playbackMessage = "操作失败：\(String(describing: error))"
-            }
-        }
-    }
-
     func seek(toMs ms: Int64, expectedSnapshot: PlaybackSnapshot? = nil) {
         let expected = expectedSnapshot ?? snapshot
         let current = controller.snapshot()
-        guard !isTerminating, isCurrentTrack(expected), Self.canSeek(current, isMock: isMock) else { return }
+        guard !isTerminating, !isChangingTrack, isCurrentTrack(expected),
+              Self.canSeek(current, isMock: isMock) else { return }
         seekSequence += 1
         let sequence = seekSequence
         let target = min(max(ms, 0), max(current.durationMs ?? ms, 0))
@@ -317,24 +312,25 @@ final class AppModel: ObservableObject {
         launchPlaybackTask { [weak self] in
             guard let self else { return }
             defer { if self.pendingSeek?.sequence == sequence { self.pendingSeek = nil } }
-            guard sequence == self.seekSequence, self.isCurrentTrack(expected),
+            guard !self.isChangingTrack, sequence == self.seekSequence, self.isCurrentTrack(expected),
                   Self.canSeek(self.controller.snapshot(), isMock: self.isMock) else { return }
             let beforeCommand = self.controller.snapshot()
             do {
-                try await self.controller.seek(positionMs: target)
+                try await self.controller.seek(positionMs: target, expected: expected)
                 guard sequence == self.seekSequence, self.isCurrentTrack(expected) else { return }
                 let confirmed = self.controller.snapshot()
                 guard confirmed.seq > beforeCommand.seq || (self.isMock && confirmed.seq == 0) else {
                     self.playbackMessage = "跳转后尚未读到新的播放位置。"
                     return
                 }
-                self.applySnapshot(confirmed)
+                // 命令读回同一位置也需重新计时；订阅可能已处理过这条权威快照。
+                self.applySnapshot(confirmed, restartingClock: true)
                 self.resumeLyricsAfterSeek(confirmed)
             } catch let error as PlaybackError {
                 guard sequence == self.seekSequence, self.isCurrentTrack(expected) else { return }
                 self.handlePlaybackError(error)
             } catch {
-                guard sequence == self.seekSequence, self.isCurrentTrack(expected) else { return }
+                guard !(error is CancellationError), sequence == self.seekSequence, self.isCurrentTrack(expected) else { return }
                 self.playbackMessage = "跳转失败：\(String(describing: error))"
             }
         }

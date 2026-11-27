@@ -216,7 +216,7 @@ else
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "== 2) 废弃 SDK 与私有播放 API 禁令 =="
+echo "== 2) 播放 API 边界：仅允许公开脚本 =="
 FORBIDDEN_PLAYBACK=(
   -e 'MusicKit|MediaRemote|MRMediaRemote|MPMusicPlayerController'
   -e '(^|[^[:alnum:]_])(ApplicationMusicPlayer|SystemMusicPlayer|MusicPlayer|MusicAuthorization|MusicSubscription|MusicDataRequest|MusicLibraryRequest|MusicCatalog[A-Za-z]*Request)([^[:alnum:]_]|$)'
@@ -231,7 +231,7 @@ while IFS= read -r file; do
   fi
 done < <(source_files)
 if [ "$FOUND" -eq 0 ]; then
-  echo "  通过：未发现旧 SDK 或私有播放 API。"
+  echo "  通过：未发现 MusicKit 或私有播放 API。"
 else
   FAILURES=$((FAILURES + 1))
 fi

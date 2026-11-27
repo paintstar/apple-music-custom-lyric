@@ -20,6 +20,7 @@ extension SongSummary {
 struct NowPlayingView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var artworkStore: ArtworkStore
+    var floatingLyricsControl: AnyView?
     @State private var isMockSearchExpanded = false
 
     var body: some View {
@@ -36,8 +37,7 @@ struct NowPlayingView: View {
                     HStack(spacing: max(28, geometry.size.width * 0.045)) {
                         coverColumn
                             .frame(width: min(360, geometry.size.width * 0.38))
-                        LyricsPanelView(showsInlineMenu: false)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                        NowPlayingLyricsColumn(floatingLyricsControl: floatingLyricsControl)
                     }
                     .frame(height: geometry.size.height)
                     .padding(.horizontal, max(28, geometry.size.width * 0.055))
@@ -150,6 +150,59 @@ struct NowPlayingView: View {
         guard let ms, ms >= 0 else { return "--:--" }
         let totalSeconds = ms / 1_000
         return String(format: "%d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+private struct NowPlayingLyricsColumn: View {
+    let floatingLyricsControl: AnyView?
+    @AppStorage(LyricsPanelView.translationsSettingKey) private var showsTranslations = true
+    @AppStorage(LyricsPanelView.pronunciationsSettingKey) private var showsPronunciations = true
+    @AppStorage(LyricsPanelView.clozeModeSettingKey) private var isClozeMode = false
+    @State private var showsPlaybackList = false
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            LyricsPanelView(showsInlineMenu: false)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            HStack(spacing: 2) {
+                translationButton
+                PlaybackMenu(items: displayItems, accessibilityLabel: "歌词显示选项",
+                             help: "歌词显示选项")
+                floatingLyricsControl
+                PlaybackListButton(isPresented: $showsPlaybackList)
+            }
+            .padding(3)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay {
+                Capsule().strokeBorder(.white.opacity(0.14), lineWidth: 0.5)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var translationButton: some View {
+        Button { showsTranslations.toggle() } label: {
+            Image(systemName: showsTranslations ? "character.bubble.fill" : "character.bubble")
+                .font(.system(size: PlaybackControlSizing.iconSize, weight: .medium))
+                .foregroundStyle(showsTranslations ? Color.appleMusicPink : .secondary)
+                .frame(width: PlaybackControlSizing.optionSide, height: PlaybackControlSizing.optionSide)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PlaybackButtonStyle(isSelected: showsTranslations))
+        .accessibilityLabel("歌词译文")
+        .accessibilityValue(showsTranslations ? "已显示" : "已隐藏")
+        .help(showsTranslations ? "隐藏译文" : "显示译文")
+    }
+
+    private var displayItems: [PlaybackMenu.Item] {
+        [
+            .init(title: "显示译文", symbol: "character.bubble", isChecked: showsTranslations,
+                  action: { showsTranslations.toggle() }),
+            .init(title: "显示注音", symbol: "captions.bubble", isChecked: showsPronunciations,
+                  action: { showsPronunciations.toggle() }),
+            .init(title: "盲听生词挖空", symbol: "eye.slash", isChecked: isClozeMode,
+                  action: { isClozeMode.toggle() })
+        ]
     }
 }
 

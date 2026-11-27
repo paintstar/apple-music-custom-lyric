@@ -4,6 +4,8 @@ import Security
 
 /// AI 服务 API Key 存储协议；按预设区分账户，绝不写入本地数据库或导出备份。
 public protocol AICredentialStoring: Sendable {
+    /// 只检查指定预设是否保存了条目，不读取密钥内容。
+    func hasAPIKey(for preset: AIProviderPreset) throws -> Bool
     func apiKey(for preset: AIProviderPreset) throws -> String?
     func saveAPIKey(_ key: String, for preset: AIProviderPreset) throws
     func deleteAPIKey(for preset: AIProviderPreset) throws
@@ -18,6 +20,20 @@ public final class SystemKeychainCredentialStore: AICredentialStoring, @unchecke
 
     public init(service: String = SystemKeychainCredentialStore.serviceName) {
         self.service = service
+    }
+
+    public func hasAPIKey(for preset: AIProviderPreset) throws -> Bool {
+        var query = baseQuery(for: preset)
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var attributes: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &attributes)
+        switch status {
+        case errSecSuccess: return true
+        case errSecItemNotFound: return false
+        default: throw AIProviderError.keychainError(status: status)
+        }
     }
 
     public func apiKey(for preset: AIProviderPreset) throws -> String? {
@@ -100,6 +116,10 @@ public final class InMemoryAICredentialStore: AICredentialStoring, @unchecked Se
             }
         }
         self.storage = OSAllocatedUnfairLock(initialState: sanitized)
+    }
+
+    public func hasAPIKey(for preset: AIProviderPreset) throws -> Bool {
+        storage.withLock { $0[preset] != nil }
     }
 
     public func apiKey(for preset: AIProviderPreset) throws -> String? {

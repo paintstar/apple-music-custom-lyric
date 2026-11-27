@@ -14,203 +14,203 @@ public actor AIStudyWorkflowService {
     let store: GRDBLyricsStore
     let aiClient: any AIStudyProviding
     let configurationProvider: @Sendable () -> AIConfiguration
-    let apiKeyProvider: @Sendable () -> String?
+    private let apiKeyProvider: @Sendable () -> String?
+    private let configuredAPIKeyProvider: (@Sendable (AIProviderPreset) throws -> String?)?
+    let draftCache: AIStudyPreviewCache?
 
     public init(
         store: GRDBLyricsStore,
         aiClient: any AIStudyProviding,
         configurationProvider: @escaping @Sendable () -> AIConfiguration,
-        apiKeyProvider: @escaping @Sendable () -> String? = { nil }
+        apiKeyProvider: @escaping @Sendable () -> String? = { nil },
+        configuredAPIKeyProvider: (@Sendable (AIProviderPreset) throws -> String?)? = nil,
+        draftCache: AIStudyPreviewCache? = nil
     ) {
         self.store = store
         self.aiClient = aiClient
         self.configurationProvider = configurationProvider
         self.apiKeyProvider = apiKeyProvider
+        self.configuredAPIKeyProvider = configuredAPIKeyProvider
+        self.draftCache = draftCache
     }
 
-    /// 按批次生成预览行列表。
-    /// - 过滤空白行后按 `batchSize` 分批，每批携带稳定 `line.id` 请求 AI 服务；
-    /// - 按 `lineId` 精确回填，乱序或遗漏都不会造成行错位；
-    /// - 已有来源为 `.manual` 的注音或译文时，默认 `isSelected = false`，否则仅在生成结果非空时选中；
-    /// - 每批前/后检查 `Task.isCancelled`，取消时立即中止后续请求。
+    /// 读取已有内容和匹配的完整批次。打开预览时只访问本地缓存。
+    public func cachedPreview(
+        for document: LyricDocument,
+        task: AIStudyBatchTaskKind,
+        request: AIStudyBatchRequest = .fillMissing,
+        batchSize: Int = AIStudyWorkflowService.defaultBatchSize,
+        configuration: AIConfiguration? = nil
+    ) async throws -> [AIStudyPreviewLine] {
+        let options = PreviewOptions(task: task, request: request, batchSize: batchSize, configuration: configuration)
+        return try await preview(for: document, options: options, allowNetwork: false, onProgress: nil)
+    }
+
+    /// 每批完成后独立缓存。失败或取消前已验证的批次可以在重试时恢复。
     public func generatePreview(
         for document: LyricDocument,
         task: AIStudyBatchTaskKind,
         songTitle: String? = nil,
         artist: String? = nil,
         batchSize: Int = AIStudyWorkflowService.defaultBatchSize,
+        request: AIStudyBatchRequest = .fillMissing,
+        configuration: AIConfiguration? = nil,
         onProgress: (@Sendable (AIStudyBatchProgress) -> Void)? = nil
     ) async throws -> [AIStudyPreviewLine] {
-        _ = (songTitle, artist)
-        if Task.isCancelled {
-            throw AIStudyWorkflowError.cancelled
+        let options = PreviewOptions(task: task, request: request, batchSize: batchSize, configuration: configuration)
+        return try await preview(for: document, options: options, allowNetwork: true, onProgress: onProgress)
+    }
+
+    public static func localPreview(
+        for document: LyricDocument, task: AIStudyBatchTaskKind
+    ) -> [AIStudyPreviewLine] {
+        buildPreviewLines(from: nonEmptyLines(in: document), task: task, generatedByLineId: [:])
+    }
+
+    public static func missingLineIDs(
+        for document: LyricDocument, task: AIStudyBatchTaskKind
+    ) -> Set<UUID> {
+        Set(nonEmptyLines(in: document).filter { line in
+            switch task {
+            case .pronunciation:
+                return normalizedNonEmpty(line.pronunciation?.text) == nil
+            case .translation(let targetLanguage):
+                let language = targetLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+                return normalizedNonEmpty(line.translations[language]?.text) == nil
+            }
+        }.map(\.id))
+    }
+
+    private struct PreviewOptions {
+        let task: AIStudyBatchTaskKind
+        let request: AIStudyBatchRequest
+        let batchSize: Int
+        let configuration: AIConfiguration?
+    }
+
+    private func preview(
+        for document: LyricDocument,
+        options: PreviewOptions,
+        allowNetwork: Bool,
+        onProgress: (@Sendable (AIStudyBatchProgress) -> Void)?
+    ) async throws -> [AIStudyPreviewLine] {
+        try Self.checkCancellation()
+        let task = options.task
+        let configuration = try resolvedConfiguration(for: task, startingWith: options.configuration)
+        let cacheContext = AIStudyBatchCacheContext(
+            documentID: document.id, sourceLanguage: document.sourceLanguage, task: task, configuration: configuration
+        )
+        let lines = Self.nonEmptyLines(in: document)
+        if allowNetwork && lines.isEmpty { throw AIStudyWorkflowError.emptyLyrics }
+
+        let requestedIDs: Set<UUID>
+        let refreshCache: AIStudyPreviewCache?
+        switch options.request {
+        case .fillMissing:
+            requestedIDs = Self.missingLineIDs(for: document, task: task)
+            refreshCache = nil
+        case let .regenerate(lineIds, completedBatches):
+            requestedIDs = lineIds
+            refreshCache = completedBatches
         }
 
-        let resolvedConfiguration = try resolvedConfiguration(for: task)
-        let apiKey = apiKeyProvider()
-
-        let nonEmptyLines = Self.nonEmptyLines(in: document)
-        guard !nonEmptyLines.isEmpty else {
-            throw AIStudyWorkflowError.emptyLyrics
-        }
-
-        let batches = Self.chunked(nonEmptyLines, size: max(1, batchSize))
-        var generatedByLineId: [UUID: String] = [:]
+        // 先分批再筛选。已有条目或局部编辑不会让后续批次的输入整体移动。
+        let batches = Self.chunked(lines, size: max(1, options.batchSize))
+            .map { group in (group: group, requested: group.filter { requestedIDs.contains($0.id) }) }
+            .filter { !$0.requested.isEmpty }
+        let totalLines = batches.reduce(0) { $0 + $1.requested.count }
+        var generatedByLineID: [UUID: String] = [:]
         var completedLines = 0
+        var apiKey: String?
+        var loadedAPIKey = false
+        var cacheGeneration: UUID?
+
         onProgress?(AIStudyBatchProgress(
-            completedBatches: 0,
-            totalBatches: batches.count,
-            completedLines: 0,
-            totalLines: nonEmptyLines.count
+            completedBatches: 0, totalBatches: batches.count,
+            completedLines: 0, totalLines: totalLines
         ))
 
-        for (batchIndex, batch) in batches.enumerated() {
-            if Task.isCancelled {
-                throw AIStudyWorkflowError.cancelled
+        for (index, plan) in batches.enumerated() {
+            try Self.checkCancellation()
+            let batch = plan.requested
+            let key = cacheContext.key(for: batch)
+            let ids = Set(batch.map(\.id))
+            let projectionKey = cacheContext.key(for: plan.group, isProjectionIndex: true)
+            let exact = await cachedBatch(for: ids, key: key, documentID: document.id, from: refreshCache)
+            var batchResult = exact ?? [:]
+            if refreshCache == nil {
+                let projected = await projectedResults(
+                    for: ids, from: plan.group, key: projectionKey, exact: exact, context: cacheContext
+                )
+                batchResult.merge(projected) { _, newer in newer }
             }
-            let batchPairs = try await fetchBatch(
-                batch: batch,
-                task: task,
-                sourceLanguage: document.sourceLanguage,
-                configuration: resolvedConfiguration,
-                apiKey: apiKey
-            )
-            if Task.isCancelled {
-                throw AIStudyWorkflowError.cancelled
+
+            if allowNetwork, batchResult.count < batch.count {
+                try Self.checkCancellation()
+                if !loadedAPIKey {
+                    apiKey = try resolveAPIKey(for: configuration.preset)
+                    // 同一次生成的所有批次共用代次，清空后后续批次也不会写回。
+                    cacheGeneration = try? await store.aiStudyCacheGeneration()
+                    loadedAPIKey = true
+                }
+                let missing = batch.filter { batchResult[$0.id] == nil }
+                let inputIDs = Set(missing.map(\.id))
+                try Self.checkCancellation()
+                let pairs = try await fetchBatch(
+                    batch: missing, task: task, sourceLanguage: document.sourceLanguage,
+                    configuration: configuration, apiKey: apiKey
+                )
+                try Self.checkCancellation()
+                let validated = Self.validatedItems(pairs, for: inputIDs)
+                if validated.count == missing.count,
+                   let payload = try? JSONEncoder().encode(validated) {
+                    let resultKey = cacheContext.key(for: missing)
+                    await refreshCache?.save(payload, for: resultKey)
+                    await saveBatch(
+                        payload, inputIDs: inputIDs, keys: (resultKey, projectionKey), documentID: document.id, generation: cacheGeneration
+                    )
+                }
+                batchResult.merge(validated) { _, newer in newer }
             }
-            let validBatchIDs = Set(batch.map(\.id))
-            for (lineId, rawText) in batchPairs {
-                guard validBatchIDs.contains(lineId) else { continue }
-                let cleanText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cleanText.isEmpty, generatedByLineId[lineId] == nil else { continue }
-                generatedByLineId[lineId] = cleanText
-            }
+            generatedByLineID.merge(batchResult) { _, new in new }
             completedLines += batch.count
             onProgress?(AIStudyBatchProgress(
-                completedBatches: batchIndex + 1,
-                totalBatches: batches.count,
-                completedLines: completedLines,
-                totalLines: nonEmptyLines.count
+                completedBatches: index + 1, totalBatches: batches.count,
+                completedLines: completedLines, totalLines: totalLines
             ))
         }
-
-        return Self.buildPreviewLines(
-            from: nonEmptyLines,
-            task: task,
-            generatedByLineId: generatedByLineId
-        )
+        try Self.checkCancellation()
+        return Self.buildPreviewLines(from: lines, task: task, generatedByLineId: generatedByLineID)
     }
 
-    /// 纯函数：将预览中勾选且非空的注音结果与文档原有注音按稳定 `lineId` 合并。
-    public static func mergedPronunciations(
-        in document: LyricDocument,
-        items: [AIStudyPreviewLine],
-        style: PronunciationStyle,
-        modelName: String?
-    ) -> [UUID: LinePronunciation] {
-        let resolvedModel = normalizedModelName(modelName)
-        var result: [UUID: LinePronunciation] = [:]
-        var validLineIDs = Set<UUID>()
-        for line in document.lines {
-            validLineIDs.insert(line.id)
-            if let existing = line.pronunciation {
-                result[line.id] = existing
-            }
-        }
-        for item in items where item.isSelected && validLineIDs.contains(item.lineId) {
-            let cleanText = item.generatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanText.isEmpty else { continue }
-            result[item.lineId] = LinePronunciation(
-                style: style,
-                text: cleanText,
-                source: .ai(model: resolvedModel),
-                needsReview: false
-            )
-        }
-        return result
+    static func checkCancellation() throws {
+        if Task.isCancelled { throw AIStudyWorkflowError.cancelled }
     }
 
-    /// 纯函数：将预览中勾选且非空的译文结果与文档原有该语言译文按稳定 `lineId` 合并。
-    public static func mergedTranslations(
-        in document: LyricDocument,
-        items: [AIStudyPreviewLine],
-        language: String
-    ) -> [UUID: Translation] {
-        let cleanLanguage = language.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanLanguage.isEmpty else { return [:] }
-        var result: [UUID: Translation] = [:]
-        var validLineIDs = Set<UUID>()
-        for line in document.lines {
-            validLineIDs.insert(line.id)
-            if let existing = line.translations[cleanLanguage] {
-                result[line.id] = existing
-            }
-        }
-        for item in items where item.isSelected && validLineIDs.contains(item.lineId) {
-            let cleanText = item.generatedText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanText.isEmpty else { continue }
-            result[item.lineId] = Translation(
-                text: cleanText,
-                source: .imported,
-                needsReview: false
-            )
-        }
-        return result
-    }
-
-    /// 原子提交预览结果到已入库文档。
-    /// - 先读取最新文档核对 `expectedRevision`，并发修改时拒绝覆盖；
-    /// - 仅更新勾选且非空的行（`needsReview = false`），无有效变更时幂等返回原文档；
-    /// - 有绑定时经 `store.save(document:binding:)`，无绑定时经 `store.updateDocument(_:)` 乐观并发提交。
-    public func applyPreviewToStore(
-        documentId: UUID,
-        expectedRevision: Int,
-        task: AIStudyBatchTaskKind,
-        modelName: String?,
-        items: [AIStudyPreviewLine]
-    ) async throws -> LyricDocument {
-        if case .translation(let targetLanguage) = task,
-           targetLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw AIStudyWorkflowError.invalidTargetLanguage
-        }
-
-        let loaded = try await loadExistingDocument(id: documentId, expectedRevision: expectedRevision)
-        guard loaded.revision == expectedRevision else {
-            throw AIStudyWorkflowError.revisionConflict(
-                documentId: documentId,
-                storedRevision: loaded.revision,
-                expectedRevision: expectedRevision
-            )
-        }
-
-        let updatedLines = Self.applying(
-            items: items,
-            to: loaded,
-            task: task,
-            modelName: modelName
-        )
-        guard updatedLines != loaded.lines else {
-            return loaded
-        }
-
-        var submit = loaded
-        submit.lines = updatedLines
-        submit.revision = loaded.revision + 1
-        submit.updatedAt = LyricTimestamp.now()
-
+    func resolveAPIKey(for preset: AIProviderPreset) throws -> String? {
+        try Self.checkCancellation()
         do {
-            let bindings = try await store.bindings(referencing: loaded.id)
-            if let anchor = bindings.first {
-                try await store.save(document: submit, binding: anchor)
+            let key: String?
+            if let configuredAPIKeyProvider {
+                key = try configuredAPIKeyProvider(preset)
             } else {
-                try await store.updateDocument(submit)
+                key = apiKeyProvider()
             }
-            return submit
-        } catch let dataError as ShinAppleDataError {
-            throw Self.mapDataError(dataError, expectedRevision: expectedRevision)
+            try Self.checkCancellation()
+            return key
         } catch {
-            throw AIStudyWorkflowError.unexpected(String(describing: error))
+            throw Self.mapAIError(error)
         }
+    }
+
+    private static func validatedItems(_ pairs: [(UUID, String)], for ids: Set<UUID>) -> [UUID: String] {
+        var result: [UUID: String] = [:]
+        for (lineID, rawText) in pairs {
+            guard ids.contains(lineID), result[lineID] == nil,
+                  let text = normalizedNonEmpty(rawText) else { continue }
+            result[lineID] = text
+        }
+        return result
     }
 }
 
@@ -218,8 +218,10 @@ public actor AIStudyWorkflowService {
 
 private extension AIStudyWorkflowService {
 
-    func resolvedConfiguration(for task: AIStudyBatchTaskKind) throws -> AIConfiguration {
-        var configuration = configurationProvider()
+    func resolvedConfiguration(
+        for task: AIStudyBatchTaskKind, startingWith snapshot: AIConfiguration?
+    ) throws -> AIConfiguration {
+        var configuration = snapshot ?? configurationProvider()
         switch task {
         case .pronunciation(let style):
             configuration.preferredPronunciationStyle = style
@@ -265,21 +267,6 @@ private extension AIStudyWorkflowService {
         }
     }
 
-    func loadExistingDocument(id: UUID, expectedRevision: Int) async throws -> LyricDocument {
-        do {
-            guard let existing = try await store.document(id: id) else {
-                throw AIStudyWorkflowError.documentNotFound(id)
-            }
-            return existing
-        } catch let workflowError as AIStudyWorkflowError {
-            throw workflowError
-        } catch let dataError as ShinAppleDataError {
-            throw Self.mapDataError(dataError, expectedRevision: expectedRevision)
-        } catch {
-            throw AIStudyWorkflowError.unexpected(String(describing: error))
-        }
-    }
-
     static func buildPreviewLines(
         from lines: [LyricLine],
         task: AIStudyBatchTaskKind,
@@ -289,15 +276,20 @@ private extension AIStudyWorkflowService {
             let generatedText = generatedByLineId[line.id] ?? ""
             let existingText: String?
             let existingIsManual: Bool
+            let existingNeedsReview: Bool
+            var existingUsesDifferentStyle = false
             switch task {
-            case .pronunciation:
+            case .pronunciation(let style):
                 existingText = line.pronunciation?.text
                 existingIsManual = line.pronunciation?.source.kind == .manual
+                existingNeedsReview = line.pronunciation?.needsReview == true
+                existingUsesDifferentStyle = line.pronunciation.map { $0.style != style } ?? false
             case .translation(let targetLanguage):
                 let cleanLanguage = targetLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
                 let existing = line.translations[cleanLanguage]
                 existingText = existing?.text
                 existingIsManual = existing?.source == .manual
+                existingNeedsReview = existing?.needsReview == true
             }
             let isSelected = !generatedText.isEmpty && !existingIsManual
             return AIStudyPreviewLine(
@@ -305,46 +297,12 @@ private extension AIStudyWorkflowService {
                 originalText: line.text,
                 existingText: existingText,
                 existingIsManual: existingIsManual,
+                existingNeedsReview: existingNeedsReview,
+                existingUsesDifferentStyle: existingUsesDifferentStyle,
                 generatedText: generatedText,
                 isSelected: isSelected
             )
         }
-    }
-
-    static func applying(
-        items: [AIStudyPreviewLine],
-        to document: LyricDocument,
-        task: AIStudyBatchTaskKind,
-        modelName: String?
-    ) -> [LyricLine] {
-        var lines = document.lines
-        switch task {
-        case .pronunciation(let style):
-            let merged = mergedPronunciations(
-                in: document,
-                items: items,
-                style: style,
-                modelName: modelName
-            )
-            for index in lines.indices {
-                if let updated = merged[lines[index].id] {
-                    lines[index].pronunciation = updated
-                }
-            }
-        case .translation(let targetLanguage):
-            let cleanLanguage = targetLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-            let merged = mergedTranslations(
-                in: document,
-                items: items,
-                language: cleanLanguage
-            )
-            for index in lines.indices {
-                if let updated = merged[lines[index].id] {
-                    lines[index].translations[cleanLanguage] = updated
-                }
-            }
-        }
-        return lines
     }
 
     static func chunked<Element>(_ array: [Element], size: Int) -> [[Element]] {
@@ -354,9 +312,6 @@ private extension AIStudyWorkflowService {
         }
     }
 
-    static func normalizedModelName(_ raw: String?) -> String? {
-        normalizedNonEmpty(raw)
-    }
 }
 
 extension AIStudyWorkflowService {

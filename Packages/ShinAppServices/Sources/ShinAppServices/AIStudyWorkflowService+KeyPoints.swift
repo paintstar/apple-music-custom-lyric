@@ -25,7 +25,7 @@ extension AIStudyWorkflowService {
         }
 
         let configuration = configurationProvider()
-        let apiKey = apiKeyProvider()
+        let apiKey = try resolveAPIKey(for: configuration.preset)
 
         do {
             let points = try await aiClient.extractKeyStudyPoints(

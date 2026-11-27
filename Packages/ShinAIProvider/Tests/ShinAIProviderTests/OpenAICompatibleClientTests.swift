@@ -241,6 +241,7 @@ struct OpenAICompatibleClientTests {
         var secondBodyHasResponseFormat = true
         MockAIURLProtocol.handler = { request in
             attemptCount += 1
+            #expect(!request.httpShouldHandleCookies)
             let bodyData = MockAIURLProtocol.bodyData(from: request) ?? Data()
             let jsonObj = (try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]) ?? [:]
             if attemptCount == 1 {

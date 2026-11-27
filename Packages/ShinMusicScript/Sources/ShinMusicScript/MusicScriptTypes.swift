@@ -1,4 +1,26 @@
 import Foundation
+import ShinAppleKit
+
+/// 适配器订阅句柄（可取消、幂等）。
+final class ScriptControllerSubscription: PlaybackSubscriptionHandle, @unchecked Sendable {
+    private let id: UUID
+    private let onCancel: @Sendable (UUID) -> Void
+    private let lock = NSLock()
+    private var cancelled = false
+
+    init(id: UUID, onCancel: @escaping @Sendable (UUID) -> Void) {
+        self.id = id
+        self.onCancel = onCancel
+    }
+
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return }
+        cancelled = true
+        onCancel(id)
+    }
+}
 
 // MARK: - 执行器层数据类型（Music 脚本词典口径；秒为 Double，毫秒换算只发生在控制器边界）
 
@@ -113,6 +135,14 @@ public enum MusicScriptFailure: Error, Equatable, Sendable {
     }
 }
 
+/// Music 命令的应答。带时间的命令需由控制器另行核对权威播放快照。
+public enum MusicVocabularyCommandResult: Equatable, Sendable {
+    case played
+    case positionRequested(Int64)
+    case queueProtected
+    case targetNotReady
+}
+
 /// Music 脚本执行器契约（本包内抽象，注入假实现做单元测试；
 /// 实现必须保证调用线程安全由调用方串行化约束满足）。
 public protocol MusicScriptExecutor: AnyObject, Sendable {
@@ -130,13 +160,46 @@ public protocol MusicScriptExecutor: AnyObject, Sendable {
     /// seek 到指定秒数（控制器已完成裁剪；越界不会传入）。
     func seek(toSeconds seconds: Double) throws
 
+    /// 在设置位置前确认 Music 当前曲目仍为指定 persistent ID。
+    func seek(toSeconds seconds: Double, expectedPersistentID: String) throws
+
     /// 按 persistent ID 在音乐库定位曲目并播放（v2 点播预留）。
     func playPersistentID(_ persistentID: String) throws
+
+    /// 保留当前队列的原声例句播放。取消检查在发送每一轮确认命令前执行。
+    func playVocabularyExample(
+        persistentID: String, positionMs: Int64?,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult
+
+    /// 已确认允许替换时的原曲标识。空字符串表示确认时没有当前曲。
+    func playVocabularyExample(
+        persistentID: String, positionMs: Int64?, replacingPersistentID: String,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult
 }
 
 public extension MusicScriptExecutor {
+    func seek(toSeconds seconds: Double, expectedPersistentID: String) throws {
+        throw MusicScriptFailure.commandUnsupported("seek:expectedPersistentID")
+    }
+
     func stop() throws {
         throw MusicScriptFailure.commandUnsupported("stop")
+    }
+
+    func playVocabularyExample(
+        persistentID: String, positionMs: Int64?,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        throw MusicScriptFailure.commandUnsupported("playVocabularyExample")
+    }
+
+    func playVocabularyExample(
+        persistentID: String, positionMs: Int64?, replacingPersistentID: String,
+        checkCancellation: () throws -> Void
+    ) throws -> MusicVocabularyCommandResult {
+        .queueProtected
     }
 }
 

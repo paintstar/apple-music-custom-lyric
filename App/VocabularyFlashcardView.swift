@@ -24,7 +24,14 @@ struct VocabularyFlashcardView: View {
         }
         .padding(22)
         .frame(width: 560, height: 500)
-        .onDisappear { book.clearStatus() }
+        .modifier(VocabularyPlaybackAlert(book: book, source: .flashcard))
+        .onChange(of: book.currentFlashcardEntry?.id) { _, entryId in
+            book.cancelOccurrencePlaybackOutsideEntry(entryId, source: .flashcard)
+        }
+        .onDisappear {
+            book.cancelOccurrencePlayback(source: .flashcard)
+            book.clearStatus()
+        }
     }
 
     private var headerBar: some View {
@@ -119,7 +126,7 @@ struct VocabularyFlashcardView: View {
                         .textSelection(.enabled)
 
                     Button {
-                        book.playOccurrence(occurrence)
+                        book.playOccurrence(occurrence, source: .flashcard)
                     } label: {
                         if book.playingOccurrenceId == occurrence.id {
                             HStack(spacing: 6) {
@@ -127,7 +134,7 @@ struct VocabularyFlashcardView: View {
                                 Text("正在定位播放……")
                             }
                         } else {
-                            Label("▶️ 听原句", systemImage: "play.fill")
+                            Label("听原句", systemImage: "play.fill")
                         }
                     }
                     .buttonStyle(.bordered)
@@ -328,13 +335,15 @@ struct VocabularyFlashcardView: View {
     }
 
     private func statusBanner(_ message: String) -> some View {
-        Label(message, systemImage: "exclamationmark.triangle.fill")
+        let isWarning = book.statusTone == .warning
+        let color: Color = isWarning ? .orange : .secondary
+        return Label(message, systemImage: isWarning ? "exclamationmark.triangle.fill" : "info.circle.fill")
             .font(.caption)
-            .foregroundStyle(.orange)
+            .foregroundStyle(color)
             .fixedSize(horizontal: false, vertical: true)
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func trackHintText(_ occurrence: VocabularyOccurrence) -> String {

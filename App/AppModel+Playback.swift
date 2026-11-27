@@ -5,6 +5,23 @@ extension AppModel {
     func playNext() { changeTrack(forward: true) }
     func playPrevious() { changeTrack(forward: false) }
 
+    func togglePlayPause() {
+        launchPlaybackTask { [weak self] in
+            guard let self else { return }
+            do {
+                if self.controller.snapshot().status == .playing {
+                    try await self.controller.pause()
+                } else {
+                    try await self.controller.play()
+                }
+            } catch let error as PlaybackError {
+                self.handlePlaybackError(error)
+            } catch {
+                self.playbackMessage = "操作失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
     func stopPlayback() {
         guard case .ready = setup, !isChangingTrack, snapshot.capabilities?.stop == true else { return }
         let expected = controller.snapshot()

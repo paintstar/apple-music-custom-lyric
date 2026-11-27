@@ -77,7 +77,7 @@ struct InterpolatedPlaybackClockTests {
 
     // MARK: - 外推上限
 
-    @Test("外推上限 1 秒：超限钉在样本值并标记陈旧")
+    @Test("外推上限 1 秒：超限冻结在边界并标记陈旧")
     func extrapolationCap() {
         var clock = InterpolatedPlaybackClock()
         clock.apply(sample: PlaybackSample(
@@ -87,12 +87,12 @@ struct InterpolatedPlaybackClockTests {
         #expect(clock.estimate(nowMonotonicMs: 1_000) == PlaybackEstimate(
             positionMs: 6_000, isExtrapolated: true, isStale: false
         ))
-        // 超过上限：钉回样本值 + 陈旧标记。
+        // 超过上限：停在上一帧的边界位置。
         #expect(clock.estimate(nowMonotonicMs: 1_001) == PlaybackEstimate(
-            positionMs: 5_000, isExtrapolated: false, isStale: true
+            positionMs: 6_000, isExtrapolated: false, isStale: true
         ))
         #expect(clock.estimate(nowMonotonicMs: 60_000) == PlaybackEstimate(
-            positionMs: 5_000, isExtrapolated: false, isStale: true
+            positionMs: 6_000, isExtrapolated: false, isStale: true
         ))
     }
 
@@ -164,7 +164,7 @@ struct InterpolatedPlaybackClockTests {
         }
         #expect(clock.isStalled)
         #expect(clock.estimate(nowMonotonicMs: 2_000) == PlaybackEstimate(
-            positionMs: 10_000, isExtrapolated: false, isStale: true
+            positionMs: 11_000, isExtrapolated: false, isStale: true
         ))
         // 用户 seek 到 60 秒：位置前进 → 冻结解除。
         clock.apply(sample: PlaybackSample(
@@ -199,7 +199,7 @@ struct InterpolatedPlaybackClockTests {
 
     // MARK: - 连续无进展样本 → 冻结
 
-    @Test("连续无进展达到阈值冻结估计：钉在样本值 + 陈旧标记")
+    @Test("重复位置沿用原锚点，停滞时冻结估计")
     func stallFreezesAfterThreshold() {
         var clock = InterpolatedPlaybackClock(stallSampleLimit: 3)
         clock.apply(sample: PlaybackSample(
@@ -212,13 +212,15 @@ struct InterpolatedPlaybackClockTests {
             positionMs: 10_000, sampledAtMonotonicMs: 800, isPlaying: true, trackEpoch: 1
         ))
         #expect(!clock.isStalled)
-        #expect(clock.estimate(nowMonotonicMs: 900).isExtrapolated)
+        #expect(clock.estimate(nowMonotonicMs: 900) == PlaybackEstimate(
+            positionMs: 10_900, isExtrapolated: true, isStale: false
+        ))
         clock.apply(sample: PlaybackSample(
             positionMs: 10_000, sampledAtMonotonicMs: 1_200, isPlaying: true, trackEpoch: 1
         ))
         #expect(clock.isStalled)
         #expect(clock.estimate(nowMonotonicMs: 1_300) == PlaybackEstimate(
-            positionMs: 10_000, isExtrapolated: false, isStale: true
+            positionMs: 11_000, isExtrapolated: false, isStale: true
         ))
     }
 
@@ -241,7 +243,7 @@ struct InterpolatedPlaybackClockTests {
         #expect(clock.sample?.positionMs == 10_000)
         #expect(clock.isStalled)
         #expect(clock.estimate(nowMonotonicMs: 1_300) == PlaybackEstimate(
-            positionMs: 10_000, isExtrapolated: false, isStale: true
+            positionMs: 11_000, isExtrapolated: false, isStale: true
         ))
     }
 
@@ -258,6 +260,12 @@ struct InterpolatedPlaybackClockTests {
             positionMs: 10_000, sampledAtMonotonicMs: 800, isPlaying: true, trackEpoch: 1
         ))
         #expect(clock.isStalled)
+        clock.apply(sample: PlaybackSample(
+            positionMs: 10_000, sampledAtMonotonicMs: 1_000, isPlaying: true, trackEpoch: 1
+        ))
+        #expect(clock.estimate(nowMonotonicMs: 1_100) == PlaybackEstimate(
+            positionMs: 10_800, isExtrapolated: false, isStale: true
+        ))
         clock.apply(sample: PlaybackSample(
             positionMs: 10_500, sampledAtMonotonicMs: 1_200, isPlaying: true, trackEpoch: 1
         ))

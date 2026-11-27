@@ -9,7 +9,7 @@ import ShinAppleKit
 // AI 学习工作流、编辑器注音/笔记批量写入及导入预览合入单测。
 // 夹具全部为原创虚构文本，通过 MockAIStudyClient 注入行为，不访问真实网络。
 
-private final class MockAIStudyClient: AIStudyProviding, @unchecked Sendable {
+final class MockAIStudyClient: AIStudyProviding, @unchecked Sendable {
     typealias PronunciationHandler = @Sendable (
         [LyricLine], PronunciationStyle, String?, AIConfiguration, String?
     ) async throws -> [AIPronunciationLineItem]
@@ -76,7 +76,7 @@ private final class MockAIStudyClient: AIStudyProviding, @unchecked Sendable {
     ) async throws -> [AIKeyStudyPoint] { [] }
 }
 
-private enum StudyTestHelper {
+enum StudyTestHelper {
     static func makeService(
         store: GRDBLyricsStore, client: MockAIStudyClient, modelName: String = "mock-model"
     ) -> AIStudyWorkflowService {
@@ -250,8 +250,10 @@ struct AIStudyWorkflowTests {
 
         let service = StudyTestHelper.makeService(store: store, client: client)
         let progressLock = OSAllocatedUnfairLock(initialState: [AIStudyBatchProgress]())
+        let lineIDs = Set(doc.lines.map(\.id))
         let preview = try await service.generatePreview(
-            for: doc, task: .pronunciation(.romaji), songTitle: "测试歌名", artist: "测试歌手", batchSize: 2
+            for: doc, task: .pronunciation(.romaji), songTitle: "测试歌名", artist: "测试歌手", batchSize: 2,
+            request: .regenerate(lineIds: lineIDs, completedBatches: AIStudyPreviewCache())
         ) { progress in
             progressLock.withLock { $0.append(progress) }
         }
@@ -283,7 +285,8 @@ struct AIStudyWorkflowTests {
 
         // 翻译模式同样保护 .manual 译文，非 .manual（如 .imported）默认允许更新。
         let transPreview = try await service.generatePreview(
-            for: doc, task: .translation(targetLanguage: "zh-Hans"), songTitle: nil, artist: nil, batchSize: 10
+            for: doc, task: .translation(targetLanguage: "zh-Hans"), batchSize: 10,
+            request: .regenerate(lineIds: lineIDs, completedBatches: AIStudyPreviewCache())
         )
         #expect(client.capturedTargetLanguages == ["zh-Hans"])
         #expect(transPreview[0].existingIsManual == true)
@@ -295,39 +298,6 @@ struct AIStudyWorkflowTests {
         #expect(transPreview[2].isSelected == true)
     }
 
-    @Test("任务取消：首批返回后取消会中断后续批次请求")
-    func generatePreviewCancellationStopsRemainingBatches() async throws {
-        let (store, dir) = try TestEnv.makeTempStore()
-        defer { TestEnv.cleanup(dir) }
-        let doc = try await StudyTestHelper.seedStudyDocument(in: store)
-        let client = MockAIStudyClient()
-        let service = StudyTestHelper.makeService(store: store, client: client)
-
-        let (startedStream, startedContinuation) = AsyncStream.makeStream(of: Void.self)
-        client.translationHandler = { lines, _, _, _ in
-            startedContinuation.yield()
-            try await Task.sleep(for: .milliseconds(50))
-            return lines.map { AITranslationLineItem(lineId: $0.id, translation: "译-\($0.text)") }
-        }
-
-        let task = Task {
-            try await service.generatePreview(
-                for: doc, task: .translation(targetLanguage: "zh-Hans"), songTitle: nil, artist: nil, batchSize: 1
-            )
-        }
-        var iterator = startedStream.makeAsyncIterator()
-        _ = await iterator.next()
-        task.cancel()
-
-        do {
-            _ = try await task.value
-            Issue.record("取消后应当抛出 AIStudyWorkflowError.cancelled")
-        } catch let error as AIStudyWorkflowError {
-            #expect(error == .cancelled)
-        }
-        #expect(client.translationBatchCalls.count == 1)
-    }
-
     @Test("原子提交与乐观并发：核对 expectedRevision，冲突拒绝覆盖；成功写入清除 needsReview")
     func applyPreviewToStoreRevisionConflictAndCommit() async throws {
         let (store, dir) = try TestEnv.makeTempStore()
@@ -337,7 +307,8 @@ struct AIStudyWorkflowTests {
         let service = StudyTestHelper.makeService(store: store, client: client)
 
         let preview = try await service.generatePreview(
-            for: doc, task: .pronunciation(.romaji), songTitle: nil, artist: nil
+            for: doc, task: .pronunciation(.romaji),
+            request: .regenerate(lineIds: [doc.lines[1].id], completedBatches: AIStudyPreviewCache())
         )
 
         var concurrent = doc
@@ -354,6 +325,16 @@ struct AIStudyWorkflowTests {
             #expect(error == .revisionConflict(documentId: doc.id, storedRevision: 2, expectedRevision: 1))
         }
         #expect(try await store.document(id: doc.id)?.lines[0].text == "并发保存的新原文")
+
+        let staleLine = AIStudyPreviewLine(
+            lineId: doc.lines[0].id, originalText: doc.lines[0].text, generatedText: "过期预览"
+        )
+        await #expect(throws: AIStudyWorkflowError.self) {
+            try await service.applyPreviewToStore(
+                documentId: doc.id, expectedRevision: 2, task: .pronunciation(.romaji),
+                modelName: "mock-model", items: [staleLine]
+            )
+        }
 
         let updated = try await service.applyPreviewToStore(
             documentId: doc.id, expectedRevision: 2, task: .pronunciation(.romaji), modelName: "mock-model", items: preview

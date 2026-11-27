@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import ShinAppleKit
 
@@ -7,6 +8,7 @@ struct LineStudyPopoverView: View {
     let initialState: LinePopoverState
 
     @State private var isEditing = false
+    @State private var isFollowUpOpen = false
 
     private var state: LinePopoverState {
         studyModel.linePopover?.id == initialState.id ? (studyModel.linePopover ?? initialState) : initialState
@@ -68,21 +70,46 @@ struct LineStudyPopoverView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                headerSection
-                lineQuoteCard
-                Divider()
-                studyContentSection
-                Divider()
-                footerSection
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        headerSection
+                        lineQuoteCard
+                        Divider()
+                        studyContentSection
+                        if hasReadableContent && !isEditing && !state.isLoadingAI {
+                            Divider()
+                            LineStudyFollowUpView(
+                                studyModel: studyModel,
+                                state: state,
+                                canUseAI: canUseAI,
+                                isOpen: $isFollowUpOpen,
+                                onOpenSettings: openSettings,
+                                onAddToDraft: { isEditing = true }
+                            )
+                        }
+                    }
+                    .padding(14)
+                }
+                .onChange(of: state.followUps.last?.id) { _, answerID in
+                    guard let answerID else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(answerID, anchor: .top)
+                    }
+                }
             }
-            .padding(14)
+            Divider()
+            footerSection.padding(14)
         }
         .frame(width: 396)
         .frame(maxHeight: 520)
         .onChange(of: state.id) { _, _ in
             isEditing = false
+            isFollowUpOpen = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            studyModel.reconcileLineStudyConfiguration()
         }
         .onChange(of: state.aiExplanation) { _, newValue in
             if newValue != nil { isEditing = false }
@@ -193,7 +220,15 @@ struct LineStudyPopoverView: View {
                 StudyErrorLabel(message: error)
             }
 
-            LineStudyReadCardsView(content: resolvedDisplayContent)
+            let draft = state.draftDisplayContent
+            if !draft.grammarSummary.isEmpty {
+                LineStudyReadCardsView(content: draft)
+            }
+            if let analysis = state.analysisDisplayContent, analysis != draft {
+                Label("AI 解析", systemImage: "sparkles")
+                    .font(.headline)
+                LineStudyReadCardsView(content: analysis)
+            }
         }
     }
 
@@ -222,37 +257,6 @@ struct LineStudyPopoverView: View {
         }
     }
 
-    private var resolvedDisplayContent: LineDisplayContent {
-        if let ai = state.aiExplanation, !state.hasEditedAfterAI {
-            return LineDisplayContent(
-                grammarSummary: ai.grammarSummary.trimmingCharacters(in: .whitespacesAndNewlines),
-                keyExpressions: ai.keyExpressions.compactMap(StudyTextHelpers.nonEmpty),
-                singingTips: StudyTextHelpers.nonEmpty(state.draftSingingTips),
-                culturalNote: StudyTextHelpers.nonEmpty(state.draftCulturalNote)
-            )
-        }
-        let rawGrammar = state.draftGrammarSummary
-        let marker = "\n\n重点表达："
-        if let range = rawGrammar.range(of: marker) {
-            let summary = String(rawGrammar[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let expressions = String(rawGrammar[range.upperBound...])
-                .components(separatedBy: " · ")
-                .compactMap(StudyTextHelpers.nonEmpty)
-            return LineDisplayContent(
-                grammarSummary: summary,
-                keyExpressions: expressions,
-                singingTips: StudyTextHelpers.nonEmpty(state.draftSingingTips),
-                culturalNote: StudyTextHelpers.nonEmpty(state.draftCulturalNote)
-            )
-        }
-        return LineDisplayContent(
-            grammarSummary: rawGrammar.trimmingCharacters(in: .whitespacesAndNewlines),
-            keyExpressions: [],
-            singingTips: StudyTextHelpers.nonEmpty(state.draftSingingTips),
-            culturalNote: StudyTextHelpers.nonEmpty(state.draftCulturalNote)
-        )
-    }
-
     private func openSettings() {
         studyModel.dismissLinePopover()
         NotificationCenter.default.post(name: .shinSelectSettingsPage, object: SettingsCategory.aiStudy)
@@ -274,13 +278,6 @@ struct LineStudyPopoverView: View {
         }
         return StudyCapsuleBadge(text: label, tint: tint)
     }
-}
-
-private struct LineDisplayContent {
-    let grammarSummary: String
-    let keyExpressions: [String]
-    let singingTips: String?
-    let culturalNote: String?
 }
 
 private struct LineStudyEmptyCard: View {

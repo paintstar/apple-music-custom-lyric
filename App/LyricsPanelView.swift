@@ -8,7 +8,7 @@ import ShinAppServices
 // - ready：同步高亮（当前组）+ FOLLOW/MANUAL 浏览 + 点击行跳转；
 //   切歌过渡态（旧内容置灰 + 「正在阅读非当前播放歌曲」提示条）；
 //   偏移/双语/编辑/解除关联通过共享菜单提供；
-// - 原文保持固定字号，当前行提高亮度；双语开关改变行高时 FOLLOW 下立即重新定位；
+// - 原文保持固定字号，跟随播放时以亮度和清晰度突出当前行；双语开关改变行高时重新定位；
 // - 原生文本排版缓存准确坐标，万行文档不创建万行视图。
 // - 本视图透明嵌入 Now Playing 页（封面模糊铺底由宿主提供）；
 //   「本地歌词库」入口移至侧边栏，库位置说明移至设置页；
@@ -125,10 +125,10 @@ private struct ObservedLyricsPanelView: View {
             unboundContent
         case let .untimedOnly(document):
             untimedContent(document)
-        case let .ready(document):
-            readyContent(document, panel: panel)
-        case let .transitioning(retained, retainedUntimedOnly):
-            transitioningContent(retained, untimedOnly: retainedUntimedOnly, panel: panel)
+        case let .ready(document), let .transitioning(document, false):
+            timedContent(document)
+        case let .transitioning(retained, true):
+            transitioningUntimedContent(retained)
         }
     }
 
@@ -191,23 +191,19 @@ private struct ObservedLyricsPanelView: View {
 
     // MARK: 同步视图
 
-    /// 切歌过渡视图：顶部提示条 + 旧文档置灰静态展示。
-    /// 新曲目关联到位后整体替换为 ready 视图（淡入，见 content 容器动画）；
-    /// 关联失败则由 refresh 落到 unavailable 明确错误态。期间不提供
-    /// 编辑/偏移/解除关联（旧文档不是可操作目标）。
-    private func transitioningContent(
-        _ retained: LyricDocument,
-        untimedOnly: Bool,
-        panel: LyricsPanelModel
-    ) -> some View {
+    private var transitionLabel: some View {
+        Label("正在阅读非当前播放歌曲；正在载入当前曲目的歌词……", systemImage: "arrow.triangle.2.circlepath")
+            .font(.callout.weight(.medium))
+            .foregroundStyle(.orange)
+            .help("上一首的歌词仍在展示；当前曲目的歌词载入后会自动替换")
+    }
+
+    private func transitioningUntimedContent(_ retained: LyricDocument) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("正在阅读非当前播放歌曲；正在载入当前曲目的歌词……", systemImage: "arrow.triangle.2.circlepath")
-                .font(.callout.weight(.medium))
-                .foregroundStyle(.orange)
-                .help("上一首的歌词仍在展示；当前曲目的歌词载入后会自动替换")
+            transitionLabel
             ScrollView {
                 Text(staticLines(retained, limit: .max))
-                    .font(untimedOnly ? .callout : .body)
+                    .font(.callout)
                     .lineSpacing(4)
                     .foregroundStyle(.secondary.opacity(0.6))
                     .textSelection(.enabled)
@@ -222,15 +218,29 @@ private struct ObservedLyricsPanelView: View {
                 .frame(height: 18)
                 .allowsHitTesting(false)
             }
-            if untimedOnly {
-                Text("上一首的歌词没有时间轴，静态展示。")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+            Text("上一首的歌词没有时间轴，静态展示。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 
-    private func readyContent(_ document: LyricDocument, panel: LyricsPanelModel) -> some View {
+    /// 新曲目加载期间复用已有原生滚动视图，保持原文停在正在阅读的位置。
+    private func timedContent(_ document: LyricDocument) -> some View {
+        let isTransitioning = panel.isTransitioning
+        return timedLyrics(document, isTransitioning: isTransitioning)
+            .opacity(isTransitioning ? 0.6 : 1)
+            .allowsHitTesting(!isTransitioning)
+            .accessibilityHidden(isTransitioning)
+            .overlay(alignment: .topLeading) {
+                if isTransitioning {
+                    transitionLabel
+                        .padding(8)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+    }
+
+    private func timedLyrics(_ document: LyricDocument, isTransitioning: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             // 播放器由顶栏统一提供歌词菜单，独立侧栏保留自己的入口。
             // 来源徽标：在线获取的歌词显示来源与核对状态；
@@ -255,7 +265,7 @@ private struct ObservedLyricsPanelView: View {
                         model.seek(toMs: target, expectedSnapshot: expected)
                     }
                 },
-                canSeek: AppModel.canSeek(model.snapshot, isMock: model.isMock) && !panel.isTransitioning
+                canSeek: AppModel.canSeek(model.snapshot, isMock: model.isMock) && !isTransitioning
                     && !panel.isAutoScrollSuspended,
                 interactionIdentity: "\(model.snapshot.sessionEpoch):\(model.snapshot.trackEpoch):\(model.snapshot.trackKey ?? "")",
                 waitingPosition: {
@@ -264,22 +274,23 @@ private struct ObservedLyricsPanelView: View {
                     switch model.snapshot.status {
                     case .playing:
                         let estimate = model.estimatedPositionMs(nowMonotonicMs: AppModel.monotonicNowMs())
-                        // 过期估计会回到旧样本；用 nil 冻结已显示的圆点，避免倒退闪动。
+                        // 陈旧样本冻结圆点，等待权威位置恢复。
                         return estimate.isStale ? nil : estimate.positionMs
                     case .paused: return position
                     default: return nil
                     }
                 },
-                waitingIsPlaying: model.snapshot.status == .playing && model.pendingSeek == nil
+                isPlaying: model.snapshot.status == .playing && model.pendingSeek == nil
                     && !panel.isTransitioning && !panel.isAutoScrollSuspended,
-                studyModel: model.lyricsStudy,
-                onToggleSingleLineLoop: { lineId in model.toggleSingleLineLoop(lineId: lineId) },
-                onSetABLoopAnchor: { lineId in model.setABLoopAnchor(lineId: lineId) },
-                onCompleteABLoop: { lineId in model.completeABLoop(endLineId: lineId) },
+                studyModel: isTransitioning ? nil : model.lyricsStudy,
+                onToggleSingleLineLoop: isTransitioning ? nil : { lineId in model.toggleSingleLineLoop(lineId: lineId) },
+                onSetABLoopAnchor: isTransitioning ? nil : { lineId in model.setABLoopAnchor(lineId: lineId) },
+                onCompleteABLoop: isTransitioning ? nil : { lineId in model.completeABLoop(endLineId: lineId) },
                 menu: {
-                    if showsInlineMenu, headerTrailing == nil { lyricsMenu }
+                    if !isTransitioning, showsInlineMenu, headerTrailing == nil { lyricsMenu }
                 }
             )
+            .id("\(document.id):\(panel.displayedTrackKey ?? ""):\(panel.displayedTrackEpoch ?? 0)")
         }
     }
 

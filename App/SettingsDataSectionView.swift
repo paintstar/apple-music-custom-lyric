@@ -1,4 +1,5 @@
 import AppKit
+import ShinAppleData
 import SwiftUI
 
 /// 设置页「本地数据」分类内容：保存位置切换、本地歌词资源管理入口与备份导出引导。
@@ -8,6 +9,9 @@ struct SettingsDataSectionView: View {
     /// 待确认切换的目标目录（NSOpenPanel 结果；nil = 无待确认操作）。
     @State private var pendingSwitchDirectory: URL?
     @State private var isRestoreDefaultConfirmVisible = false
+    @State private var pendingAICacheStore: GRDBLyricsStore?
+    @State private var isClearingAICache = false
+    @State private var aiCacheMessage: String?
 
     private static let storageSwitchExplanation =
         "目标位置没有歌词库时会复制当前资料。已有歌词库时会直接打开该库，两个库各自保留。"
@@ -30,6 +34,18 @@ struct SettingsDataSectionView: View {
                 } actions: {
                     Button("管理资源…") { isResourceManagementPresented = true }
                         .disabled(model.library == nil || model.isSwitchingStorage)
+                }
+                Divider()
+                dataRow("AI 缓存", symbol: "externaldrive") {
+                    Text("当前歌词库的 AI 生成结果最多保留 7 天。")
+                    if let aiCacheMessage {
+                        Text(aiCacheMessage)
+                    }
+                } actions: {
+                    Button(isClearingAICache ? "正在清空…" : "清空 AI 缓存…") {
+                        pendingAICacheStore = model.lyricsStore
+                    }
+                    .disabled(model.lyricsStore == nil || model.isSwitchingStorage || isClearingAICache)
                 }
                 Divider()
                 dataRow("备份与导出", symbol: "archivebox") {
@@ -70,6 +86,38 @@ struct SettingsDataSectionView: View {
         } message: {
             Text(Self.storageSwitchExplanation)
         }
+        .alert("清空 AI 缓存", isPresented: Binding(
+            get: { pendingAICacheStore != nil },
+            set: { if !$0 { pendingAICacheStore = nil } }
+        ), presenting: pendingAICacheStore) { store in
+            Button("清空", role: .destructive) {
+                Task { await clearAICache(in: store) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { _ in
+            Text("清除当前歌词库中可复用的 AI 结果。已保存的注音、译文和笔记会保留。")
+        }
+        .onChange(of: model.lyricsStore.map(ObjectIdentifier.init)) { _, _ in
+            pendingAICacheStore = nil
+            aiCacheMessage = nil
+        }
+    }
+
+    private func clearAICache(in store: GRDBLyricsStore) async {
+        guard model.lyricsStore === store, !model.isSwitchingStorage, !isClearingAICache else { return }
+        isClearingAICache = true
+        aiCacheMessage = nil
+        defer { isClearingAICache = false }
+
+        let message: String
+        do {
+            try await store.clearAIStudyCache()
+            message = "已清空当前歌词库的 AI 缓存。"
+        } catch {
+            message = "暂时无法清空 AI 缓存，请重试。"
+        }
+        guard model.lyricsStore === store else { return }
+        aiCacheMessage = message
     }
 
     private func dataRow<Details: View, Actions: View>(
@@ -115,7 +163,7 @@ struct SettingsDataSectionView: View {
                 Button("恢复默认位置") { isRestoreDefaultConfirmVisible = true }
             }
         }
-        .disabled(model.isSwitchingStorage || model.library?.isDeletingResources == true)
+        .disabled(model.isSwitchingStorage || isClearingAICache || model.library?.isDeletingResources == true)
     }
 
     @ViewBuilder

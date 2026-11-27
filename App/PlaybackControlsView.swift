@@ -59,14 +59,14 @@ struct PlaybackControlsView: View {
             .accessibilityLabel("上一首")
             .help(model.isChangingTrack ? "正在切换歌曲…" : "上一首")
             Button { model.togglePlayPause() } label: {
-                Image(systemName: model.snapshot.status == .playing ? "pause.fill" : "play.fill")
+                Image(systemName: showsPause ? "pause.fill" : "play.fill")
                     .font(.system(size: layout == .transport ? 24 : 26, weight: .semibold))
                     .frame(width: PlaybackControlSizing.playWidth, height: PlaybackControlSizing.transportHeight)
                     .contentShape(Rectangle())
             }
             .disabled(!canControl || !(model.snapshot.capabilities?.playPause ?? model.isMock))
-            .accessibilityLabel(model.snapshot.status == .playing ? "暂停" : "播放")
-            .help(model.snapshot.status == .playing ? "暂停" : "播放")
+            .accessibilityLabel(showsPause ? "暂停" : "播放")
+            .help(showsPause ? "暂停" : "播放")
             Button { model.playNext() } label: {
                 Image(systemName: "forward.fill")
                     .font(.system(size: PlaybackControlSizing.iconSize, weight: .semibold))
@@ -93,12 +93,12 @@ struct PlaybackControlsView: View {
     }
 
     private var canControl: Bool { canControlPlayback(model) }
+    private var showsPause: Bool { model.snapshot.status == .playing }
 }
 
 struct PlaybackTimelineProgressView: View {
     @EnvironmentObject private var model: AppModel
     var showsTimeLabels = true
-    var thinStyle = false
 
     var body: some View {
         TimelineView(AdaptiveProgressSchedule(isPlaying: model.snapshot.status == .playing)) { _ in
@@ -108,9 +108,8 @@ struct PlaybackTimelineProgressView: View {
                 estimatePositionMs: model.pendingSeek?.positionMs ?? estimate.positionMs,
                 isStale: model.pendingSeek == nil && estimate.isStale,
                 durationMs: model.sliderDurationMs,
-                enabled: canControlPlayback(model) && (model.snapshot.capabilities?.seek ?? model.isMock),
+                enabled: model.setup == .ready && AppModel.canSeek(model.snapshot, isMock: model.isMock),
                 showsTimeLabels: showsTimeLabels,
-                thinStyle: thinStyle,
                 onSeek: { position, snapshot in model.seek(toMs: position, expectedSnapshot: snapshot) }
             )
         }
@@ -143,24 +142,24 @@ private struct PlaybackProgressView: View {
     let durationMs: Int64
     let enabled: Bool
     let showsTimeLabels: Bool
-    let thinStyle: Bool
     let onSeek: (Int64, PlaybackSnapshot) -> Void
     @State private var previewPositionMs: Int64?
 
     var body: some View {
-        let position = previewPositionMs ?? estimatePositionMs
+        let currentPosition = displayedPosition(estimatePositionMs)
+        let canScrub = enabled && durationMs > 1 && currentPosition != nil
+        let position = displayedPosition((canScrub ? previewPositionMs : nil) ?? currentPosition)
         VStack(spacing: 2) {
             PlaybackScrubber(
                 snapshot: snapshot,
-                positionMs: estimatePositionMs,
+                positionMs: currentPosition,
                 durationMs: durationMs,
-                enabled: enabled && durationMs > 1 && estimatePositionMs != nil && snapshot.positionMs != nil,
-                thinStyle: thinStyle,
+                enabled: canScrub,
                 reduceMotion: reduceMotion,
                 onPreview: { previewPositionMs = $0 },
                 onSeek: onSeek
             )
-            .frame(height: thinStyle ? ThinPlaybackSliderSizing.hitHeight : 14)
+            .frame(height: ThinPlaybackSliderSizing.hitHeight)
             if showsTimeLabels {
                 timeLabels(position)
             } else if let status = compactStatus(position) {
@@ -174,6 +173,11 @@ private struct PlaybackProgressView: View {
         .onChange(of: snapshot.trackKey) { _, _ in previewPositionMs = nil }
     }
 
+    private func displayedPosition(_ position: Int64?) -> Int64? {
+        guard let position, position >= 0 else { return nil }
+        return durationMs > 1 ? min(position, durationMs) : position
+    }
+
     private func timeLabels(_ position: Int64?) -> some View {
         HStack {
             Text(PlayerBarView.formatDuration(position))
@@ -183,7 +187,7 @@ private struct PlaybackProgressView: View {
                     .accessibilityLabel("播放位置暂未更新")
             }
             Spacer()
-            Text("−" + PlayerBarView.formatDuration(remaining(position)))
+            Text(remaining(position).map { "−" + PlayerBarView.formatDuration($0) } ?? "--:--")
         }
         .font(.caption2.monospacedDigit())
         .foregroundStyle(.secondary)

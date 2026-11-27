@@ -10,6 +10,8 @@ import ShinLyricsEngine
 enum LyricsMotionUICheck {
     static func run() async throws {
         runCompactWaitingChecks()
+        checkGlyphPixelAlignment()
+        try await checkPlaybackFocus()
         try await checkContinuousMotion()
         try await checkNarrowLongMotion()
         try await checkScrollerPresentation()
@@ -137,13 +139,14 @@ enum LyricsMotionUICheck {
         precondition(offsets.allSatisfy { $0 <= target + 0.5 }, "歌词不能越过目标后再退回")
     }
 
-    private static func pixels(of view: NSView) -> Data {
+    private static func pixels(of view: NSView, inside rect: NSRect? = nil) -> Data {
         view.layoutSubtreeIfNeeded()
         view.displayIfNeeded()
-        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+        let captureRect = rect ?? view.bounds
+        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: captureRect) else {
             preconditionFailure("无法获取真实歌词视图的绘制结果")
         }
-        view.cacheDisplay(in: view.bounds, to: bitmap)
+        view.cacheDisplay(in: captureRect, to: bitmap)
         guard let data = bitmap.representation(using: .png, properties: [:]) else {
             preconditionFailure("无法编码歌词绘制结果")
         }
@@ -158,13 +161,165 @@ enum LyricsMotionUICheck {
         print("原创歌词截图：\(name).png")
     }
 
+    private static func checkGlyphPixelAlignment() {
+        let original = "紙の舟がそこを渡る  Clear night 23\n"
+        let translation = "纸船轻轻驶过岸边。\n"
+        let text = NSTextStorage(string: original + translation + "水面に灯りがともる\n", attributes: [
+            .foregroundColor: NSColor.white.withAlphaComponent(0.91), .font: NSFont.systemFont(ofSize: 27.2, weight: .bold)
+        ])
+        text.addAttribute(.font, value: NSFont.systemFont(ofSize: 13.3),
+                          range: NSRange(location: original.utf16.count, length: translation.utf16.count))
+        let manager = LyricsFocusLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: 460, height: 170))
+        text.addLayoutManager(manager)
+        manager.addTextContainer(container)
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 480, height: 145), textContainer: container)
+        view.drawsBackground = false
+        let glyphs = manager.glyphRange(for: container)
+        let focused = NSRange(location: 0, length: original.utf16.count + translation.utf16.count - 1)
+
+        func pixelsAt(_ scale: Int, phase: CGFloat, sharpness: Double) -> Data {
+            manager.focusedRanges = [.init(characters: focused, sharpness: sharpness)]
+            let bitmap = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: Int(view.bounds.width) * scale, pixelsHigh: Int(view.bounds.height) * scale,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+            )!
+            let context = NSGraphicsContext(bitmapImageRep: bitmap)!.cgContext
+            context.setFillColor(NSColor.black.cgColor)
+            context.fill(NSRect(x: 0, y: 0, width: bitmap.pixelsWide, height: bitmap.pixelsHigh))
+            // 模拟一个落在非整数设备坐标的歌词视口，同时固定字形坐标和亮度。
+            context.translateBy(x: phase, y: CGFloat(bitmap.pixelsHigh) - phase)
+            context.scaleBy(x: CGFloat(scale), y: -CGFloat(scale))
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+            manager.drawGlyphs(forGlyphRange: glyphs, at: NSPoint(x: 12.13, y: 24.31))
+            NSGraphicsContext.restoreGraphicsState()
+            return bitmap.representation(using: .png, properties: [:])!
+        }
+
+        for scale in [1, 2] {
+            for phase in [0.38, 0.62, 0.83] {
+                let sharp = pixelsAt(scale, phase: phase, sharpness: 1)
+                precondition(sharp == pixelsAt(scale, phase: phase, sharpness: 0.999),
+                             "明暗相同的歌词完成柔化时不能移动一个像素")
+                precondition(sharp != pixelsAt(scale, phase: phase, sharpness: 0.5), "必须比较实际绘制的柔化字形")
+            }
+        }
+        print("PASS 1x/2x 非整数视口下，原文与译文切回全清晰时像素一致")
+    }
+
+    private static func checkPlaybackFocus() async throws {
+        let document = LyricDocument(lines: [
+            LyricLine(startMs: 0, text: "紙の舟が夕暮れを渡る", translations: ["zh-Hans": Translation(text: "纸船划过暮色。")],
+                      pronunciation: LinePronunciation(style: .romaji, text: "Kami no fune ga yūgure o wataru", source: .manual())),
+            LyricLine(startMs: 0, text: "窓に灯りがともる", translations: ["zh-Hans": Translation(text: "窗边亮起了灯。")]),
+            LyricLine(startMs: 2_000, text: "小さな波が岸に着く", translations: ["zh-Hans": Translation(text: "小小的浪涌向岸边。")]),
+            LyricLine(startMs: 4_000, text: "川の向こうに星が見える")
+        ])
+        let (window, view) = try await makeWindow(size: NSSize(width: 560, height: 620))
+        defer { view.prepareForRemoval(); window.orderOut(nil) }
+        let textView = view.textLayout.textView
+        func show(focused: Bool, following: Bool = true, current: [Int] = [0, 1], reduceMotion: Bool = true) {
+            view.configure(NativeLyricsScrollView(
+                document: document, typography: .resolved(line: 30, translation: 15, width: view.frame.width),
+                showTranslations: true, currentLineIds: Set(current.map { document.lines[$0].id }),
+                request: nil, followsPlayback: following, reduceMotion: reduceMotion,
+                onInteraction: {}, onDragStateChange: { _ in }, onTapLine: { _ in }, focusesPlayback: focused
+            ))
+            view.layoutSubtreeIfNeeded()
+        }
+
+        show(focused: false)
+        let frames = view.textLayout.rows.map(\.interactionFrame)
+        func rowPixels(_ index: Int) -> Data {
+            let row = view.convert(frames[index], from: textView).intersection(view.bounds).integral
+            return pixels(of: view, inside: row)
+        }
+
+        let sharpRows = (0..<3).map(rowPixels)
+        show(focused: true)
+        precondition(rowPixels(0) == sharpRows[0] && rowPixels(1) == sharpRows[1], "同时间组整组保持清晰")
+        precondition(rowPixels(2) != sharpRows[2], "播放焦点必须改变非当前行的实际像素")
+        try capture(view, name: "lyrics-playback-focus")
+
+        textView.setSelectedRange(view.textLayout.rows[0].originalRange)
+        precondition(rowPixels(2) == sharpRows[2], "选择文字时其他行恢复清晰")
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        precondition(rowPixels(2) != sharpRows[2], "取消选择后恢复播放焦点")
+
+        view.textLayout.hover(lineId: document.lines[2].id)
+        let hoveredPixels = rowPixels(2)
+        show(focused: false)
+        precondition(rowPixels(2) == hoveredPixels, "悬停行与清晰绘制像素一致")
+        view.textLayout.hover(lineId: nil)
+        precondition(rowPixels(2) == sharpRows[2], "暂停时清晰绘制所有行")
+        show(focused: true, following: false)
+        precondition(rowPixels(2) == sharpRows[2], "手动浏览时清晰绘制所有行")
+        precondition(view.textLayout.rows.map(\.interactionFrame) == frames, "歌词焦点不改变排版和命中范围")
+        print("PASS 播放焦点保留同时间组与悬停行的清晰度；暂停、划词、手动浏览可读且排版稳定")
+
+        // 悬停单独覆盖，窗口下的实际鼠标位置不应影响换句像素采样。
+        textView.onHoverLine = nil
+        textView.clearInteraction()
+        view.textLayout.hover(lineId: nil)
+        func sharpness(_ index: Int) -> Double {
+            let start = view.textLayout.rows[index].originalRange.location
+            return view.textLayout.manager.focusedRanges?.first { $0.characters.location == start }?.sharpness ?? 0
+        }
+        func focusDiagnostic() -> String {
+            let motions = view.textLayout.emphasisMotions.sorted { $0.key < $1.key }.map { index, motion in
+                "\(index)=\(motion.sharpness.position)→\(motion.sharpness.target)"
+            }
+            return "focus=\(view.textLayout.focusesPlayback), visible=\(window.occlusionState.contains(.visible)), "
+                + "link=\(view.hasActiveDisplayLink), running=\(view.textLayout.hasActiveEmphasis), motions=\(motions)"
+        }
+
+        show(focused: true, current: [2])
+        let nextEndpoint = rowPixels(2)
+        show(focused: true)
+        let before = rowPixels(2)
+        show(focused: true, current: [2], reduceMotion: false)
+        precondition(rowPixels(2) == before && sharpness(0) == 1 && sharpness(1) == 1 && sharpness(2) == 0,
+                     "换句应从上一帧开始，当前视觉及同时间组不能跳变")
+        try await settle("自然推进时必须出现旧句柔化与新句清晰的中间帧", diagnostic: focusDiagnostic) {
+            (0.15..<0.85).contains(sharpness(2)) && (0.15..<0.85).contains(sharpness(0))
+        }
+        let middle = rowPixels(2)
+        precondition(middle != before && middle != nextEndpoint, "清晰度过渡必须实际绘制中间像素")
+        try capture(view, name: "lyrics-focus-transition")
+
+        let movingFocus = sharpness(2)
+        let lastFocus = sharpness(0)
+        let nextWhileMoving = rowPixels(3)
+        show(focused: true, current: [3], reduceMotion: false)
+        precondition(sharpness(2) == movingFocus && sharpness(0) == lastFocus && rowPixels(3) == nextWhileMoving,
+                     "连续换句应接续正在绘制的清晰度")
+        try await settle("快速推进后最后一句必须清晰，之前的句子全部柔化") {
+            sharpness(3) == 1 && sharpness(2) == 0 && sharpness(0) == 0 && !view.hasActiveDisplayLink
+        }
+
+        show(focused: true, current: [0, 1], reduceMotion: false)
+        precondition(sharpness(0) == 1 && sharpness(1) == 1 && sharpness(3) == 0, "回跳应直接应用最新的歌词焦点")
+        show(focused: true, current: [2], reduceMotion: false)
+        try await settle("切换减少动态效果前需要真实中间帧") { (0.15..<0.85).contains(sharpness(2)) }
+        show(focused: true, current: [2])
+        precondition(sharpness(0) == 0 && sharpness(2) == 1 && !view.hasActiveDisplayLink,
+                     "打开减少动态效果应立即完成焦点动画")
+        precondition(rowPixels(2) == nextEndpoint && view.textLayout.rows.map(\.interactionFrame) == frames,
+                     "歌词动画完成后保持原生字形与行坐标")
+        print("PASS 换句的真实清晰度中间帧、快速接续、回跳及减少动态效果")
+    }
+
     private static func checkContinuousMotion() async throws {
-        let document = LyricDocument(lines: (0..<12).map { index in
-            LyricLine(startMs: Int64(index) * 2_000, text: "Paper boats follow the evening light \(index).",
+        let starts: [Int64] = [0, 180, 360, 680] + (4..<12).map { Int64($0) * 2_000 }
+        let document = LyricDocument(lines: starts.enumerated().map { index, start in
+            LyricLine(startMs: start, text: "Paper boats follow the evening light \(index).",
                       translations: ["zh-Hans": Translation(text: "纸船沿着晚霞向前，原创第 \(index) 句。")])
         })
         let (window, view) = try await makeWindow()
         defer { view.prepareForRemoval(); window.orderOut(nil) }
+        view.textLayout.textView.onHoverLine = nil
         var unexpectedManual = 0
         func show(_ index: Int, reduceMotion: Bool = false, request: LyricsPanelModel.ScrollAnchorRequest? = nil) {
             view.configure(NativeLyricsScrollView(
@@ -172,7 +327,8 @@ enum LyricsMotionUICheck {
                 showTranslations: true, currentLineIds: [document.lines[index].id],
                 request: request ?? .init(requestId: UUID(), lineId: document.lines[index].id),
                 followsPlayback: true, reduceMotion: reduceMotion,
-                onInteraction: { unexpectedManual += 1 }, onDragStateChange: { _ in }, onTapLine: { _ in }
+                onInteraction: { unexpectedManual += 1 }, onDragStateChange: { _ in }, onTapLine: { _ in },
+                focusesPlayback: true
             ))
             view.layoutSubtreeIfNeeded()
         }
@@ -181,7 +337,15 @@ enum LyricsMotionUICheck {
         let initialFrames = view.textLayout.rows.map(\.frame)
         let initialPixels = pixels(of: view)
         try capture(view, name: "lyrics-current")
-        show(1)
+        let firstDistance = view.textLayout.rows[2].frame.minY
+        show(2) // 一次 400 ms 播放样本从首句跨过 180 ms 的短句。
+        precondition(view.textLayout.activeIds == [document.lines[2].id]
+                     && renderedFocus(view, row: 0).sharpness == 1 && renderedFocus(view, row: 2).sharpness == 0,
+                     "近距离跨短句仍从上一帧交接，活动身份直接使用真实样本")
+        view.advanceMotion(by: 0.25)
+        precondition(view.contentView.bounds.minY <= firstDistance * 0.04
+                     && renderedFocus(view, row: 2).sharpness == 0,
+                     "首帧延迟也必须轻起步，下一句仍等视口靠近后再清晰")
         try await settle("屏幕刷新应产生真实滚动中间帧") {
             view.contentView.bounds.minY > 2 && view.isScrollAnimating
         }
@@ -189,13 +353,16 @@ enum LyricsMotionUICheck {
         precondition(before.last! - before.first! > 1, "普通换行必须跨多帧移动")
         precondition(initialPixels != pixels(of: view), "实际绘制结果应随歌词移动变化")
         let interruptedAt = view.contentView.bounds.minY
-        show(2)
-        precondition(abs(view.contentView.bounds.minY - interruptedAt) < 1, "新目标应从当前画面接续")
+        let beforeRetarget = renderedFocus(view, row: 2)
+        show(3)
+        precondition(abs(view.contentView.bounds.minY - interruptedAt) < 1 && renderedFocus(view, row: 2) == beforeRetarget,
+                     "新目标应从当前位移、亮度和清晰度接续")
+        precondition(renderedFocus(view, row: 1).sharpness == 0, "被跨过的短句不会伪造为当前句")
         let after = try await sampleOffsets(view, count: 8)
         let previousTravel = before.last! - before.first!
         precondition(after.last! - after.first! > previousTravel * 0.2,
                      "同方向新目标不能让正在移动的歌词突然停下重新起步")
-        let target = view.textLayout.rows[2].frame.minY
+        let target = view.textLayout.rows[3].frame.minY
         var remainder = after
         while view.isScrollAnimating, remainder.count < 200 {
             try await Task.sleep(for: .milliseconds(8))
@@ -203,18 +370,19 @@ enum LyricsMotionUICheck {
         }
         assertForward(before, target: target)
         assertForward(remainder, target: target)
+        assertBackingGrid(before + remainder, in: window)
         precondition(!view.isScrollAnimating && abs(view.contentView.bounds.minY - target) < 1,
                      "连续换行必须准确停在最新目标")
         precondition(initialFrames == view.textLayout.rows.map(\.frame), "高亮及动画不能改变歌词排版")
-        let inFlightRequest = LyricsPanelModel.ScrollAnchorRequest(requestId: UUID(), lineId: document.lines[3].id)
-        show(3, request: inFlightRequest)
+        let inFlightRequest = LyricsPanelModel.ScrollAnchorRequest(requestId: UUID(), lineId: document.lines[4].id)
+        show(4, request: inFlightRequest)
         try await settle("减少动态效果切换检查需要真实的滚动中间帧") {
             let offset = view.contentView.bounds.minY
-            return view.isScrollAnimating && offset > target + 1 && offset < view.textLayout.rows[3].frame.minY - 1
+            return view.isScrollAnimating && offset > target + 1 && offset < view.textLayout.rows[4].frame.minY - 1
         }
         // 设置变化不会生成新的播放定位请求；必须沿用 requestId 才能覆盖中途切换的真实路径。
-        show(3, reduceMotion: true, request: inFlightRequest)
-        precondition(!view.isScrollAnimating && abs(view.contentView.bounds.minY - view.textLayout.rows[3].frame.minY) < 1,
+        show(4, reduceMotion: true, request: inFlightRequest)
+        precondition(!view.isScrollAnimating && abs(view.contentView.bounds.minY - view.textLayout.rows[4].frame.minY) < 1,
                      "滚动中打开减少动态效果，即使请求不变也必须立即定位，不能停在中间")
         show(11)
         try await settle("远距离 seek 应经过真实淡出中间态") { view.documentView!.alphaValue < 0.95 }
@@ -260,8 +428,23 @@ enum LyricsMotionUICheck {
         print("PASS 歌词实际绘制中间帧、同向接续、终点无回弹、固定排版、减少动态效果与卸载清理")
     }
 
+    private struct RenderedFocus: Equatable {
+        let sharpness: Double
+        let brightness: CGFloat
+    }
+
+    private static func renderedFocus(_ view: LyricsScrollView, row: Int) -> RenderedFocus {
+        let layout = view.textLayout
+        let start = layout.rows[row].originalRange.location
+        let sharpness = layout.manager.focusedRanges?.first { $0.characters.location == start }?.sharpness ?? 0
+        let color = layout.manager.temporaryAttribute(.foregroundColor, atCharacterIndex: start, effectiveRange: nil)
+            ?? layout.storage.attribute(.foregroundColor, at: start, effectiveRange: nil)
+        return RenderedFocus(sharpness: sharpness, brightness: (color as? NSColor)?.alphaComponent ?? 0)
+    }
+
     private struct MotionSamples {
         var offsets: [CGFloat] = []
+        var focus: [(offset: CGFloat, display: RenderedFocus)] = []
         var minimumAlpha: CGFloat = 1
         var duration: TimeInterval = 0
         var maximumStep: CGFloat {
@@ -269,12 +452,15 @@ enum LyricsMotionUICheck {
         }
     }
 
-    private static func collectMotion(_ view: LyricsScrollView) async throws -> MotionSamples {
+    private static func collectMotion(_ view: LyricsScrollView, following row: Int? = nil) async throws -> MotionSamples {
         let started = ProcessInfo.processInfo.systemUptime
         var sample = MotionSamples(offsets: [view.contentView.bounds.minY])
+        if let row { sample.focus.append((view.contentView.bounds.minY, renderedFocus(view, row: row))) }
         while view.isScrollAnimating && ProcessInfo.processInfo.systemUptime - started < 2.5 {
             try await Task.sleep(for: .milliseconds(5))
-            sample.offsets.append(view.contentView.bounds.minY)
+            let offset = view.contentView.bounds.minY
+            sample.offsets.append(offset)
+            if let row { sample.focus.append((offset, renderedFocus(view, row: row))) }
             sample.minimumAlpha = min(sample.minimumAlpha, view.canvas.alphaValue)
         }
         sample.duration = ProcessInfo.processInfo.systemUptime - started
@@ -303,13 +489,15 @@ enum LyricsMotionUICheck {
         ])
         let (window, view) = try await makeWindow(size: NSSize(width: 230, height: 360))
         defer { view.prepareForRemoval(); window.orderOut(nil) }
+        view.textLayout.textView.onHoverLine = nil
         func show(_ index: Int) {
+            let current = document.lines.filter { $0.startMs == document.lines[index].startMs }
             view.configure(NativeLyricsScrollView(
                 document: document, typography: .resolved(line: 30, translation: 15, width: view.frame.width),
-                showTranslations: true, currentLineIds: [document.lines[index].id],
+                showTranslations: true, currentLineIds: Set(current.map(\.id)),
                 request: .init(requestId: UUID(), lineId: document.lines[index].id),
                 followsPlayback: true, reduceMotion: false,
-                onInteraction: {}, onDragStateChange: { _ in }, onTapLine: { _ in }
+                onInteraction: {}, onDragStateChange: { _ in }, onTapLine: { _ in }, focusesPlayback: true
             ))
             view.layoutSubtreeIfNeeded()
         }
@@ -317,26 +505,30 @@ enum LyricsMotionUICheck {
         try await Task.sleep(for: .milliseconds(250))
         let frames = view.textLayout.rows.map(\.frame)
         show(1)
-        let short = try await collectMotion(view)
+        let short = try await collectMotion(view, following: 1)
         let shortTarget = view.textLayout.rows[1].frame.minY
         assertForward(short.offsets, target: shortTarget)
         precondition(short.minimumAlpha == 1 && short.maximumStep < shortTarget * 0.3,
                      "短句应连续跨帧平移，不能淡出或单帧跳跃")
-        show(2)
-        let long = try await collectMotion(view)
+        checkFocusAlignment(short, startingAt: 0, distance: shortTarget)
+        show(8)
+        let long = try await collectMotion(view, following: 8)
         let longTarget = view.textLayout.rows[2].frame.minY
         let longDistance = longTarget - shortTarget
         precondition(longDistance > view.contentSize.height * LyricsMotionStyle.jumpViewportFraction,
                      "窄栏夹具必须覆盖超出远跳距离门槛的相邻长句")
         assertForward(long.offsets, target: longTarget)
+        assertBackingGrid(short.offsets, in: window)
+        assertBackingGrid(long.offsets, in: window)
         precondition(long.minimumAlpha == 1 && long.maximumStep < longDistance * 0.3,
                      "窄栏长句正常推进也必须连续平移，不能误作远seek让整栏闪淡")
+        checkFocusAlignment(long, startingAt: shortTarget, distance: longDistance)
         precondition(long.duration < 1.7 && long.duration > short.duration,
                      "长句应适度放缓且及时停稳，不能留下过长拖尾")
         let resumedDistance = view.textLayout.rows[8].frame.minY - longTarget
         precondition(resumedDistance == 0 && view.textLayout.rows[2..<8].allSatisfy { $0.frame.height == 0 },
                      "合并的两秒短空白必须全部收起，不能继续撑出大块等待留白")
-        for index in [8, 9, 10] {
+        for index in [9, 10] {
             show(index)
             let normal = try await collectMotion(view)
             precondition(normal.minimumAlpha == 1, "合并多个明确空白后的实词及同时间组接续不能触发整栏淡出")
@@ -345,6 +537,27 @@ enum LyricsMotionUICheck {
         print("歌词真实采样：短句 \(Int(short.duration * 1_000)) ms、最大步进 \(Int(short.maximumStep.rounded())) pt；"
               + "窄栏长句 \(Int(long.duration * 1_000)) ms、最大步进 \(Int(long.maximumStep.rounded())) pt")
         print("PASS 窄栏双语长句、明确空白、同时间组、连续相邻推进保持可见且及时停稳")
+    }
+
+    private static func checkFocusAlignment(_ motion: MotionSamples, startingAt start: CGFloat, distance: CGFloat) {
+        let frames = motion.focus.map { (travel: ($0.offset - start) / distance, display: $0.display) }
+        let early = frames.last { (0.06...0.21).contains($0.travel) }
+        let middle = frames.first { (0.46...0.72).contains($0.travel) }
+        let late = frames.first { $0.travel >= 0.94 }
+        guard let early, let middle, let late else { preconditionFailure("位移比例采样必须覆盖起步、交接和停稳") }
+        precondition(early.display == frames.first?.display && early.display.sharpness == 0,
+                     "视口移开初段应保持原来的文字亮度和清晰度")
+        precondition((0.1...0.9).contains(middle.display.sharpness) && early.display.brightness < middle.display.brightness
+                     && middle.display.brightness < late.display.brightness,
+                     "视口靠近新句时，文字亮度和清晰度都应在中间状态")
+        precondition(late.display.sharpness == 1 && late.display.brightness == 1,
+                     "新句到阅读锚点附近才完整清晰且高亮")
+    }
+
+    private static func assertBackingGrid(_ offsets: [CGFloat], in window: NSWindow) {
+        let scale = window.backingScaleFactor
+        precondition(offsets.allSatisfy { ($0 * scale).rounded() == $0 * scale }, "自动滚动应逐个设备像素同步移动整组歌词")
+        precondition(zip(offsets, offsets.dropFirst()).allSatisfy { $1 >= $0 }, "自动前进停稳时不能有半像素回摆")
     }
 
     private static func checkScrollerPresentation() async throws {

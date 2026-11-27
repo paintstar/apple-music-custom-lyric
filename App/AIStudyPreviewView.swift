@@ -27,6 +27,7 @@ struct AIStudyPreviewView: View {
         .padding(18)
         .frame(width: 680, height: 580)
         .interactiveDismissDisabled(model.isApplying)
+        .task(id: model.currentTaskKind) { model.openTaskPreview() }
         .onDisappear { model.invalidate() }
     }
 
@@ -71,7 +72,7 @@ struct AIStudyPreviewView: View {
 
     private var noticeBanner: some View {
         Label(
-            "AI 生成由用户主动触发，确认后才写入；已人工编辑的条目默认保留不覆盖。文本注音仅供参考，不代表歌手实际演唱唱法。",
+            "补齐缺失会保留已有内容。可逐行选择重新生成，确认应用后才写入。文本注音仅供参考。",
             systemImage: "info.circle"
         )
         .font(.caption)
@@ -93,64 +94,94 @@ struct AIStudyPreviewView: View {
     }
 
     private var controlsSection: some View {
-        HStack(spacing: 12) {
+        let controlsDisabled = model.isGenerating || model.isApplying
+        let pronunciationControls = HStack(spacing: 6) {
+            Text("注音形式")
+                .fixedSize()
+                .accessibilityHidden(true)
+            Picker("注音形式", selection: $model.selectedStyle) {
+                ForEach(AIStudyPreviewModel.selectablePronunciationStyles, id: \.self) { style in
+                    Text(style.displayName).tag(style)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .frame(width: 96)
+        }
+        let translationControls = HStack(spacing: 6) {
+            Text("目标语言")
+                .fixedSize()
+                .accessibilityHidden(true)
+            Picker("目标语言", selection: $model.selectedTargetLanguage) {
+                ForEach(model.selectableTargetLanguages, id: \.self) { language in
+                    Text(Self.languageDisplayName(language)).tag(language)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .frame(width: 96)
+        }
+
+        return HStack(spacing: 12) {
+            Text("生成任务")
+                .fixedSize()
+                .accessibilityHidden(true)
             Picker("生成任务", selection: $model.selectedTaskOption) {
                 ForEach(AIStudyPreviewModel.TaskOption.allCases) { option in
                     Text(option.displayName).tag(option)
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .frame(maxWidth: 260)
-            .disabled(model.isGenerating || model.isApplying)
+            .disabled(controlsDisabled)
 
             if model.selectedTaskOption == .pronunciation {
-                Picker("注音形式", selection: $model.selectedStyle) {
-                    ForEach(AIStudyPreviewModel.selectablePronunciationStyles, id: \.self) { style in
-                        Text(style.displayName).tag(style)
-                    }
-                }
-                .pickerStyle(.menu)
-                .frame(maxWidth: 170)
-                .disabled(model.isGenerating || model.isApplying)
+                pronunciationControls.disabled(controlsDisabled)
+            } else {
+                translationControls.disabled(controlsDisabled)
             }
 
-            Spacer()
+            Spacer(minLength: 0)
 
             actionControlButton
         }
+        .controlSize(.small)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private static func languageDisplayName(_ language: String) -> String {
+        Locale(identifier: "zh-Hans").localizedString(forIdentifier: language) ?? language
     }
 
     @ViewBuilder
     private var actionControlButton: some View {
         switch model.phase {
-        case .idle:
-            Button("开始生成") {
-                model.generate()
+        case .idle, .preview, .applying:
+            HStack(spacing: 6) {
+                Button("补齐缺失") { model.generate() }
+                    .disabled(!model.canFillMissing)
+                Button("重新生成所选") { model.generate(replacingSelected: true) }
+                    .disabled(!model.canRegenerate)
             }
-            .disabled(model.nonEmptyLineCount == 0)
         case .generating:
-            Button("取消任务", role: .destructive) {
-                model.cancelGeneration()
-            }
-        case .preview:
-            Button("重新生成") {
-                model.resetToIdle()
-            }
-        case .applying:
-            Button("重新生成") {}
-                .disabled(true)
+            Button("取消任务", role: .destructive) { model.cancelGeneration() }
         }
     }
 
     @ViewBuilder
     private var contentSection: some View {
         switch model.phase {
-        case .idle:
-            idleContent
+        case .idle, .preview:
+            if model.nonEmptyLineCount == 0 {
+                Text("当前歌词没有可供 AI 处理的非空行。")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                previewContent(model.previewLines)
+            }
         case let .generating(progress):
             generatingContent(progress: progress)
-        case let .preview(lines):
-            previewContent(lines)
         case .applying:
             VStack(spacing: 10) {
                 ProgressView()
@@ -161,25 +192,17 @@ struct AIStudyPreviewView: View {
         }
     }
 
-    private var idleContent: some View {
-        VStack(spacing: 8) {
-            Text(model.nonEmptyLineCount == 0
-                 ? "当前歌词没有可供 AI 处理的非空行。"
-                 : "选择需要生成的学习内容后，点击「开始生成」获取预览。")
-                .foregroundStyle(.secondary)
-            Text("生成完成后可逐行修改结果、按行勾选是否写入，已人工编辑的条目默认不勾选覆盖。")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
     private func generatingContent(progress: AIStudyBatchProgress) -> some View {
         let percentage = Int((progress.fractionCompleted * 100).rounded())
         let isFinalizing = progress.totalBatches > 0 && progress.completedBatches >= progress.totalBatches
-        let statusText = isFinalizing
-            ? "正在整理生成结果……"
-            : "正在生成第 \(progress.currentBatchNumber) / \(progress.totalBatches) 批"
+        let statusText: String
+        if progress.totalBatches == 0 {
+            statusText = "正在检查本地结果……"
+        } else if isFinalizing {
+            statusText = "正在整理生成结果……"
+        } else {
+            statusText = "正在处理第 \(progress.currentBatchNumber) / \(progress.totalBatches) 批"
+        }
         let startedAt = model.generationStartedAt ?? .now
 
         return VStack(spacing: 14) {
@@ -235,7 +258,7 @@ struct AIStudyPreviewView: View {
     private func previewContent(_ lines: [AIStudyPreviewLine]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("共 \(lines.count) 行 · 已选 \(model.selectedCount) 项")
+                Text("待应用 \(model.selectedCount) 行 · 待重新生成 \(model.generationSelection.count) 行")
                     .font(.callout.weight(.medium))
                 if model.manualProtectedCount > 0 {
                     Text("· 已保留 \(model.manualProtectedCount) 条人工编辑")
@@ -243,9 +266,7 @@ struct AIStudyPreviewView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("全选未人工编辑项") { model.selectAllNonManual() }
-                    .controlSize(.small)
-                Button("反选") { model.invertSelection() }
+                Button("选中非人工项") { model.selectAllNonManual() }
                     .controlSize(.small)
                 Button("全不选") { model.deselectAll() }
                     .controlSize(.small)
@@ -255,6 +276,10 @@ struct AIStudyPreviewView: View {
                     ForEach(lines) { line in
                         AIStudyPreviewRow(
                             line: line,
+                            generationBinding: Binding(
+                                get: { model.generationSelection.contains(line.lineId) },
+                                set: { model.setGenerationSelected($0, for: line.lineId) }
+                            ),
                             selectionBinding: Binding(
                                 get: { line.isSelected },
                                 set: { model.setSelected($0, for: line.lineId) }
@@ -301,47 +326,65 @@ struct AIStudyPreviewView: View {
 
 private struct AIStudyPreviewRow: View {
     let line: AIStudyPreviewLine
+    let generationBinding: Binding<Bool>
     let selectionBinding: Binding<Bool>
     let textBinding: Binding<String>
+    @FocusState private var isEditingResult: Bool
 
     private var hasGeneratedContent: Bool {
         !line.generatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Toggle("", isOn: selectionBinding)
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-                .disabled(!hasGeneratedContent)
-                .padding(.top, 2)
-                .accessibilityLabel("应用此行生成结果：\(line.originalText)")
-
-            VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(line.originalText)
                     .font(.callout.weight(.medium))
                     .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                if let existing = line.existingText, !existing.isEmpty {
-                    HStack(spacing: 6) {
-                        Text("现有：\(existing)")
-                            .font(.caption)
+                Toggle("重新生成", isOn: generationBinding)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .accessibilityLabel("重新生成此行：\(line.originalText)")
+            }
+
+            if let existing = line.existingText, !existing.isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("现有：\(existing)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if line.existingIsManual {
+                        Text("人工编辑")
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                        if line.existingIsManual {
-                            Text("已有人工版本，默认保留")
-                                .font(.caption2)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1)
-                                .background(Color.orange.opacity(0.16), in: Capsule())
-                                .foregroundStyle(.orange)
-                        }
+                    }
+                    if line.existingNeedsReview {
+                        Text("待复核")
+                            .foregroundStyle(.orange)
+                    }
+                    if line.existingUsesDifferentStyle {
+                        Text("其他注音形式")
+                            .foregroundStyle(.secondary)
                     }
                 }
+                .font(.caption2)
+            }
 
-                TextField("生成结果（可手动修改，留空则不应用）", text: textBinding)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.callout)
+            if hasGeneratedContent || isEditingResult {
+                HStack(spacing: 8) {
+                    TextField("生成结果", text: textBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.callout)
+                        .focused($isEditingResult)
+
+                    Toggle("应用", isOn: selectionBinding)
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .disabled(!hasGeneratedContent)
+                        .accessibilityLabel("应用此行生成结果：\(line.originalText)")
+                }
             }
         }
         .padding(8)
